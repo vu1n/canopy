@@ -1,0 +1,17 @@
+[package]
+name = "canopy-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MCP server for canopy token-efficient codebase queries"
+
+[[bin]]
+name = "canopy-mcp"
+path = "src/main.rs"
+
+[dependencies]
+canopy-core = { path = "../canopy-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

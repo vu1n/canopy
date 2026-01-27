@@ -1,0 +1,1177 @@
+//! Repository index with SQLite FTS5
+
+use crate::config::{Config, DEFAULT_CONFIG};
+use crate::document::{NodeType, ParsedFile};
+use crate::error::CanopyError;
+use crate::handle::{generate_preview, Handle, HandleId};
+use crate::parse::{estimate_tokens, parse_file};
+use crate::query::{execute_query, execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult};
+use ignore::WalkBuilder;
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// File discovery backend
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FileDiscovery {
+    Fd,
+    Ripgrep,
+    Ignore,
+}
+
+impl FileDiscovery {
+    /// Detect the best available file discovery tool
+    pub fn detect() -> Self {
+        // Try fd first
+        if Command::new("fd").arg("--version").output().is_ok() {
+            return Self::Fd;
+        }
+        // Try ripgrep
+        if Command::new("rg").arg("--version").output().is_ok() {
+            return Self::Ripgrep;
+        }
+        // Fallback to ignore crate
+        Self::Ignore
+    }
+
+    /// Get the name of the discovery tool
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Fd => "fd",
+            Self::Ripgrep => "ripgrep",
+            Self::Ignore => "ignore-crate",
+        }
+    }
+}
+
+const SCHEMA_VERSION: i32 = 1;
+
+/// Statistics from an indexing operation
+#[derive(Debug, Serialize)]
+pub struct IndexStats {
+    pub files_indexed: usize,
+    pub files_skipped: usize,
+    pub total_tokens: usize,
+    pub index_size_bytes: u64,
+}
+
+/// Index status information
+#[derive(Debug, Serialize)]
+pub struct IndexStatus {
+    pub files_indexed: usize,
+    pub total_tokens: usize,
+    pub schema_version: i32,
+    pub index_size_bytes: u64,
+    pub last_indexed: Option<String>,
+}
+
+/// Repository index backed by SQLite
+pub struct RepoIndex {
+    repo_root: PathBuf,
+    conn: Connection,
+    config: Config,
+}
+
+impl RepoIndex {
+    /// Initialize a new canopy repository
+    pub fn init(repo_root: &Path) -> crate::Result<()> {
+        let canopy_dir = repo_root.join(".canopy");
+        let config_path = canopy_dir.join("config.toml");
+
+        if config_path.exists() {
+            return Err(CanopyError::ConfigExists(config_path));
+        }
+
+        fs::create_dir_all(&canopy_dir)?;
+        fs::write(&config_path, DEFAULT_CONFIG)?;
+
+        // Add .canopy to .gitignore if not present
+        update_gitignore(repo_root)?;
+
+        // Create the database
+        let db_path = canopy_dir.join("index.db");
+        let conn = Connection::open(&db_path)?;
+        Self::init_schema(&conn)?;
+
+        Ok(())
+    }
+
+    /// Open or create index at .canopy/index.db
+    pub fn open(repo_root: &Path) -> crate::Result<Self> {
+        let canopy_dir = repo_root.join(".canopy");
+        let config_path = canopy_dir.join("config.toml");
+        let db_path = canopy_dir.join("index.db");
+
+        // Load config (use defaults if not present)
+        let config = if config_path.exists() {
+            Config::load(&config_path)?
+        } else {
+            // Check if .canopy exists at all
+            if !canopy_dir.exists() {
+                return Err(CanopyError::NotInitialized);
+            }
+            Config::default()
+        };
+
+        // Open database
+        let conn = Connection::open(&db_path)?;
+
+        // Initialize or migrate schema
+        Self::init_schema(&conn)?;
+
+        Ok(Self {
+            repo_root: repo_root.to_path_buf(),
+            conn,
+            config,
+        })
+    }
+
+    /// Initialize database schema
+    fn init_schema(conn: &Connection) -> crate::Result<()> {
+        // Enable WAL mode for concurrent access
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 5000;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA cache_size = -64000;
+            ",
+        )?;
+
+        // Check schema version
+        let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+
+        if version == 0 {
+            // Fresh database, create schema
+            conn.execute_batch(
+                "
+                -- File metadata for cache invalidation
+                CREATE TABLE IF NOT EXISTS files (
+                    id INTEGER PRIMARY KEY,
+                    path TEXT UNIQUE NOT NULL,
+                    content_hash BLOB NOT NULL,
+                    mtime INTEGER NOT NULL,
+                    indexed_at INTEGER NOT NULL,
+                    token_count INTEGER NOT NULL
+                );
+
+                -- Nodes (sections, code blocks, paragraphs, functions, etc.)
+                CREATE TABLE IF NOT EXISTS nodes (
+                    id INTEGER PRIMARY KEY,
+                    file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+                    handle_id TEXT UNIQUE NOT NULL,
+                    node_type INTEGER NOT NULL,
+                    start_byte INTEGER NOT NULL,
+                    end_byte INTEGER NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    token_count INTEGER NOT NULL,
+                    metadata TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
+                CREATE INDEX IF NOT EXISTS idx_nodes_handle ON nodes(handle_id);
+                CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
+
+                -- FTS5 index for text search
+                CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
+                    content,
+                    tokenize='unicode61'
+                );
+
+                -- Mapping from FTS rowid to node
+                CREATE TABLE IF NOT EXISTS fts_node_map (
+                    fts_rowid INTEGER PRIMARY KEY,
+                    node_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE
+                );
+
+                PRAGMA user_version = 1;
+                ",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Get current config
+    pub fn config(&self) -> &Config {
+        &self.config
+    }
+
+    /// Index files matching glob pattern
+    pub fn index(&mut self, glob: &str) -> crate::Result<IndexStats> {
+        let mut files_indexed = 0;
+        let mut files_skipped = 0;
+        let mut total_tokens = 0;
+
+        // Walk files respecting .gitignore
+        let files = self.walk_files(glob)?;
+
+        for file_path in files {
+            let relative_path = file_path
+                .strip_prefix(&self.repo_root)
+                .unwrap_or(&file_path)
+                .to_string_lossy()
+                .to_string();
+
+            // Check if we need to reindex
+            if !self.needs_reindex(&file_path, &relative_path)? {
+                files_skipped += 1;
+
+                // Add to total tokens from existing entry
+                if let Some(tokens) = self.get_file_tokens(&relative_path)? {
+                    total_tokens += tokens;
+                }
+                continue;
+            }
+
+            // Read and parse file
+            let source = match fs::read_to_string(&file_path) {
+                Ok(s) => s,
+                Err(_) => continue, // Skip binary/unreadable files
+            };
+
+            let parsed = parse_file(&file_path, &source, &self.config);
+
+            // Index the file
+            self.index_parsed_file(&relative_path, &parsed)?;
+
+            files_indexed += 1;
+            total_tokens += parsed.total_tokens;
+        }
+
+        // Get index size
+        let db_path = self.repo_root.join(".canopy").join("index.db");
+        let index_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+        Ok(IndexStats {
+            files_indexed,
+            files_skipped,
+            total_tokens,
+            index_size_bytes,
+        })
+    }
+
+    /// Walk files matching glob, respecting .gitignore
+    /// Uses fd > ripgrep > ignore crate (in order of preference)
+    fn walk_files(&self, glob: &str) -> crate::Result<Vec<PathBuf>> {
+        let discovery = FileDiscovery::detect();
+
+        // Extract extensions from glob pattern (e.g., "**/*.rs" -> ["rs"])
+        let extensions = Self::extract_extensions(glob);
+
+        match discovery {
+            FileDiscovery::Fd => self.walk_files_fd(&extensions),
+            FileDiscovery::Ripgrep => self.walk_files_rg(&extensions),
+            FileDiscovery::Ignore => self.walk_files_ignore(glob),
+        }
+    }
+
+    /// Extract file extensions from a glob pattern
+    fn extract_extensions(glob: &str) -> Vec<String> {
+        let mut extensions = Vec::new();
+
+        // Handle patterns like "**/*.{rs,py,ts}" or "**/*.rs"
+        if let Some(ext_part) = glob.rsplit('.').next() {
+            // Check for brace expansion: {rs,py,ts}
+            if ext_part.starts_with('{') && ext_part.ends_with('}') {
+                let inner = &ext_part[1..ext_part.len()-1];
+                for ext in inner.split(',') {
+                    let ext = ext.trim();
+                    if !ext.is_empty() && !ext.contains('*') {
+                        extensions.push(ext.to_string());
+                    }
+                }
+            } else if !ext_part.contains('*') && !ext_part.contains('/') {
+                // Simple extension like "rs"
+                extensions.push(ext_part.to_string());
+            }
+        }
+
+        extensions
+    }
+
+    /// Walk files using fd (fastest)
+    fn walk_files_fd(&self, extensions: &[String]) -> crate::Result<Vec<PathBuf>> {
+        let mut cmd = Command::new("fd");
+        cmd.arg("--type").arg("f");
+        cmd.arg("--hidden"); // Include hidden, let .gitignore handle it
+
+        // Add extensions
+        for ext in extensions {
+            cmd.arg("-e").arg(ext);
+        }
+
+        // Add exclusions from config
+        for pattern in &self.config.ignore.patterns {
+            cmd.arg("--exclude").arg(pattern);
+        }
+
+        // Search in repo root
+        cmd.arg(".").arg(&self.repo_root);
+
+        let output = cmd.output()
+            .map_err(|e| CanopyError::Io(e))?;
+
+        if !output.status.success() {
+            // Fallback to ignore crate on error
+            return self.walk_files_ignore(&format!("**/*.{{{}}}", extensions.join(",")));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let files: Vec<PathBuf> = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
+
+        Ok(files)
+    }
+
+    /// Walk files using ripgrep --files
+    fn walk_files_rg(&self, extensions: &[String]) -> crate::Result<Vec<PathBuf>> {
+        let mut cmd = Command::new("rg");
+        cmd.arg("--files");
+        cmd.arg("--hidden"); // Include hidden, let .gitignore handle it
+
+        // Add type filters (ripgrep uses --type or --glob)
+        for ext in extensions {
+            cmd.arg("--glob").arg(format!("*.{}", ext));
+        }
+
+        // Add exclusions from config
+        for pattern in &self.config.ignore.patterns {
+            cmd.arg("--glob").arg(format!("!{}", pattern));
+            cmd.arg("--glob").arg(format!("!{}/**", pattern));
+        }
+
+        // Search in repo root
+        cmd.arg(&self.repo_root);
+
+        let output = cmd.output()
+            .map_err(|e| CanopyError::Io(e))?;
+
+        if !output.status.success() {
+            // Fallback to ignore crate on error
+            return self.walk_files_ignore(&format!("**/*.{{{}}}", extensions.join(",")));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let files: Vec<PathBuf> = stdout
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+            .collect();
+
+        Ok(files)
+    }
+
+    /// Walk files using ignore crate (fallback)
+    fn walk_files_ignore(&self, glob: &str) -> crate::Result<Vec<PathBuf>> {
+        let mut builder = WalkBuilder::new(&self.repo_root);
+        builder.hidden(false);
+        builder.git_ignore(true);
+        builder.git_global(true);
+        builder.git_exclude(true);
+
+        // Build glob matcher for inclusion
+        let mut glob_builder = globset::GlobSetBuilder::new();
+        glob_builder.add(
+            globset::Glob::new(glob)
+                .map_err(|e| CanopyError::GlobPattern(e.to_string()))?,
+        );
+        let glob_set = glob_builder
+            .build()
+            .map_err(|e| CanopyError::GlobPattern(e.to_string()))?;
+
+        // Build glob matcher for custom ignore patterns
+        let mut ignore_builder = globset::GlobSetBuilder::new();
+        for pattern in &self.config.ignore.patterns {
+            let glob_pattern = if pattern.contains('*') || pattern.contains('?') {
+                pattern.clone()
+            } else {
+                format!("**/{}", pattern)
+            };
+            if let Ok(g) = globset::Glob::new(&glob_pattern) {
+                ignore_builder.add(g);
+            }
+            if let Ok(g) = globset::Glob::new(&format!("**/{}/**", pattern)) {
+                ignore_builder.add(g);
+            }
+        }
+        let ignore_set = ignore_builder
+            .build()
+            .map_err(|e| CanopyError::GlobPattern(e.to_string()))?;
+
+        let mut files = Vec::new();
+
+        for entry in builder.build() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+
+            if path.is_dir() {
+                continue;
+            }
+
+            let relative = path
+                .strip_prefix(&self.repo_root)
+                .unwrap_or(path);
+
+            if ignore_set.is_match(relative) {
+                continue;
+            }
+
+            if glob_set.is_match(relative) {
+                files.push(path.to_path_buf());
+            }
+        }
+
+        Ok(files)
+    }
+
+    /// Check if file needs reindexing
+    fn needs_reindex(&self, file_path: &Path, relative_path: &str) -> crate::Result<bool> {
+        // Get file metadata
+        let metadata = match fs::metadata(file_path) {
+            Ok(m) => m,
+            Err(_) => return Ok(true), // File doesn't exist or can't be read
+        };
+
+        let current_mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Check database entry
+        let row: Option<(i64, Vec<u8>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT mtime, content_hash, indexed_at FROM files WHERE path = ?",
+                params![relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        let Some((db_mtime, db_hash, indexed_at)) = row else {
+            return Ok(true); // Not in database
+        };
+
+        // Fast path: mtime unchanged
+        if db_mtime == current_mtime {
+            // Check TTL
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let ttl_secs = self.config.ttl_duration().as_secs() as i64;
+
+            if now - indexed_at < ttl_secs {
+                return Ok(false); // Cache still valid
+            }
+        }
+
+        // Compute content hash
+        let content = fs::read_to_string(file_path)?;
+        let mut hasher = Sha256::new();
+        hasher.update(content.as_bytes());
+        let current_hash: [u8; 32] = hasher.finalize().into();
+
+        // Compare hashes
+        Ok(db_hash != current_hash.as_slice())
+    }
+
+    /// Get token count for a file
+    fn get_file_tokens(&self, relative_path: &str) -> crate::Result<Option<usize>> {
+        let result: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT token_count FROM files WHERE path = ?",
+                params![relative_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        Ok(result.map(|t| t as usize))
+    }
+
+    /// Index a parsed file
+    fn index_parsed_file(&mut self, relative_path: &str, parsed: &ParsedFile) -> crate::Result<()> {
+        let tx = self.conn.transaction()?;
+
+        // Delete existing entry
+        tx.execute("DELETE FROM files WHERE path = ?", params![relative_path])?;
+
+        let mtime = fs::metadata(&parsed.path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        // Insert file
+        tx.execute(
+            "INSERT INTO files (path, content_hash, mtime, indexed_at, token_count)
+             VALUES (?, ?, ?, ?, ?)",
+            params![
+                relative_path,
+                parsed.content_hash.as_slice(),
+                mtime,
+                now,
+                parsed.total_tokens as i64
+            ],
+        )?;
+
+        let file_id = tx.last_insert_rowid();
+
+        // Insert nodes
+        for node in &parsed.nodes {
+            let handle_id = HandleId::new(relative_path, node.node_type, &node.span);
+            let node_tokens = estimate_tokens(&parsed.source[node.span.clone()]);
+
+            tx.execute(
+                "INSERT INTO nodes (file_id, handle_id, node_type, start_byte, end_byte,
+                                   line_start, line_end, token_count, metadata)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    file_id,
+                    handle_id.raw(),
+                    node.node_type.as_int() as i32,
+                    node.span.start as i64,
+                    node.span.end as i64,
+                    node.line_range.0 as i64,
+                    node.line_range.1 as i64,
+                    node_tokens as i64,
+                    node.metadata.to_json()
+                ],
+            )?;
+
+            let node_id = tx.last_insert_rowid();
+
+            // Index content in FTS5
+            let content = &parsed.source[node.span.clone()];
+            tx.execute(
+                "INSERT INTO content_fts (content) VALUES (?)",
+                params![content],
+            )?;
+
+            let fts_rowid = tx.last_insert_rowid();
+            tx.execute(
+                "INSERT INTO fts_node_map (fts_rowid, node_id) VALUES (?, ?)",
+                params![fts_rowid, node_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Query indexed content
+    pub fn query(&self, query_str: &str, limit: Option<usize>) -> crate::Result<QueryResult> {
+        let query = parse_query(query_str)?;
+        execute_query(&query, self, limit)
+    }
+
+    /// Query indexed content with full options including expand_budget
+    pub fn query_with_options(&self, query_str: &str, options: QueryOptions) -> crate::Result<QueryResult> {
+        let query = parse_query(query_str)?;
+        execute_query_with_options(&query, self, options)
+    }
+
+    /// Query using simplified params API (recommended for MCP tools)
+    ///
+    /// Example:
+    /// ```ignore
+    /// let params = QueryParams::pattern("error").with_glob("src/*.rs");
+    /// let result = index.query_params(params)?;
+    /// ```
+    pub fn query_params(&self, params: QueryParams) -> crate::Result<QueryResult> {
+        let query = params.to_query()?;
+        let options = params.to_options();
+        execute_query_with_options(&query, self, options)
+    }
+
+    /// Expand handles to full content
+    pub fn expand(&self, handle_ids: &[String]) -> crate::Result<Vec<(String, String)>> {
+        let mut results = Vec::new();
+
+        for handle_id_str in handle_ids {
+            let handle_id: HandleId = handle_id_str.parse()?;
+
+            // Get node info
+            let row: Option<(String, i64, i64, Vec<u8>)> = self
+                .conn
+                .query_row(
+                    "SELECT f.path, n.start_byte, n.end_byte, f.content_hash
+                     FROM nodes n
+                     JOIN files f ON n.file_id = f.id
+                     WHERE n.handle_id = ?",
+                    params![handle_id.raw()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+
+            let Some((path, start, end, db_hash)) = row else {
+                return Err(CanopyError::HandleNotFound(handle_id.to_string()));
+            };
+
+            // Read file and verify hash
+            let full_path = self.repo_root.join(&path);
+            let source = fs::read_to_string(&full_path)?;
+
+            let mut hasher = Sha256::new();
+            hasher.update(source.as_bytes());
+            let current_hash: [u8; 32] = hasher.finalize().into();
+
+            if db_hash != current_hash.as_slice() {
+                return Err(CanopyError::StaleIndex { path });
+            }
+
+            // Extract content
+            let start = start as usize;
+            let end = (end as usize).min(source.len());
+            let content = source[start..end].to_string();
+
+            results.push((handle_id.to_string(), content));
+        }
+
+        Ok(results)
+    }
+
+    /// Get index status
+    pub fn status(&self) -> crate::Result<IndexStatus> {
+        let files_indexed: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+
+        let total_tokens: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(SUM(token_count), 0) FROM files", [], |row| {
+                row.get(0)
+            })?;
+
+        let last_indexed: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(indexed_at) FROM files", [], |row| row.get(0))
+            .optional()?
+            .flatten();
+
+        let db_path = self.repo_root.join(".canopy").join("index.db");
+        let index_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+        let last_indexed_str = last_indexed.map(|ts| {
+            let duration = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                - ts;
+
+            if duration < 60 {
+                format!("{} seconds ago", duration)
+            } else if duration < 3600 {
+                format!("{} minutes ago", duration / 60)
+            } else if duration < 86400 {
+                format!("{} hours ago", duration / 3600)
+            } else {
+                format!("{} days ago", duration / 86400)
+            }
+        });
+
+        Ok(IndexStatus {
+            files_indexed: files_indexed as usize,
+            total_tokens: total_tokens as usize,
+            schema_version: SCHEMA_VERSION,
+            index_size_bytes,
+            last_indexed: last_indexed_str,
+        })
+    }
+
+    /// Invalidate cached entries
+    pub fn invalidate(&mut self, glob: Option<&str>) -> crate::Result<usize> {
+        match glob {
+            Some(pattern) => {
+                // Build glob matcher
+                let glob_matcher = globset::Glob::new(pattern)
+                    .map_err(|e| CanopyError::GlobPattern(e.to_string()))?
+                    .compile_matcher();
+
+                // Get all file paths
+                let mut stmt = self.conn.prepare("SELECT id, path FROM files")?;
+                let rows: Vec<(i64, String)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                let mut count = 0;
+                for (id, path) in rows {
+                    if glob_matcher.is_match(&path) {
+                        self.conn
+                            .execute("DELETE FROM files WHERE id = ?", params![id])?;
+                        count += 1;
+                    }
+                }
+
+                Ok(count)
+            }
+            None => {
+                // Delete all
+                let count: i64 = self
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
+
+                self.conn.execute("DELETE FROM files", [])?;
+                self.conn.execute("DELETE FROM content_fts", [])?;
+                self.conn.execute("DELETE FROM fts_node_map", [])?;
+
+                Ok(count as usize)
+            }
+        }
+    }
+
+    /// FTS5 search (used by query executor)
+    pub fn fts_search(&self, query: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        // Escape FTS5 special characters
+        let escaped = escape_fts5_query(query);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count
+             FROM content_fts fts
+             JOIN fts_node_map m ON fts.rowid = m.fts_rowid
+             JOIN nodes n ON m.node_id = n.id
+             JOIN files f ON n.file_id = f.id
+             WHERE fts.content MATCH ?
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(params![escaped, limit as i64], |row| {
+                let handle_id: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let node_type_int: i32 = row.get(2)?;
+                let start_byte: i64 = row.get(3)?;
+                let end_byte: i64 = row.get(4)?;
+                let line_start: i64 = row.get(5)?;
+                let line_end: i64 = row.get(6)?;
+                let token_count: i64 = row.get(7)?;
+
+                Ok((
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start_byte as usize,
+                    end_byte as usize,
+                    line_start as usize,
+                    line_end as usize,
+                    token_count as usize,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
+                    let span = start..end;
+
+                    // Generate preview by reading file
+                    let preview = self
+                        .read_preview(&file_path, &span)
+                        .unwrap_or_else(|_| "...".to_string());
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Get all nodes of a specific type
+    pub fn get_nodes_by_type(&self, node_type: NodeType, limit: usize) -> crate::Result<Vec<Handle>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.metadata
+             FROM nodes n
+             JOIN files f ON n.file_id = f.id
+             WHERE n.node_type = ?
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(params![node_type.as_int() as i32, limit as i64], |row| {
+                let handle_id: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let node_type_int: i32 = row.get(2)?;
+                let start_byte: i64 = row.get(3)?;
+                let end_byte: i64 = row.get(4)?;
+                let line_start: i64 = row.get(5)?;
+                let line_end: i64 = row.get(6)?;
+                let token_count: i64 = row.get(7)?;
+
+                Ok((
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start_byte as usize,
+                    end_byte as usize,
+                    line_start as usize,
+                    line_end as usize,
+                    token_count as usize,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
+                    let span = start..end;
+
+                    let preview = self
+                        .read_preview(&file_path, &span)
+                        .unwrap_or_else(|_| "...".to_string());
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Search for sections by heading (fuzzy match)
+    pub fn search_sections(&self, heading: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let pattern = format!("%{}%", heading.to_lowercase());
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.metadata
+             FROM nodes n
+             JOIN files f ON n.file_id = f.id
+             WHERE n.node_type = ?
+               AND LOWER(json_extract(n.metadata, '$.heading')) LIKE ?
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(
+                params![NodeType::Section.as_int() as i32, pattern, limit as i64],
+                |row| {
+                    let handle_id: String = row.get(0)?;
+                    let file_path: String = row.get(1)?;
+                    let node_type_int: i32 = row.get(2)?;
+                    let start_byte: i64 = row.get(3)?;
+                    let end_byte: i64 = row.get(4)?;
+                    let line_start: i64 = row.get(5)?;
+                    let line_end: i64 = row.get(6)?;
+                    let token_count: i64 = row.get(7)?;
+
+                    Ok((
+                        handle_id,
+                        file_path,
+                        node_type_int,
+                        start_byte as usize,
+                        end_byte as usize,
+                        line_start as usize,
+                        line_end as usize,
+                        token_count as usize,
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Section);
+                    let span = start..end;
+
+                    let preview = self
+                        .read_preview(&file_path, &span)
+                        .unwrap_or_else(|_| "...".to_string());
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Search for code symbols by name
+    pub fn search_code(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let pattern = format!("%{}%", symbol.to_lowercase());
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.metadata
+             FROM nodes n
+             JOIN files f ON n.file_id = f.id
+             WHERE n.node_type IN (?, ?, ?, ?)
+               AND LOWER(json_extract(n.metadata, '$.name')) LIKE ?
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(
+                params![
+                    NodeType::Function.as_int() as i32,
+                    NodeType::Class.as_int() as i32,
+                    NodeType::Struct.as_int() as i32,
+                    NodeType::Method.as_int() as i32,
+                    pattern,
+                    limit as i64
+                ],
+                |row| {
+                    let handle_id: String = row.get(0)?;
+                    let file_path: String = row.get(1)?;
+                    let node_type_int: i32 = row.get(2)?;
+                    let start_byte: i64 = row.get(3)?;
+                    let end_byte: i64 = row.get(4)?;
+                    let line_start: i64 = row.get(5)?;
+                    let line_end: i64 = row.get(6)?;
+                    let token_count: i64 = row.get(7)?;
+
+                    Ok((
+                        handle_id,
+                        file_path,
+                        node_type_int,
+                        start_byte as usize,
+                        end_byte as usize,
+                        line_start as usize,
+                        line_end as usize,
+                        token_count as usize,
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
+                    let span = start..end;
+
+                    let preview = self
+                        .read_preview(&file_path, &span)
+                        .unwrap_or_else(|_| "...".to_string());
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Get file as a single handle
+    pub fn get_file(&self, path_pattern: &str) -> crate::Result<Vec<Handle>> {
+        let glob_matcher = globset::Glob::new(path_pattern)
+            .map_err(|e| CanopyError::GlobPattern(e.to_string()))?
+            .compile_matcher();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, f.token_count FROM files f",
+        )?;
+
+        let matches: Vec<(String, usize)> = stmt
+            .query_map([], |row| {
+                let path: String = row.get(0)?;
+                let tokens: i64 = row.get(1)?;
+                Ok((path, tokens as usize))
+            })?
+            .filter_map(|r| r.ok())
+            .filter(|(path, _)| glob_matcher.is_match(path))
+            .collect();
+
+        let mut handles = Vec::new();
+        for (file_path, token_count) in matches {
+            // Read file to get line count and preview
+            let full_path = self.repo_root.join(&file_path);
+            if let Ok(source) = fs::read_to_string(&full_path) {
+                let line_count = source.lines().count().max(1);
+                let span = 0..source.len();
+                let preview = generate_preview(&source, &span, self.config.indexing.preview_bytes);
+
+                handles.push(Handle {
+                    id: HandleId::new(&file_path, NodeType::Chunk, &span),
+                    file_path,
+                    node_type: NodeType::Chunk,
+                    span,
+                    line_range: (1, line_count),
+                    token_count,
+                    preview,
+                    content: None,
+                });
+            }
+        }
+
+        Ok(handles)
+    }
+
+    /// Search within specific files (in-file query)
+    pub fn search_in_files(&self, glob: &str, fts_query: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let glob_matcher = globset::Glob::new(glob)
+            .map_err(|e| CanopyError::GlobPattern(e.to_string()))?
+            .compile_matcher();
+
+        let escaped = escape_fts5_query(fts_query);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count
+             FROM content_fts fts
+             JOIN fts_node_map m ON fts.rowid = m.fts_rowid
+             JOIN nodes n ON m.node_id = n.id
+             JOIN files f ON n.file_id = f.id
+             WHERE fts.content MATCH ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(params![escaped], |row| {
+                let handle_id: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let node_type_int: i32 = row.get(2)?;
+                let start_byte: i64 = row.get(3)?;
+                let end_byte: i64 = row.get(4)?;
+                let line_start: i64 = row.get(5)?;
+                let line_end: i64 = row.get(6)?;
+                let token_count: i64 = row.get(7)?;
+
+                Ok((
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start_byte as usize,
+                    end_byte as usize,
+                    line_start as usize,
+                    line_end as usize,
+                    token_count as usize,
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .filter(|(_, file_path, _, _, _, _, _, _)| glob_matcher.is_match(file_path))
+            .take(limit)
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
+                    let span = start..end;
+
+                    let preview = self
+                        .read_preview(&file_path, &span)
+                        .unwrap_or_else(|_| "...".to_string());
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Read preview for a file span
+    fn read_preview(&self, relative_path: &str, span: &std::ops::Range<usize>) -> crate::Result<String> {
+        let full_path = self.repo_root.join(relative_path);
+        let source = fs::read_to_string(&full_path)?;
+        Ok(generate_preview(
+            &source,
+            span,
+            self.config.indexing.preview_bytes,
+        ))
+    }
+
+    /// Get default result limit
+    pub fn default_limit(&self) -> usize {
+        self.config.core.default_result_limit
+    }
+}
+
+/// Escape FTS5 special characters
+fn escape_fts5_query(query: &str) -> String {
+    // For simple queries, wrap in quotes if it contains special chars
+    // FTS5 special chars: " ( ) - * < >
+    if query.contains(|c: char| matches!(c, '"' | '(' | ')' | '-' | '*' | '<' | '>')) {
+        // Quote the entire query for literal search
+        format!("\"{}\"", query.replace('"', "\"\""))
+    } else {
+        query.to_string()
+    }
+}
+
+/// Update .gitignore to include .canopy/
+fn update_gitignore(repo_root: &Path) -> crate::Result<()> {
+    let gitignore_path = repo_root.join(".gitignore");
+
+    if gitignore_path.exists() {
+        let content = fs::read_to_string(&gitignore_path)?;
+        if !content.lines().any(|line| line.trim() == ".canopy" || line.trim() == ".canopy/") {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(&gitignore_path)?;
+            use std::io::Write;
+            writeln!(file, "\n# Canopy index\n.canopy/")?;
+        }
+    } else {
+        fs::write(&gitignore_path, "# Canopy index\n.canopy/\n")?;
+    }
+
+    Ok(())
+}
+

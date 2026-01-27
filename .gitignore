@@ -1,0 +1,5 @@
+# Canopy index
+.canopy/
+
+# Rust build artifacts
+target/

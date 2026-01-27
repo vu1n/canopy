@@ -1,0 +1,6 @@
+{
+  "name": "canopy",
+  "description": "Token-efficient codebase search for large repos. Provides semantic code intelligence with symbol search, token-aware retrieval, and shared indexes for parallel agents.",
+  "version": "0.1.0",
+  "keywords": ["code-search", "indexing", "semantic-search", "codebase"]
+}
