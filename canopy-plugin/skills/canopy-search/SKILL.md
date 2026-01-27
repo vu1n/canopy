@@ -71,12 +71,14 @@ canopy_expand(handle_ids=["h1a2b3c...", "h5d6e7f..."])
 Index files for querying.
 ```
 canopy_index(glob="**/*.rs")
+canopy_index(path="/path/to/repo", glob="**/*.rs")  # Explicit repo path
 ```
 
 ### canopy_query
 Search indexed content. Returns handles with token counts and previews.
 
 **Parameters:**
+- `path` (string): Repository path (defaults to auto-detected)
 - `pattern` (string): Single text pattern
 - `patterns` (array): Multiple patterns
 - `symbol` (string): Code symbol (function, class, struct, method)
@@ -90,16 +92,22 @@ Search indexed content. Returns handles with token counts and previews.
 Expand handles to full content.
 ```
 canopy_expand(handle_ids=["h1a2b3c4d5e6"])
+canopy_expand(path="/path/to/repo", handle_ids=["h1a2b3c4d5e6"])
 ```
 
 ### canopy_status
 Get index statistics (file count, tokens, last indexed).
+```
+canopy_status()
+canopy_status(path="/path/to/repo")
+```
 
 ### canopy_invalidate
 Force reindex of files.
 ```
-canopy_invalidate()              # All files
-canopy_invalidate(glob="*.rs")   # Only matching files
+canopy_invalidate()                          # All files
+canopy_invalidate(glob="*.rs")               # Only matching files
+canopy_invalidate(path="/path/to/repo")      # Specific repo
 ```
 
 ## Key Insight
