@@ -38,25 +38,32 @@ Would you like to reindex? [Yes - default glob] [Yes - custom glob] [No]
 
 ## When to Use Canopy
 
-**Use canopy for:**
-- Symbol search: `canopy_query(path=..., symbol="authenticate")` - find function/class definitions
-- Large repos (500+ files) where ripgrep is slow
-- When you need token counts before deciding what to read
+Canopy is a **time-for-tokens tradeoff**: ~36% slower but ~45% fewer tokens (~44% cost savings).
 
-**Use Grep instead for:**
-- Quick text searches mid-task (no index needed)
-- Small/medium repos (<500 files)
-- Known literal patterns
+### Canopy Excels At:
+| Scenario | Why |
+|----------|-----|
+| **Multi-iteration exploration** | Overhead amortizes; by iter 3, same speed + fewer tokens |
+| **Deep code review / analysis** | Multiple queries benefit from indexed search |
+| **Large codebases (500+ files)** | Index beats repeated file scans |
+| **Semantic symbol search** | `canopy_query(symbol="authenticate")` finds definitions |
+| **Parallel agents on same repo** | Shared index, reduced redundant file reads |
 
-## Tool Decision Matrix
+### Skip Canopy For:
+| Scenario | Why |
+|----------|-----|
+| **Quick single lookup** | Index overhead not worth it |
+| **Time-critical tasks** | ~36% slower than native tools |
+| **Small repos (<200 files)** | Native tools are fast enough |
 
-| Finding... | Use |
-|------------|-----|
-| File by name | `fd` / Glob |
-| Text pattern | `rg` / Grep |
-| **Function/class definition** | **canopy** |
-| Token count before reading | canopy |
-| Large repo (500+ files) | canopy |
+### The Iteration Effect (from benchmarks)
+```
+Iteration 1: Canopy ~94% slower (cold start, index building)
+Iteration 2: Canopy ~16% slower (context building)
+Iteration 3: Canopy reaches parity (token savings accumulate)
+```
+
+**Rule of thumb**: If you expect 3+ search iterations, consider Canopy for token savings.
 
 ## Quick Reference
 
@@ -134,6 +141,12 @@ canopy_invalidate(path="/path/to/repo", glob="*.rs")
 ```
 **Required:** `path`
 
-## Key Insight
+## Key Insights
 
-**Canopy's unique value is semantic symbol search.** Text pattern search is convenient but ripgrep does it well. Use canopy when you need to find code symbols by name - something grep can't do semantically.
+1. **Time-for-tokens tradeoff**: ~36% slower but ~45% fewer tokens (~44% cost savings)
+
+2. **Iteration effect**: Canopy overhead amortizes. By iteration 3, it reaches speed parity while maintaining token savings.
+
+3. **Unique capability**: Semantic symbol search - find function/class definitions by name
+
+4. **Decision rule**: Expect 3+ search iterations? Consider Canopy for token/cost savings.
