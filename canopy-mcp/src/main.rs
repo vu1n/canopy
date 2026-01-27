@@ -4,7 +4,7 @@ use canopy_core::{FileDiscovery, MatchMode, QueryParams, RepoIndex, Result as Ca
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn main() {
     let stdin = std::io::stdin();
@@ -137,9 +137,13 @@ impl McpServer {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository path to index (defaults to auto-detected root)"
+                            },
                             "glob": {
                                 "type": "string",
-                                "description": "Glob pattern for files to index (e.g., 'src/**/*.rs')"
+                                "description": "Glob pattern for files to index (e.g., '**/*.rs')"
                             }
                         },
                         "required": ["glob"]
@@ -151,6 +155,10 @@ impl McpServer {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository path to query (defaults to auto-detected root)"
+                            },
                             "pattern": {
                                 "type": "string",
                                 "description": "Single text pattern to search (FTS5 search)"
@@ -198,6 +206,10 @@ impl McpServer {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository path (defaults to auto-detected root)"
+                            },
                             "handle_ids": {
                                 "type": "array",
                                 "items": { "type": "string" },
@@ -212,7 +224,12 @@ impl McpServer {
                     "description": "Get index status including file count, token count, and last indexed time",
                     "inputSchema": {
                         "type": "object",
-                        "properties": {}
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository path (defaults to auto-detected root)"
+                            }
+                        }
                     }
                 },
                 {
@@ -221,6 +238,10 @@ impl McpServer {
                     "inputSchema": {
                         "type": "object",
                         "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository path (defaults to auto-detected root)"
+                            },
                             "glob": {
                                 "type": "string",
                                 "description": "Glob pattern to invalidate (all files if omitted)"
@@ -260,7 +281,8 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .ok_or((-32602, "Missing 'glob' parameter".to_string()))?;
 
-        let mut index = self.open_index()?;
+        let repo_root = self.get_repo_root(args);
+        let mut index = self.open_index_at(&repo_root)?;
         let stats = index
             .index(glob)
             .map_err(|e| (-32000, e.to_string()))?;
@@ -270,7 +292,7 @@ impl McpServer {
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
                 "repo_root".to_string(),
-                json!(self.repo_root.display().to_string()),
+                json!(repo_root.display().to_string()),
             );
         }
 
@@ -283,7 +305,8 @@ impl McpServer {
     }
 
     fn tool_query(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let mut index = self.open_index()?;
+        let repo_root = self.get_repo_root(args);
+        let mut index = self.open_index_at(&repo_root)?;
 
         // Auto-index if no files indexed yet
         let status = index.status().map_err(|e| (-32000, e.to_string()))?;
@@ -396,7 +419,8 @@ impl McpServer {
             return Err((-32602, "Empty handle_ids array".to_string()));
         }
 
-        let index = self.open_index()?;
+        let repo_root = self.get_repo_root(args);
+        let index = self.open_index_at(&repo_root)?;
         let contents = index
             .expand(&handle_ids)
             .map_err(|e| (-32000, e.to_string()))?;
@@ -416,8 +440,9 @@ impl McpServer {
         }))
     }
 
-    fn tool_status(&self, _args: &Value) -> Result<Value, (i32, String)> {
-        let index = self.open_index()?;
+    fn tool_status(&self, args: &Value) -> Result<Value, (i32, String)> {
+        let repo_root = self.get_repo_root(args);
+        let index = self.open_index_at(&repo_root)?;
         let status = index.status().map_err(|e| (-32000, e.to_string()))?;
 
         // Include repo_root and file_discovery for debugging
@@ -425,7 +450,7 @@ impl McpServer {
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
                 "repo_root".to_string(),
-                json!(self.repo_root.display().to_string()),
+                json!(repo_root.display().to_string()),
             );
             obj.insert(
                 "file_discovery".to_string(),
@@ -444,7 +469,8 @@ impl McpServer {
     fn tool_invalidate(&self, args: &Value) -> Result<Value, (i32, String)> {
         let glob = args.get("glob").and_then(|v| v.as_str());
 
-        let mut index = self.open_index()?;
+        let repo_root = self.get_repo_root(args);
+        let mut index = self.open_index_at(&repo_root)?;
         let count = index
             .invalidate(glob)
             .map_err(|e| (-32000, e.to_string()))?;
@@ -457,12 +483,21 @@ impl McpServer {
         }))
     }
 
-    fn open_index(&self) -> Result<RepoIndex, (i32, String)> {
+    /// Open index at a specific path (with auto-init)
+    fn open_index_at(&self, root: &Path) -> Result<RepoIndex, (i32, String)> {
         // Auto-init if .canopy doesn't exist
-        if !self.repo_root.join(".canopy").exists() {
-            RepoIndex::init(&self.repo_root).map_err(|e| (-32000, e.to_string()))?;
+        if !root.join(".canopy").exists() {
+            RepoIndex::init(root).map_err(|e| (-32000, e.to_string()))?;
         }
-        RepoIndex::open(&self.repo_root).map_err(|e| (-32000, e.to_string()))
+        RepoIndex::open(root).map_err(|e| (-32000, e.to_string()))
+    }
+
+    /// Get repo root from args, falling back to default
+    fn get_repo_root(&self, args: &Value) -> PathBuf {
+        args.get("path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.repo_root.clone())
     }
 }
 
