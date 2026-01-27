@@ -1,23 +1,32 @@
 ---
 name: canopy
 description: >
-  Check canopy index status and optionally reindex the current repository.
+  Check canopy index status and optionally reindex a repository.
 user_invocable: true
-arg_description: "[path] - optional repo path (defaults to current directory)"
+arg_description: "<path> - repository path (REQUIRED)"
 ---
 
 # Canopy: Semantic Code Intelligence
 
+## IMPORTANT: Path is Required
+
+All canopy tools require an explicit `path` parameter. This prevents indexing the wrong directory.
+
+```
+canopy_query(path="/Users/vuln/code/myproject", pattern="auth")  # Correct
+canopy_query(pattern="auth")                                      # ERROR: missing path
+```
+
 ## When invoked via /canopy
 
-1. Call `canopy_status(path)` to get current index state (use arg as path if provided)
-2. Display: files indexed, total tokens, repo root, file discovery method
-3. Ask user: "Reindex now?" with options for glob pattern
+1. User provides path as argument: `/canopy /path/to/repo`
+2. Call `canopy_status(path=<arg>)` to get current index state
+3. Display: files indexed, total tokens, repo root, file discovery method
+4. Ask user: "Reindex now?" with options for glob pattern
 
 Example response:
 ```
-Canopy index status:
-- Repository: /Users/vuln/code/myproject
+Canopy index status for /Users/vuln/code/myproject:
 - Files indexed: 47 (125k tokens)
 - File discovery: fd
 - Last indexed: 5 minutes ago
@@ -27,9 +36,17 @@ Would you like to reindex? [Yes - default glob] [Yes - custom glob] [No]
 
 ---
 
-## Background: When to use canopy
+## When to Use Canopy
 
-Use canopy when you need to find code symbols (functions, classes, structs) or when working with large codebases (500+ files). For simple text searches in small repos, prefer ripgrep/Grep.
+**Use canopy for:**
+- Symbol search: `canopy_query(path=..., symbol="authenticate")` - find function/class definitions
+- Large repos (500+ files) where ripgrep is slow
+- When you need token counts before deciding what to read
+
+**Use Grep instead for:**
+- Quick text searches mid-task (no index needed)
+- Small/medium repos (<500 files)
+- Known literal patterns
 
 ## Tool Decision Matrix
 
@@ -39,51 +56,37 @@ Use canopy when you need to find code symbols (functions, classes, structs) or w
 | Text pattern | `rg` / Grep |
 | **Function/class definition** | **canopy** |
 | Token count before reading | canopy |
-| Large repo (1000+ files) | canopy |
-| Code structure to rewrite | ast-grep |
-
-## When to Use Canopy
-
-**Use canopy for:**
-- Symbol search: `canopy_query(symbol="authenticate")` - find function/class definitions
-- Large repos where ripgrep is slow
-- When you need token counts before deciding what to read
-- Parallel agents that can share an indexed codebase
-
-**Use Grep instead for:**
-- Quick text searches mid-task (no index needed)
-- Small/medium repos (<500 files)
-- Known literal patterns like `console.log`
+| Large repo (500+ files) | canopy |
 
 ## Quick Reference
 
 ### Index first (once per session)
 ```
-canopy_index(glob="**/*.{rs,py,ts,js,go}")
+canopy_index(path="/path/to/repo", glob="**/*.{rs,py,ts,js,go}")
 ```
 
 ### Symbol search (unique capability)
 ```
-canopy_query(symbol="handleError")
-canopy_query(symbol="authenticate", glob="src/**/*.py")
+canopy_query(path="/path/to/repo", symbol="handleError")
+canopy_query(path="/path/to/repo", symbol="authenticate", glob="src/**/*.py")
 ```
 
 ### Text search with token awareness
 ```
-canopy_query(pattern="TODO")
-canopy_query(pattern="error", glob="src/*.rs")
+canopy_query(path="/path/to/repo", pattern="TODO")
+canopy_query(path="/path/to/repo", pattern="error", glob="src/*.rs")
 ```
 
 ### Multi-pattern search
 ```
-canopy_query(patterns=["TODO", "FIXME"])                    # Match any (OR)
-canopy_query(patterns=["auth", "validate"], match="all")    # Match all (AND)
+canopy_query(path="/path/to/repo", patterns=["TODO", "FIXME"])
+canopy_query(path="/path/to/repo", patterns=["auth", "validate"], match="all")
 ```
 
 ### Auto-expand (default: 5000 tokens)
-Results are auto-expanded if they fit within the token budget. For large results, use `canopy_expand`:
+Results auto-expand if they fit budget. For large results:
 ```
-canopy_expand(handle_ids=["h1a2b3c...", "h5d6e7f..."])
+canopy_expand(path="/path/to/repo", handle_ids=["h1a2b3c...", "h5d6e7f..."])
 ```
 
 ## API Reference
@@ -91,15 +94,15 @@ canopy_expand(handle_ids=["h1a2b3c...", "h5d6e7f..."])
 ### canopy_index
 Index files for querying.
 ```
-canopy_index(glob="**/*.rs")
-canopy_index(path="/path/to/repo", glob="**/*.rs")  # Explicit repo path
+canopy_index(path="/path/to/repo", glob="**/*.rs")
 ```
+**Required:** `path`, `glob`
 
 ### canopy_query
 Search indexed content. Returns handles with token counts and previews.
 
-**Parameters:**
-- `path` (string): Repository path (defaults to auto-detected)
+**Required:** `path`
+**Optional:**
 - `pattern` (string): Single text pattern
 - `patterns` (array): Multiple patterns
 - `symbol` (string): Code symbol (function, class, struct, method)
@@ -112,24 +115,24 @@ Search indexed content. Returns handles with token counts and previews.
 ### canopy_expand
 Expand handles to full content.
 ```
-canopy_expand(handle_ids=["h1a2b3c4d5e6"])
 canopy_expand(path="/path/to/repo", handle_ids=["h1a2b3c4d5e6"])
 ```
+**Required:** `path`, `handle_ids`
 
 ### canopy_status
 Get index statistics (file count, tokens, last indexed).
 ```
-canopy_status()
 canopy_status(path="/path/to/repo")
 ```
+**Required:** `path`
 
 ### canopy_invalidate
 Force reindex of files.
 ```
-canopy_invalidate()                          # All files
-canopy_invalidate(glob="*.rs")               # Only matching files
-canopy_invalidate(path="/path/to/repo")      # Specific repo
+canopy_invalidate(path="/path/to/repo")
+canopy_invalidate(path="/path/to/repo", glob="*.rs")
 ```
+**Required:** `path`
 
 ## Key Insight
 

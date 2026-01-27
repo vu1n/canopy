@@ -1,6 +1,6 @@
 //! Canopy MCP Server - MCP interface for token-efficient codebase queries
 
-use canopy_core::{FileDiscovery, MatchMode, QueryParams, RepoIndex, Result as CanopyResult};
+use canopy_core::{FileDiscovery, MatchMode, QueryParams, RepoIndex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -11,14 +11,7 @@ fn main() {
     let mut stdout = std::io::stdout();
     let reader = BufReader::new(stdin.lock());
 
-    // Check for CANOPY_ROOT env var first, then detect from current directory
-    let repo_root = if let Ok(root) = std::env::var("CANOPY_ROOT") {
-        PathBuf::from(root)
-    } else {
-        detect_repo_root().unwrap_or_else(|_| std::env::current_dir().unwrap())
-    };
-
-    let server = McpServer::new(repo_root);
+    let server = McpServer::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -38,9 +31,7 @@ fn main() {
     }
 }
 
-struct McpServer {
-    repo_root: PathBuf,
-}
+struct McpServer;
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -68,8 +59,8 @@ struct JsonRpcError {
 }
 
 impl McpServer {
-    fn new(repo_root: PathBuf) -> Self {
-        Self { repo_root }
+    fn new() -> Self {
+        Self
     }
 
     fn handle_request(&self, line: &str) -> Option<String> {
@@ -139,14 +130,14 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path to index (defaults to auto-detected root)"
+                                "description": "Repository path to index (e.g., '/path/to/repo')"
                             },
                             "glob": {
                                 "type": "string",
                                 "description": "Glob pattern for files to index (e.g., '**/*.rs')"
                             }
                         },
-                        "required": ["glob"]
+                        "required": ["path", "glob"]
                     }
                 },
                 {
@@ -157,7 +148,7 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path to query (defaults to auto-detected root)"
+                                "description": "Repository path to query (e.g., '/path/to/repo')"
                             },
                             "pattern": {
                                 "type": "string",
@@ -197,7 +188,8 @@ impl McpServer {
                                 "type": "string",
                                 "description": "[Fallback] S-expression DSL query. Use params above instead. Examples: (grep \"TODO\"), (section \"auth\"), (in-file \"src/*.rs\" (grep \"error\"))"
                             }
-                        }
+                        },
+                        "required": ["path"]
                     }
                 },
                 {
@@ -208,7 +200,7 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path (defaults to auto-detected root)"
+                                "description": "Repository path (e.g., '/path/to/repo')"
                             },
                             "handle_ids": {
                                 "type": "array",
@@ -216,7 +208,7 @@ impl McpServer {
                                 "description": "Handle IDs to expand (e.g., ['h1a2b3c4d5e6', 'h5d6e7f8a9b0'])"
                             }
                         },
-                        "required": ["handle_ids"]
+                        "required": ["path", "handle_ids"]
                     }
                 },
                 {
@@ -227,9 +219,10 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path (defaults to auto-detected root)"
+                                "description": "Repository path (e.g., '/path/to/repo')"
                             }
-                        }
+                        },
+                        "required": ["path"]
                     }
                 },
                 {
@@ -240,13 +233,14 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path (defaults to auto-detected root)"
+                                "description": "Repository path (e.g., '/path/to/repo')"
                             },
                             "glob": {
                                 "type": "string",
                                 "description": "Glob pattern to invalidate (all files if omitted)"
                             }
-                        }
+                        },
+                        "required": ["path"]
                     }
                 }
             ]
@@ -281,7 +275,7 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .ok_or((-32602, "Missing 'glob' parameter".to_string()))?;
 
-        let repo_root = self.get_repo_root(args);
+        let repo_root = self.get_repo_root(args)?;
         let mut index = self.open_index_at(&repo_root)?;
         let stats = index
             .index(glob)
@@ -305,7 +299,7 @@ impl McpServer {
     }
 
     fn tool_query(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let repo_root = self.get_repo_root(args);
+        let repo_root = self.get_repo_root(args)?;
         let mut index = self.open_index_at(&repo_root)?;
 
         // Auto-index if no files indexed yet
@@ -419,7 +413,7 @@ impl McpServer {
             return Err((-32602, "Empty handle_ids array".to_string()));
         }
 
-        let repo_root = self.get_repo_root(args);
+        let repo_root = self.get_repo_root(args)?;
         let index = self.open_index_at(&repo_root)?;
         let contents = index
             .expand(&handle_ids)
@@ -441,7 +435,7 @@ impl McpServer {
     }
 
     fn tool_status(&self, args: &Value) -> Result<Value, (i32, String)> {
-        let repo_root = self.get_repo_root(args);
+        let repo_root = self.get_repo_root(args)?;
         let index = self.open_index_at(&repo_root)?;
         let status = index.status().map_err(|e| (-32000, e.to_string()))?;
 
@@ -469,7 +463,7 @@ impl McpServer {
     fn tool_invalidate(&self, args: &Value) -> Result<Value, (i32, String)> {
         let glob = args.get("glob").and_then(|v| v.as_str());
 
-        let repo_root = self.get_repo_root(args);
+        let repo_root = self.get_repo_root(args)?;
         let mut index = self.open_index_at(&repo_root)?;
         let count = index
             .invalidate(glob)
@@ -492,23 +486,11 @@ impl McpServer {
         RepoIndex::open(root).map_err(|e| (-32000, e.to_string()))
     }
 
-    /// Get repo root from args, falling back to default
-    fn get_repo_root(&self, args: &Value) -> PathBuf {
+    /// Get repo root from args (required parameter)
+    fn get_repo_root(&self, args: &Value) -> Result<PathBuf, (i32, String)> {
         args.get("path")
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
-            .unwrap_or_else(|| self.repo_root.clone())
-    }
-}
-
-fn detect_repo_root() -> CanopyResult<PathBuf> {
-    let mut current = std::env::current_dir()?;
-    loop {
-        if current.join(".canopy").exists() || current.join(".git").exists() {
-            return Ok(current);
-        }
-        if !current.pop() {
-            return Ok(std::env::current_dir()?);
-        }
+            .ok_or_else(|| (-32602, "Missing required 'path' parameter".to_string()))
     }
 }
