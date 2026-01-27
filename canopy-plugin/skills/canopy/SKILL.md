@@ -1,12 +1,33 @@
 ---
-name: canopy-search
+name: canopy
 description: >
-  Semantic code intelligence for large codebases. Find functions, classes, and symbols.
-  Use for token-aware retrieval and shared indexes across parallel agents.
-user_invocable: false
+  Check canopy index status and optionally reindex the current repository.
+user_invocable: true
+arg_description: "[path] - optional repo path (defaults to current directory)"
 ---
 
 # Canopy: Semantic Code Intelligence
+
+## When invoked via /canopy
+
+1. Call `canopy_status(path)` to get current index state (use arg as path if provided)
+2. Display: files indexed, total tokens, repo root, file discovery method
+3. Ask user: "Reindex now?" with options for glob pattern
+
+Example response:
+```
+Canopy index status:
+- Repository: /Users/vuln/code/myproject
+- Files indexed: 47 (125k tokens)
+- File discovery: fd
+- Last indexed: 5 minutes ago
+
+Would you like to reindex? [Yes - default glob] [Yes - custom glob] [No]
+```
+
+---
+
+## Background: When to use canopy
 
 Use canopy when you need to find code symbols (functions, classes, structs) or when working with large codebases (500+ files). For simple text searches in small repos, prefer ripgrep/Grep.
 
