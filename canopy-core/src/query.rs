@@ -1,8 +1,9 @@
 //! Query DSL parser and executor
 
 use crate::error::CanopyError;
-use crate::handle::Handle;
+use crate::handle::{Handle, RefHandle};
 use crate::index::RepoIndex;
+use crate::parse::estimate_tokens;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -25,6 +26,14 @@ pub enum Query {
     Intersect(Vec<Query>),
     /// (limit N query) - limit results
     Limit(usize, Box<Query>),
+    /// (children "parent") - get all children of a parent symbol
+    Children(String),
+    /// (children-named "parent" "symbol") - get named children of a parent
+    ChildrenNamed(String, String),
+    /// (definition "symbol") - exact match symbol definition
+    Definition(String),
+    /// (references "symbol") - find references to a symbol
+    References(String),
 }
 
 /// Match mode for multi-pattern queries
@@ -36,6 +45,19 @@ pub enum MatchMode {
     Any,
     /// Intersect: match all of the patterns (AND)
     All,
+}
+
+/// Query kind for filtering results
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum QueryKind {
+    /// Match any (default behavior)
+    #[default]
+    Any,
+    /// Only match definitions
+    Definition,
+    /// Only match references (calls, imports, type usages)
+    Reference,
 }
 
 /// Simplified query parameters (params-only API)
@@ -59,6 +81,14 @@ pub struct QueryParams {
     /// Section heading to search for (markdown sections)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub section: Option<String>,
+
+    /// Parent symbol to filter by (e.g., class name for methods)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+
+    /// Query kind: definition, reference, or any (default)
+    #[serde(default)]
+    pub kind: QueryKind,
 
     /// File path glob pattern to filter results
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -114,6 +144,26 @@ impl QueryParams {
         }
     }
 
+    /// Create a parent search (get all children)
+    pub fn parent(parent: impl Into<String>) -> Self {
+        Self {
+            parent: Some(parent.into()),
+            ..Default::default()
+        }
+    }
+
+    /// Set the parent filter
+    pub fn with_parent(mut self, parent: impl Into<String>) -> Self {
+        self.parent = Some(parent.into());
+        self
+    }
+
+    /// Set the query kind (definition, reference, any)
+    pub fn with_kind(mut self, kind: QueryKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     /// Filter by file glob
     pub fn with_glob(mut self, glob: impl Into<String>) -> Self {
         self.glob = Some(glob.into());
@@ -140,30 +190,61 @@ impl QueryParams {
 
     /// Convert params to Query AST
     pub fn to_query(&self) -> crate::Result<Query> {
-        // Build the base query
-        let base_query = if let Some(symbol) = &self.symbol {
-            Query::Code(symbol.clone())
-        } else if let Some(section) = &self.section {
-            Query::Section(section.clone())
-        } else if let Some(pattern) = &self.pattern {
-            Query::Grep(pattern.clone())
-        } else if let Some(patterns) = &self.patterns {
-            if patterns.is_empty() {
-                return Err(CanopyError::QueryParse {
-                    position: 0,
-                    message: "Empty patterns array".to_string(),
-                });
-            }
-            let queries: Vec<Query> = patterns.iter().map(|p| Query::Grep(p.clone())).collect();
-            match self.match_mode {
-                MatchMode::Any => Query::Union(queries),
-                MatchMode::All => Query::Intersect(queries),
-            }
-        } else {
+        // Validate: kind requires symbol
+        if !matches!(self.kind, QueryKind::Any) && self.symbol.is_none() {
             return Err(CanopyError::QueryParse {
                 position: 0,
-                message: "Must specify pattern, patterns, symbol, or section".to_string(),
+                message: "kind parameter requires symbol to be specified".to_string(),
             });
+        }
+
+        // Build the base query based on kind
+        let base_query = match &self.kind {
+            QueryKind::Definition => {
+                let symbol = self.symbol.as_ref().unwrap(); // validated above
+                // If parent is specified, use ChildrenNamed, otherwise Definition
+                if let Some(parent) = &self.parent {
+                    Query::ChildrenNamed(parent.clone(), symbol.clone())
+                } else {
+                    Query::Definition(symbol.clone())
+                }
+            }
+            QueryKind::Reference => {
+                let symbol = self.symbol.as_ref().unwrap(); // validated above
+                Query::References(symbol.clone())
+            }
+            QueryKind::Any => {
+                // Check for parent + symbol combination
+                if let (Some(parent), Some(symbol)) = (&self.parent, &self.symbol) {
+                    Query::ChildrenNamed(parent.clone(), symbol.clone())
+                } else if let Some(parent) = &self.parent {
+                    // Just parent - get all children
+                    Query::Children(parent.clone())
+                } else if let Some(symbol) = &self.symbol {
+                    Query::Code(symbol.clone())
+                } else if let Some(section) = &self.section {
+                    Query::Section(section.clone())
+                } else if let Some(pattern) = &self.pattern {
+                    Query::Grep(pattern.clone())
+                } else if let Some(patterns) = &self.patterns {
+                    if patterns.is_empty() {
+                        return Err(CanopyError::QueryParse {
+                            position: 0,
+                            message: "Empty patterns array".to_string(),
+                        });
+                    }
+                    let queries: Vec<Query> = patterns.iter().map(|p| Query::Grep(p.clone())).collect();
+                    match self.match_mode {
+                        MatchMode::Any => Query::Union(queries),
+                        MatchMode::All => Query::Intersect(queries),
+                    }
+                } else {
+                    return Err(CanopyError::QueryParse {
+                        position: 0,
+                        message: "Must specify pattern, patterns, symbol, section, or parent".to_string(),
+                    });
+                }
+            }
         };
 
         // Apply glob filter if specified
@@ -196,6 +277,8 @@ impl QueryParams {
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
     pub handles: Vec<Handle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ref_handles: Option<Vec<RefHandle>>,
     pub total_tokens: usize,
     pub truncated: bool,
     pub total_matches: usize,
@@ -269,6 +352,29 @@ pub fn execute_query_with_options(
 ) -> crate::Result<QueryResult> {
     let default_limit = index.default_limit();
     let effective_limit = options.limit.unwrap_or(default_limit);
+
+    if let Query::References(symbol) = query {
+        let mut refs = index.search_references(symbol, effective_limit * 2)?;
+        let total_matches = refs.len();
+        let truncated = refs.len() > effective_limit;
+        refs.truncate(effective_limit);
+
+        let total_tokens = refs
+            .iter()
+            .map(|r| estimate_tokens(&r.preview))
+            .sum();
+
+        return Ok(QueryResult {
+            handles: Vec::new(),
+            ref_handles: Some(refs),
+            total_tokens,
+            truncated,
+            total_matches,
+            auto_expanded: false,
+            expand_note: None,
+        });
+    }
+
     let handles = execute_query_internal(query, index, effective_limit * 2)?;
 
     let total_matches = handles.len();
@@ -306,6 +412,7 @@ pub fn execute_query_with_options(
 
     Ok(QueryResult {
         handles,
+        ref_handles: None,
         total_tokens,
         truncated,
         total_matches,
@@ -327,6 +434,18 @@ fn execute_query_internal(
         Query::File(path) => index.get_file(path),
 
         Query::Code(symbol) => index.search_code(symbol, limit),
+
+        Query::Children(parent) => index.search_children(parent, limit),
+
+        Query::ChildrenNamed(parent, symbol) => index.search_children_named(parent, symbol, limit),
+
+        Query::Definition(symbol) => index.search_definitions(symbol, limit),
+
+        Query::References(symbol) => {
+            // References return RefHandles, but for now we convert to regular Handles
+            // by returning nodes that contain the reference
+            index.search_reference_sources(symbol, limit)
+        }
 
         Query::InFile(glob, subquery) => {
             // Only support grep inside in-file for now
@@ -479,6 +598,28 @@ impl<'a> QueryParser<'a> {
                 self.skip_whitespace();
                 let subquery = self.parse()?;
                 Query::Limit(n, Box::new(subquery))
+            }
+            "children" => {
+                self.skip_whitespace();
+                let parent = self.parse_string()?;
+                Query::Children(parent)
+            }
+            "children-named" => {
+                self.skip_whitespace();
+                let parent = self.parse_string()?;
+                self.skip_whitespace();
+                let symbol = self.parse_string()?;
+                Query::ChildrenNamed(parent, symbol)
+            }
+            "definition" => {
+                self.skip_whitespace();
+                let symbol = self.parse_string()?;
+                Query::Definition(symbol)
+            }
+            "references" => {
+                self.skip_whitespace();
+                let symbol = self.parse_string()?;
+                Query::References(symbol)
             }
             _ => return Err(self.error(&format!("Unknown operator: {}", op))),
         };

@@ -3,7 +3,8 @@
 use crate::config::{Config, DEFAULT_CONFIG};
 use crate::document::{NodeType, ParsedFile};
 use crate::error::CanopyError;
-use crate::handle::{generate_preview, Handle, HandleId};
+use crate::document::RefType;
+use crate::handle::{generate_preview, Handle, HandleId, RefHandle};
 use crate::parse::{estimate_tokens, parse_file};
 use crate::query::{execute_query, execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult};
 use ignore::WalkBuilder;
@@ -48,7 +49,7 @@ impl FileDiscovery {
     }
 }
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 3;
 
 /// Statistics from an indexing operation
 #[derive(Debug, Serialize)]
@@ -139,14 +140,23 @@ impl RepoIndex {
             PRAGMA busy_timeout = 5000;
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
+            PRAGMA foreign_keys = ON;
             ",
         )?;
 
         // Check schema version
         let version: i32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
 
+        // Fail fast on older schema versions - require reindex
+        if version != 0 && version != SCHEMA_VERSION {
+            return Err(CanopyError::SchemaVersionMismatch {
+                found: version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+
         if version == 0 {
-            // Fresh database, create schema
+            // Fresh database, create schema v2
             conn.execute_batch(
                 "
                 -- File metadata for cache invalidation
@@ -170,12 +180,22 @@ impl RepoIndex {
                     line_start INTEGER NOT NULL,
                     line_end INTEGER NOT NULL,
                     token_count INTEGER NOT NULL,
-                    metadata TEXT
+                    metadata TEXT,
+                    -- NEW COLUMNS in v2:
+                    name TEXT,
+                    name_lower TEXT COLLATE NOCASE,
+                    parent_name TEXT,
+                    parent_name_lower TEXT COLLATE NOCASE,
+                    parent_handle_id TEXT,
+                    preview TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(file_id);
                 CREATE INDEX IF NOT EXISTS idx_nodes_handle ON nodes(handle_id);
                 CREATE INDEX IF NOT EXISTS idx_nodes_type ON nodes(node_type);
+                CREATE INDEX IF NOT EXISTS idx_nodes_name_lower ON nodes(name_lower);
+                CREATE INDEX IF NOT EXISTS idx_nodes_parent_name_lower ON nodes(parent_name_lower);
+                CREATE INDEX IF NOT EXISTS idx_nodes_parent_handle ON nodes(parent_handle_id);
 
                 -- FTS5 index for text search
                 CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(
@@ -189,7 +209,40 @@ impl RepoIndex {
                     node_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE
                 );
 
-                PRAGMA user_version = 1;
+                -- References table (calls, imports, type refs)
+                CREATE TABLE IF NOT EXISTS refs (
+                    id INTEGER PRIMARY KEY,
+                    file_id INTEGER REFERENCES files(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    name_lower TEXT COLLATE NOCASE,
+                    qualifier TEXT,
+                    ref_type TEXT NOT NULL,
+                    source_node_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
+                    span_start INTEGER NOT NULL,
+                    span_end INTEGER NOT NULL,
+                    line_start INTEGER NOT NULL,
+                    line_end INTEGER NOT NULL,
+                    preview TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_refs_name_lower ON refs(name_lower);
+                CREATE INDEX IF NOT EXISTS idx_refs_type ON refs(ref_type);
+                CREATE INDEX IF NOT EXISTS idx_refs_source ON refs(source_node_id);
+                CREATE INDEX IF NOT EXISTS idx_refs_file ON refs(file_id);
+
+                -- Symbol FTS for fuzzy symbol search
+                CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
+                    name,
+                    tokenize='unicode61'
+                );
+
+                -- Mapping from symbol FTS rowid to node
+                CREATE TABLE IF NOT EXISTS symbol_fts_map (
+                    fts_rowid INTEGER PRIMARY KEY,
+                    node_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE
+                );
+
+                PRAGMA user_version = 3;
                 ",
             )?;
         }
@@ -543,10 +596,33 @@ impl RepoIndex {
             let handle_id = HandleId::new(relative_path, node.node_type, &node.span);
             let node_tokens = estimate_tokens(&parsed.source[node.span.clone()]);
 
+            // Extract name from metadata for fast lookup
+            let name = node.metadata.searchable_name().map(String::from);
+            let name_lower = name.as_ref().map(|n| n.to_lowercase());
+
+            // Generate preview at index time
+            let preview = generate_preview(
+                &parsed.source,
+                &node.span,
+                self.config.indexing.preview_bytes,
+            );
+
+            // Parent fields populated in Step 2 (for now, null)
+            let parent_name: Option<&str> = node.parent_name.as_deref();
+            let parent_name_lower = parent_name.map(|p| p.to_lowercase());
+            let parent_handle_id = match (node.parent_node_type, node.parent_span.as_ref()) {
+                (Some(parent_node_type), Some(parent_span)) => Some(
+                    HandleId::new(relative_path, parent_node_type, parent_span).raw().to_string(),
+                ),
+                _ => None,
+            };
+
             tx.execute(
                 "INSERT INTO nodes (file_id, handle_id, node_type, start_byte, end_byte,
-                                   line_start, line_end, token_count, metadata)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                   line_start, line_end, token_count, metadata,
+                                   name, name_lower, parent_name, parent_name_lower,
+                                   parent_handle_id, preview)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     file_id,
                     handle_id.raw(),
@@ -556,7 +632,13 @@ impl RepoIndex {
                     node.line_range.0 as i64,
                     node.line_range.1 as i64,
                     node_tokens as i64,
-                    node.metadata.to_json()
+                    node.metadata.to_json(),
+                    name,
+                    name_lower,
+                    parent_name,
+                    parent_name_lower,
+                    parent_handle_id,
+                    preview
                 ],
             )?;
 
@@ -573,6 +655,71 @@ impl RepoIndex {
             tx.execute(
                 "INSERT INTO fts_node_map (fts_rowid, node_id) VALUES (?, ?)",
                 params![fts_rowid, node_id],
+            )?;
+
+            // Index symbol name in symbol_fts for fuzzy search
+            if let Some(ref sym_name) = name {
+                tx.execute(
+                    "INSERT INTO symbol_fts (name) VALUES (?)",
+                    params![sym_name],
+                )?;
+                let symbol_fts_rowid = tx.last_insert_rowid();
+                tx.execute(
+                    "INSERT INTO symbol_fts_map (fts_rowid, node_id) VALUES (?, ?)",
+                    params![symbol_fts_rowid, node_id],
+                )?;
+            }
+        }
+
+        // Build a map of spans to node IDs for reference source mapping
+        let node_spans: Vec<(std::ops::Range<usize>, i64)> = parsed
+            .nodes
+            .iter()
+            .enumerate()
+            .filter_map(|(_, node)| {
+                // Get the node ID from the database (assumes nodes were inserted in order)
+                let handle_id = HandleId::new(relative_path, node.node_type, &node.span);
+                let node_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM nodes WHERE handle_id = ?",
+                        params![handle_id.raw()],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                node_id.map(|id| (node.span.clone(), id))
+            })
+            .collect();
+
+        // Insert references
+        for reference in &parsed.refs {
+            let name_lower = reference.name.to_lowercase();
+
+            // Find the smallest enclosing node for this reference
+            let source_node_id = find_smallest_enclosing_node(&reference.span, &node_spans);
+
+            let preview = reference_preview(
+                &parsed.source,
+                &reference.span,
+                self.config.indexing.preview_bytes * 2,
+            );
+
+            tx.execute(
+                "INSERT INTO refs (file_id, name, name_lower, qualifier, ref_type,
+                                  source_node_id, span_start, span_end, line_start, line_end, preview)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    file_id,
+                    reference.name,
+                    name_lower,
+                    reference.qualifier,
+                    reference.ref_type.as_str(),
+                    source_node_id,
+                    reference.span.start as i64,
+                    reference.span.end as i64,
+                    reference.line_range.0 as i64,
+                    reference.line_range.1 as i64,
+                    preview,
+                ],
             )?;
         }
 
@@ -725,6 +872,12 @@ impl RepoIndex {
                     }
                 }
 
+                // Clean up orphaned symbol_fts rows (symbol_fts_map rows are removed via FK)
+                self.conn.execute(
+                    "DELETE FROM symbol_fts WHERE rowid NOT IN (SELECT fts_rowid FROM symbol_fts_map)",
+                    [],
+                )?;
+
                 Ok(count)
             }
             None => {
@@ -736,6 +889,9 @@ impl RepoIndex {
                 self.conn.execute("DELETE FROM files", [])?;
                 self.conn.execute("DELETE FROM content_fts", [])?;
                 self.conn.execute("DELETE FROM fts_node_map", [])?;
+                self.conn.execute("DELETE FROM refs", [])?;
+                self.conn.execute("DELETE FROM symbol_fts", [])?;
+                self.conn.execute("DELETE FROM symbol_fts_map", [])?;
 
                 Ok(count as usize)
             }
@@ -749,7 +905,7 @@ impl RepoIndex {
 
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
-                    n.line_start, n.line_end, n.token_count
+                    n.line_start, n.line_end, n.token_count, n.preview
              FROM content_fts fts
              JOIN fts_node_map m ON fts.rowid = m.fts_rowid
              JOIN nodes n ON m.node_id = n.id
@@ -768,6 +924,7 @@ impl RepoIndex {
                 let line_start: i64 = row.get(5)?;
                 let line_end: i64 = row.get(6)?;
                 let token_count: i64 = row.get(7)?;
+                let preview: Option<String> = row.get(8)?;
 
                 Ok((
                     handle_id,
@@ -778,19 +935,15 @@ impl RepoIndex {
                     line_start as usize,
                     line_end as usize,
                     token_count as usize,
+                    preview.unwrap_or_else(|| "...".to_string()),
                 ))
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
                     let span = start..end;
-
-                    // Generate preview by reading file
-                    let preview = self
-                        .read_preview(&file_path, &span)
-                        .unwrap_or_else(|_| "...".to_string());
 
                     Handle {
                         id: HandleId::from_raw(handle_id),
@@ -813,7 +966,7 @@ impl RepoIndex {
     pub fn get_nodes_by_type(&self, node_type: NodeType, limit: usize) -> crate::Result<Vec<Handle>> {
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
-                    n.line_start, n.line_end, n.token_count, n.metadata
+                    n.line_start, n.line_end, n.token_count, n.preview
              FROM nodes n
              JOIN files f ON n.file_id = f.id
              WHERE n.node_type = ?
@@ -830,6 +983,7 @@ impl RepoIndex {
                 let line_start: i64 = row.get(5)?;
                 let line_end: i64 = row.get(6)?;
                 let token_count: i64 = row.get(7)?;
+                let preview: Option<String> = row.get(8)?;
 
                 Ok((
                     handle_id,
@@ -840,18 +994,15 @@ impl RepoIndex {
                     line_start as usize,
                     line_end as usize,
                     token_count as usize,
+                    preview.unwrap_or_else(|| "...".to_string()),
                 ))
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
                     let span = start..end;
-
-                    let preview = self
-                        .read_preview(&file_path, &span)
-                        .unwrap_or_else(|_| "...".to_string());
 
                     Handle {
                         id: HandleId::from_raw(handle_id),
@@ -876,7 +1027,7 @@ impl RepoIndex {
 
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
-                    n.line_start, n.line_end, n.token_count, n.metadata
+                    n.line_start, n.line_end, n.token_count, n.preview
              FROM nodes n
              JOIN files f ON n.file_id = f.id
              WHERE n.node_type = ?
@@ -896,6 +1047,7 @@ impl RepoIndex {
                     let line_start: i64 = row.get(5)?;
                     let line_end: i64 = row.get(6)?;
                     let token_count: i64 = row.get(7)?;
+                    let preview: Option<String> = row.get(8)?;
 
                     Ok((
                         handle_id,
@@ -906,19 +1058,16 @@ impl RepoIndex {
                         line_start as usize,
                         line_end as usize,
                         token_count as usize,
+                        preview.unwrap_or_else(|| "...".to_string()),
                     ))
                 },
             )?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Section);
                     let span = start..end;
-
-                    let preview = self
-                        .read_preview(&file_path, &span)
-                        .unwrap_or_else(|_| "...".to_string());
 
                     Handle {
                         id: HandleId::from_raw(handle_id),
@@ -939,15 +1088,15 @@ impl RepoIndex {
 
     /// Search for code symbols by name
     pub fn search_code(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
-        let pattern = format!("%{}%", symbol.to_lowercase());
+        let symbol_lower = symbol.to_lowercase();
 
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
-                    n.line_start, n.line_end, n.token_count, n.metadata
+                    n.line_start, n.line_end, n.token_count, n.preview
              FROM nodes n
              JOIN files f ON n.file_id = f.id
              WHERE n.node_type IN (?, ?, ?, ?)
-               AND LOWER(json_extract(n.metadata, '$.name')) LIKE ?
+               AND n.name_lower = ?
              LIMIT ?",
         )?;
 
@@ -958,7 +1107,7 @@ impl RepoIndex {
                     NodeType::Class.as_int() as i32,
                     NodeType::Struct.as_int() as i32,
                     NodeType::Method.as_int() as i32,
-                    pattern,
+                    symbol_lower,
                     limit as i64
                 ],
                 |row| {
@@ -970,6 +1119,7 @@ impl RepoIndex {
                     let line_start: i64 = row.get(5)?;
                     let line_end: i64 = row.get(6)?;
                     let token_count: i64 = row.get(7)?;
+                    let preview: Option<String> = row.get(8)?;
 
                     Ok((
                         handle_id,
@@ -980,19 +1130,92 @@ impl RepoIndex {
                         line_start as usize,
                         line_end as usize,
                         token_count as usize,
+                        preview.unwrap_or_else(|| "...".to_string()),
                     ))
                 },
             )?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
                     let span = start..end;
 
-                    let preview = self
-                        .read_preview(&file_path, &span)
-                        .unwrap_or_else(|_| "...".to_string());
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        if handles.is_empty() {
+            return self.search_symbol_fuzzy(symbol, limit);
+        }
+
+        Ok(handles)
+    }
+
+    fn search_symbol_fuzzy(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let escaped = escape_fts5_query(symbol);
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.preview
+             FROM symbol_fts fts
+             JOIN symbol_fts_map m ON fts.rowid = m.fts_rowid
+             JOIN nodes n ON m.node_id = n.id
+             JOIN files f ON n.file_id = f.id
+             WHERE fts.name MATCH ?
+               AND n.node_type IN (?, ?, ?, ?)
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(
+                params![
+                    escaped,
+                    NodeType::Function.as_int() as i32,
+                    NodeType::Class.as_int() as i32,
+                    NodeType::Struct.as_int() as i32,
+                    NodeType::Method.as_int() as i32,
+                    limit as i64
+                ],
+                |row| {
+                    let handle_id: String = row.get(0)?;
+                    let file_path: String = row.get(1)?;
+                    let node_type_int: i32 = row.get(2)?;
+                    let start_byte: i64 = row.get(3)?;
+                    let end_byte: i64 = row.get(4)?;
+                    let line_start: i64 = row.get(5)?;
+                    let line_end: i64 = row.get(6)?;
+                    let token_count: i64 = row.get(7)?;
+                    let preview: Option<String> = row.get(8)?;
+
+                    Ok((
+                        handle_id,
+                        file_path,
+                        node_type_int,
+                        start_byte as usize,
+                        end_byte as usize,
+                        line_start as usize,
+                        line_end as usize,
+                        token_count as usize,
+                        preview.unwrap_or_else(|| "...".to_string()),
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
+                    let span = start..end;
 
                     Handle {
                         id: HandleId::from_raw(handle_id),
@@ -1066,7 +1289,7 @@ impl RepoIndex {
 
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
-                    n.line_start, n.line_end, n.token_count
+                    n.line_start, n.line_end, n.token_count, n.preview
              FROM content_fts fts
              JOIN fts_node_map m ON fts.rowid = m.fts_rowid
              JOIN nodes n ON m.node_id = n.id
@@ -1084,6 +1307,7 @@ impl RepoIndex {
                 let line_start: i64 = row.get(5)?;
                 let line_end: i64 = row.get(6)?;
                 let token_count: i64 = row.get(7)?;
+                let preview: Option<String> = row.get(8)?;
 
                 Ok((
                     handle_id,
@@ -1094,20 +1318,17 @@ impl RepoIndex {
                     line_start as usize,
                     line_end as usize,
                     token_count as usize,
+                    preview.unwrap_or_else(|| "...".to_string()),
                 ))
             })?
             .filter_map(|r| r.ok())
-            .filter(|(_, file_path, _, _, _, _, _, _)| glob_matcher.is_match(file_path))
+            .filter(|(_, file_path, _, _, _, _, _, _, _)| glob_matcher.is_match(file_path))
             .take(limit)
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens)| {
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
                     let span = start..end;
-
-                    let preview = self
-                        .read_preview(&file_path, &span)
-                        .unwrap_or_else(|_| "...".to_string());
 
                     Handle {
                         id: HandleId::from_raw(handle_id),
@@ -1126,21 +1347,353 @@ impl RepoIndex {
         Ok(handles)
     }
 
-    /// Read preview for a file span
-    fn read_preview(&self, relative_path: &str, span: &std::ops::Range<usize>) -> crate::Result<String> {
-        let full_path = self.repo_root.join(relative_path);
-        let source = fs::read_to_string(&full_path)?;
-        Ok(generate_preview(
-            &source,
-            span,
-            self.config.indexing.preview_bytes,
-        ))
+    /// Search for children of a parent symbol
+    pub fn search_children(&self, parent: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let parent_lower = parent.to_lowercase();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.preview
+             FROM nodes n
+             JOIN files f ON n.file_id = f.id
+             WHERE n.parent_name_lower = ?
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(params![parent_lower, limit as i64], |row| {
+                let handle_id: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let node_type_int: i32 = row.get(2)?;
+                let start_byte: i64 = row.get(3)?;
+                let end_byte: i64 = row.get(4)?;
+                let line_start: i64 = row.get(5)?;
+                let line_end: i64 = row.get(6)?;
+                let token_count: i64 = row.get(7)?;
+                let preview: Option<String> = row.get(8)?;
+
+                Ok((
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start_byte as usize,
+                    end_byte as usize,
+                    line_start as usize,
+                    line_end as usize,
+                    token_count as usize,
+                    preview.unwrap_or_else(|| "...".to_string()),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Method);
+                    let span = start..end;
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Search for named children of a parent symbol
+    pub fn search_children_named(&self, parent: &str, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let parent_lower = parent.to_lowercase();
+        let symbol_lower = symbol.to_lowercase();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.preview
+             FROM nodes n
+             JOIN files f ON n.file_id = f.id
+             WHERE n.parent_name_lower = ?
+               AND n.name_lower = ?
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(params![parent_lower, symbol_lower, limit as i64], |row| {
+                let handle_id: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let node_type_int: i32 = row.get(2)?;
+                let start_byte: i64 = row.get(3)?;
+                let end_byte: i64 = row.get(4)?;
+                let line_start: i64 = row.get(5)?;
+                let line_end: i64 = row.get(6)?;
+                let token_count: i64 = row.get(7)?;
+                let preview: Option<String> = row.get(8)?;
+
+                Ok((
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start_byte as usize,
+                    end_byte as usize,
+                    line_start as usize,
+                    line_end as usize,
+                    token_count as usize,
+                    preview.unwrap_or_else(|| "...".to_string()),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Method);
+                    let span = start..end;
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Search for symbol definitions (exact match on name_lower)
+    pub fn search_definitions(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let symbol_lower = symbol.to_lowercase();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.preview
+             FROM nodes n
+             JOIN files f ON n.file_id = f.id
+             WHERE n.name_lower = ?
+               AND n.node_type IN (?, ?, ?, ?)
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(
+                params![
+                    symbol_lower,
+                    NodeType::Function.as_int() as i32,
+                    NodeType::Class.as_int() as i32,
+                    NodeType::Struct.as_int() as i32,
+                    NodeType::Method.as_int() as i32,
+                    limit as i64
+                ],
+                |row| {
+                    let handle_id: String = row.get(0)?;
+                    let file_path: String = row.get(1)?;
+                    let node_type_int: i32 = row.get(2)?;
+                    let start_byte: i64 = row.get(3)?;
+                    let end_byte: i64 = row.get(4)?;
+                    let line_start: i64 = row.get(5)?;
+                    let line_end: i64 = row.get(6)?;
+                    let token_count: i64 = row.get(7)?;
+                    let preview: Option<String> = row.get(8)?;
+
+                    Ok((
+                        handle_id,
+                        file_path,
+                        node_type_int,
+                        start_byte as usize,
+                        end_byte as usize,
+                        line_start as usize,
+                        line_end as usize,
+                        token_count as usize,
+                        preview.unwrap_or_else(|| "...".to_string()),
+                    ))
+                },
+            )?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
+                    let span = start..end;
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Search for source nodes containing references to a symbol
+    pub fn search_reference_sources(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+        let symbol_lower = symbol.to_lowercase();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.preview
+             FROM refs r
+             JOIN nodes n ON r.source_node_id = n.id
+             JOIN files f ON n.file_id = f.id
+             WHERE r.name_lower = ?
+             LIMIT ?",
+        )?;
+
+        let handles: Vec<Handle> = stmt
+            .query_map(params![symbol_lower, limit as i64], |row| {
+                let handle_id: String = row.get(0)?;
+                let file_path: String = row.get(1)?;
+                let node_type_int: i32 = row.get(2)?;
+                let start_byte: i64 = row.get(3)?;
+                let end_byte: i64 = row.get(4)?;
+                let line_start: i64 = row.get(5)?;
+                let line_end: i64 = row.get(6)?;
+                let token_count: i64 = row.get(7)?;
+                let preview: Option<String> = row.get(8)?;
+
+                Ok((
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start_byte as usize,
+                    end_byte as usize,
+                    line_start as usize,
+                    line_end as usize,
+                    token_count as usize,
+                    preview.unwrap_or_else(|| "...".to_string()),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(
+                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                    let node_type =
+                        NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
+                    let span = start..end;
+
+                    Handle {
+                        id: HandleId::from_raw(handle_id),
+                        file_path,
+                        node_type,
+                        span,
+                        line_range: (line_start, line_end),
+                        token_count: tokens,
+                        preview,
+                        content: None,
+                    }
+                },
+            )
+            .collect();
+
+        Ok(handles)
+    }
+
+    /// Search for references to a symbol (returns RefHandles)
+    pub fn search_references(&self, symbol: &str, limit: usize) -> crate::Result<Vec<RefHandle>> {
+        let symbol_lower = symbol.to_lowercase();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT f.path, r.span_start, r.span_end, r.line_start, r.line_end,
+                    r.name, r.qualifier, r.ref_type, n.handle_id, r.preview
+             FROM refs r
+             JOIN files f ON r.file_id = f.id
+             LEFT JOIN nodes n ON r.source_node_id = n.id
+             WHERE r.name_lower = ?
+             LIMIT ?",
+        )?;
+
+        let refs: Vec<RefHandle> = stmt
+            .query_map(params![symbol_lower, limit as i64], |row| {
+                let file_path: String = row.get(0)?;
+                let span_start: i64 = row.get(1)?;
+                let span_end: i64 = row.get(2)?;
+                let line_start: i64 = row.get(3)?;
+                let line_end: i64 = row.get(4)?;
+                let name: String = row.get(5)?;
+                let qualifier: Option<String> = row.get(6)?;
+                let ref_type_str: String = row.get(7)?;
+                let source_handle_id: Option<String> = row.get(8)?;
+                let preview: Option<String> = row.get(9)?;
+
+                Ok((
+                    file_path,
+                    span_start as usize,
+                    span_end as usize,
+                    line_start as usize,
+                    line_end as usize,
+                    name,
+                    qualifier,
+                    ref_type_str,
+                    source_handle_id,
+                    preview.unwrap_or_else(|| "...".to_string()),
+                ))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(file_path, span_start, span_end, line_start, line_end, name, qualifier, ref_type_str, source_handle_id, preview)| {
+                let ref_type = RefType::from_str(&ref_type_str).unwrap_or(RefType::Call);
+                let span = span_start..span_end;
+
+                RefHandle {
+                    file_path,
+                    span,
+                    line_range: (line_start, line_end),
+                    name,
+                    qualifier,
+                    ref_type,
+                    source_handle: source_handle_id.map(HandleId::from_raw),
+                    preview,
+                }
+            })
+            .collect();
+
+        Ok(refs)
     }
 
     /// Get default result limit
     pub fn default_limit(&self) -> usize {
         self.config.core.default_result_limit
     }
+}
+
+/// Find the smallest node that encloses the given span
+fn find_smallest_enclosing_node(ref_span: &std::ops::Range<usize>, nodes: &[(std::ops::Range<usize>, i64)]) -> Option<i64> {
+    nodes
+        .iter()
+        .filter(|(span, _)| span.start <= ref_span.start && ref_span.end <= span.end)
+        .min_by_key(|(span, _)| span.end - span.start)
+        .map(|(_, id)| *id)
+}
+
+/// Generate a preview for a reference span using the containing line
+fn reference_preview(source: &str, span: &std::ops::Range<usize>, max_bytes: usize) -> String {
+    let line_start = source[..span.start.min(source.len())]
+        .rfind('\n')
+        .map(|p| p + 1)
+        .unwrap_or(0);
+    let line_end = source[span.end.min(source.len())..]
+        .find('\n')
+        .map(|p| span.end + p)
+        .unwrap_or(source.len());
+
+    let preview_span = line_start..line_end;
+    generate_preview(source, &preview_span, max_bytes)
 }
 
 /// Escape FTS5 special characters
@@ -1174,4 +1727,3 @@ fn update_gitignore(repo_root: &Path) -> crate::Result<()> {
 
     Ok(())
 }
-

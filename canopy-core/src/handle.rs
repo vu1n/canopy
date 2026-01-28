@@ -1,5 +1,6 @@
 //! Handle types for referencing content without expansion
 
+use crate::document::RefType;
 use crate::{CanopyError, NodeType, Span};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -139,6 +140,49 @@ impl<'de> Deserialize<'de> for NodeType {
                 s
             ))),
         }
+    }
+}
+
+/// Handle for a reference (call, import, type usage)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefHandle {
+    /// File path (repo-relative)
+    pub file_path: String,
+    /// Byte span of the reference
+    pub span: Span,
+    /// Line range (1-indexed)
+    pub line_range: (usize, usize),
+    /// The referenced name (unqualified)
+    pub name: String,
+    /// Optional qualifier (e.g., object name, module path)
+    pub qualifier: Option<String>,
+    /// Type of reference
+    pub ref_type: RefType,
+    /// Handle of the containing function/class (if any)
+    pub source_handle: Option<HandleId>,
+    /// Preview text around the reference
+    pub preview: String,
+}
+
+// Serialize RefType as string for JSON output
+impl Serialize for RefType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for RefType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        RefType::from_str(&s).ok_or_else(|| {
+            serde::de::Error::custom(format!("Unknown ref type: {}", s))
+        })
     }
 }
 

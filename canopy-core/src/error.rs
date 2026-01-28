@@ -40,4 +40,7 @@ pub enum CanopyError {
 
     #[error("Tree-sitter parse error for {path}: {message}")]
     TreeSitterParse { path: String, message: String },
+
+    #[error("Schema version mismatch: database is v{found}, expected v{expected}. Run 'canopy invalidate' then 'canopy index' to reindex.")]
+    SchemaVersionMismatch { found: i32, expected: i32 },
 }

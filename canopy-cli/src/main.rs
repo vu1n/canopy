@@ -42,6 +42,14 @@ enum Commands {
         #[arg(short, long)]
         symbol: Option<String>,
 
+        /// Filter by parent symbol (e.g., class name for methods)
+        #[arg(long)]
+        parent: Option<String>,
+
+        /// Query kind: definition, reference, or any (default)
+        #[arg(short, long, value_parser = ["definition", "reference", "any"])]
+        kind: Option<String>,
+
         /// Filter by file glob pattern
         #[arg(short, long)]
         glob: Option<String>,
@@ -81,10 +89,12 @@ fn main() {
             query,
             pattern,
             symbol,
+            parent,
+            kind,
             glob,
             expand_budget,
             limit,
-        } => cmd_query(cli.root, query, pattern, symbol, glob, expand_budget, limit, cli.json),
+        } => cmd_query(cli.root, query, pattern, symbol, parent, kind, glob, expand_budget, limit, cli.json),
         Commands::Expand { handle_ids } => cmd_expand(cli.root, &handle_ids, cli.json),
         Commands::Status => cmd_status(cli.root, cli.json),
         Commands::Invalidate { glob } => cmd_invalidate(cli.root, glob, cli.json),
@@ -155,12 +165,14 @@ fn cmd_query(
     query_str: Option<String>,
     pattern: Option<String>,
     symbol: Option<String>,
+    parent: Option<String>,
+    kind: Option<String>,
     glob: Option<String>,
     expand_budget: Option<usize>,
     limit: Option<usize>,
     json: bool,
 ) -> canopy_core::Result<()> {
-    use canopy_core::{QueryParams, RepoIndex};
+    use canopy_core::{QueryKind, QueryParams, RepoIndex};
     use colored::Colorize;
 
     let repo_root = detect_repo_root(root)?;
@@ -175,7 +187,7 @@ fn cmd_query(
             expand_budget,
         };
         index.query_with_options(&query_str, options)?
-    } else if pattern.is_some() || symbol.is_some() {
+    } else if pattern.is_some() || symbol.is_some() || parent.is_some() {
         // New params-based API
         let mut params = QueryParams::new();
 
@@ -184,6 +196,16 @@ fn cmd_query(
         }
         if let Some(s) = symbol {
             params.symbol = Some(s);
+        }
+        if let Some(p) = parent {
+            params.parent = Some(p);
+        }
+        if let Some(k) = kind {
+            params.kind = match k.as_str() {
+                "definition" => QueryKind::Definition,
+                "reference" => QueryKind::Reference,
+                _ => QueryKind::Any,
+            };
         }
         if let Some(g) = glob {
             params.glob = Some(g);
@@ -199,12 +221,39 @@ fn cmd_query(
     } else {
         return Err(canopy_core::CanopyError::QueryParse {
             position: 0,
-            message: "Must provide either a query s-expression or --pattern/--symbol flag".to_string(),
+            message: "Must provide either a query s-expression or --pattern/--symbol/--parent flag".to_string(),
         });
     };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    } else if let Some(refs) = &result.ref_handles {
+        for reference in refs {
+            let qualifier = reference
+                .qualifier
+                .as_ref()
+                .map(|q| format!("{}.", q))
+                .unwrap_or_default();
+            let source = reference
+                .source_handle
+                .as_ref()
+                .map(|h| format!(" in {}", h.to_string().cyan()))
+                .unwrap_or_default();
+            println!(
+                "{}: {}:{}-{} {}{} ({}) {:?}",
+                "ref".cyan(),
+                reference.file_path,
+                reference.line_range.0,
+                reference.line_range.1,
+                qualifier,
+                reference.name,
+                reference.ref_type.as_str(),
+                reference.preview
+            );
+            if !source.is_empty() {
+                println!("{}", source);
+            }
+        }
     } else {
         for handle in &result.handles {
             if let Some(content) = &handle.content {
@@ -232,23 +281,30 @@ fn cmd_query(
                 );
             }
         }
-        if result.truncated {
-            println!(
-                "... ({} showing {} of {} results)",
-                "truncated".yellow(),
-                result.handles.len(),
-                result.total_matches
-            );
-        }
-        if let Some(note) = &result.expand_note {
-            println!("{}: {}", "Note".yellow(), note);
-        }
-        println!("({} results, {} tokens{})",
-            result.handles.len(),
-            result.total_tokens,
-            if result.auto_expanded { ", auto-expanded" } else { "" }
+    }
+
+    let shown = result
+        .ref_handles
+        .as_ref()
+        .map(|r| r.len())
+        .unwrap_or_else(|| result.handles.len());
+    if result.truncated {
+        println!(
+            "... ({} showing {} of {} results)",
+            "truncated".yellow(),
+            shown,
+            result.total_matches
         );
     }
+    if let Some(note) = &result.expand_note {
+        println!("{}: {}", "Note".yellow(), note);
+    }
+    println!(
+        "({} results, {} tokens{})",
+        shown,
+        result.total_tokens,
+        if result.auto_expanded { ", auto-expanded" } else { "" }
+    );
     Ok(())
 }
 

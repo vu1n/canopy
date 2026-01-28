@@ -1,6 +1,6 @@
 //! Canopy MCP Server - MCP interface for token-efficient codebase queries
 
-use canopy_core::{FileDiscovery, MatchMode, QueryParams, RepoIndex};
+use canopy_core::{FileDiscovery, MatchMode, QueryKind, QueryParams, RepoIndex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -142,7 +142,7 @@ impl McpServer {
                 },
                 {
                     "name": "canopy_query",
-                    "description": "Query indexed content. Preferred: use individual params (pattern, symbol, section, glob). Fallback: use query param for s-expression DSL. Returns handles (references) with optional auto-expansion.",
+                    "description": "Query indexed content. Preferred: use individual params (pattern, symbol, section, glob). Fallback: use query param for s-expression DSL. Returns handles (or ref_handles when kind=reference) with optional auto-expansion.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -166,6 +166,15 @@ impl McpServer {
                             "section": {
                                 "type": "string",
                                 "description": "Section heading search (markdown sections)"
+                            },
+                            "parent": {
+                                "type": "string",
+                                "description": "Filter by parent symbol (e.g., class name for methods)"
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["definition", "reference", "any"],
+                                "description": "Query kind: 'definition' for exact symbol match, 'reference' for usages, 'any' (default)"
                             },
                             "glob": {
                                 "type": "string",
@@ -350,6 +359,20 @@ impl McpServer {
             params.section = Some(section.to_string());
         }
 
+        // Set parent filter
+        if let Some(parent) = args.get("parent").and_then(|v| v.as_str()) {
+            params.parent = Some(parent.to_string());
+        }
+
+        // Set kind
+        if let Some(kind) = args.get("kind").and_then(|v| v.as_str()) {
+            params.kind = match kind {
+                "definition" => QueryKind::Definition,
+                "reference" => QueryKind::Reference,
+                _ => QueryKind::Any,
+            };
+        }
+
         // Set glob filter
         if let Some(glob) = args.get("glob").and_then(|v| v.as_str()) {
             params.glob = Some(glob.to_string());
@@ -381,10 +404,11 @@ impl McpServer {
             && params.patterns.is_none()
             && params.symbol.is_none()
             && params.section.is_none()
+            && params.parent.is_none()
         {
             return Err((
                 -32602,
-                "Must specify one of: pattern, patterns, symbol, section, or query".to_string(),
+                "Must specify one of: pattern, patterns, symbol, section, parent, or query".to_string(),
             ));
         }
 

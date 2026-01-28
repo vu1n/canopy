@@ -60,6 +60,14 @@ pub struct DocumentNode {
     pub span: Span,
     pub line_range: (usize, usize), // 1-indexed line numbers
     pub metadata: NodeMetadata,
+    /// Parent symbol name (e.g., class name for methods)
+    pub parent_name: Option<String>,
+    /// Handle ID of parent node (if applicable)
+    pub parent_handle_id: Option<String>,
+    /// Parent node type (if applicable)
+    pub parent_node_type: Option<NodeType>,
+    /// Parent node span (if applicable)
+    pub parent_span: Option<Span>,
 }
 
 /// Type-specific metadata
@@ -183,12 +191,58 @@ impl NodeMetadata {
     }
 }
 
-/// Parsed file with nodes
+/// Reference type (call, import, type usage)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefType {
+    /// Function/method call
+    Call,
+    /// Import statement
+    Import,
+    /// Type reference (type annotation, inheritance)
+    TypeRef,
+}
+
+impl RefType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Call => "call",
+            Self::Import => "import",
+            Self::TypeRef => "type_ref",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "call" => Some(Self::Call),
+            "import" => Some(Self::Import),
+            "type_ref" => Some(Self::TypeRef),
+            _ => None,
+        }
+    }
+}
+
+/// A reference (call, import, type usage) extracted from code
+#[derive(Debug, Clone)]
+pub struct Reference {
+    /// The unqualified name being referenced
+    pub name: String,
+    /// Optional qualifier (e.g., module path, object name)
+    pub qualifier: Option<String>,
+    /// Type of reference
+    pub ref_type: RefType,
+    /// Byte span of the reference in source
+    pub span: Span,
+    /// Line range (1-indexed)
+    pub line_range: (usize, usize),
+}
+
+/// Parsed file with nodes and references
 #[derive(Debug)]
 pub struct ParsedFile {
     pub path: PathBuf,
     pub source: String,
     pub content_hash: [u8; 32],
     pub nodes: Vec<DocumentNode>,
+    pub refs: Vec<Reference>,
     pub total_tokens: usize,
 }
