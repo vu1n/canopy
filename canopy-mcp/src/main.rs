@@ -1,6 +1,9 @@
 //! Canopy MCP Server - MCP interface for token-efficient codebase queries
 
+mod predict;
+
 use canopy_core::{FileDiscovery, MatchMode, QueryKind, QueryParams, RepoIndex};
+use predict::{extract_extensions_from_glob, extract_query_text, predict_globs};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -311,11 +314,70 @@ impl McpServer {
         let repo_root = self.get_repo_root(args)?;
         let mut index = self.open_index_at(&repo_root)?;
 
-        // Auto-index if no files indexed yet
+        // Auto-index: use predictive indexing for large repos
+        let default_glob = index.config().default_glob().to_string();
         let status = index.status().map_err(|e| (-32000, e.to_string()))?;
-        if status.files_indexed == 0 {
-            let default_glob = index.config().default_glob().to_string();
-            index.index(&default_glob).map_err(|e| (-32000, e.to_string()))?;
+
+        // Count files to determine if this is a large repo
+        // Only count once (when no files indexed yet) to avoid repeated walks
+        const LARGE_REPO_THRESHOLD: usize = 1000;
+        const MAX_PREDICTIVE_FILES: usize = 500;
+
+        let is_large_repo = if status.files_indexed == 0 {
+            let all_files = index.walk_files(&default_glob).unwrap_or_default();
+            all_files.len() > LARGE_REPO_THRESHOLD
+        } else {
+            // If already indexed, check if we indexed less than full repo would have
+            // (heuristic: if indexed < threshold, assume it was predictive)
+            status.files_indexed < LARGE_REPO_THRESHOLD
+        };
+
+        if status.files_indexed == 0 && !is_large_repo {
+            // Small repo with no index: full index is fine
+            index
+                .index(&default_glob)
+                .map_err(|e| (-32000, e.to_string()))?;
+        } else if is_large_repo {
+            // Large repo: always run predictive indexing
+            // needs_reindex() will skip already-indexed files, so this is safe
+            // for multi-agent fan-out where each agent has different queries
+            let query_text = extract_query_text(args);
+            let extensions = extract_extensions_from_glob(&default_glob);
+            let predicted_globs = predict_globs(&query_text, &extensions);
+
+            eprintln!(
+                "[canopy] Large repo, predictive indexing for: {:?}",
+                predicted_globs.iter().take(5).collect::<Vec<_>>()
+            );
+
+            // Index predicted globs until we hit file cap
+            let mut total_indexed = 0;
+            for glob in &predicted_globs {
+                if total_indexed >= MAX_PREDICTIVE_FILES {
+                    break;
+                }
+                match index.index(glob) {
+                    Ok(stats) => {
+                        total_indexed += stats.files_indexed;
+                    }
+                    Err(_e) => {
+                        // Glob might not match any files, that's ok
+                    }
+                }
+            }
+
+            if total_indexed > 0 {
+                eprintln!("[canopy] Predictively indexed {} new files", total_indexed);
+            }
+
+            // If prediction found nothing AND no files exist, fall back to entry points
+            let current_status = index.status().map_err(|e| (-32000, e.to_string()))?;
+            if current_status.files_indexed == 0 {
+                eprintln!("[canopy] No files indexed, adding entry points");
+                let _ = index.index("**/main.*");
+                let _ = index.index("**/index.*");
+                let _ = index.index("**/app.*");
+            }
         }
 
         // Check if DSL query is provided (fallback path)

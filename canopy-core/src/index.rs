@@ -311,53 +311,25 @@ impl RepoIndex {
 
     /// Walk files matching glob, respecting .gitignore
     /// Uses fd > ripgrep > ignore crate (in order of preference)
-    fn walk_files(&self, glob: &str) -> crate::Result<Vec<PathBuf>> {
+    pub fn walk_files(&self, glob: &str) -> crate::Result<Vec<PathBuf>> {
         let discovery = FileDiscovery::detect();
 
-        // Extract extensions from glob pattern (e.g., "**/*.rs" -> ["rs"])
-        let extensions = Self::extract_extensions(glob);
-
         match discovery {
-            FileDiscovery::Fd => self.walk_files_fd(&extensions),
-            FileDiscovery::Ripgrep => self.walk_files_rg(&extensions),
+            FileDiscovery::Fd => self.walk_files_fd(glob),
+            FileDiscovery::Ripgrep => self.walk_files_rg(glob),
             FileDiscovery::Ignore => self.walk_files_ignore(glob),
         }
     }
 
-    /// Extract file extensions from a glob pattern
-    fn extract_extensions(glob: &str) -> Vec<String> {
-        let mut extensions = Vec::new();
-
-        // Handle patterns like "**/*.{rs,py,ts}" or "**/*.rs"
-        if let Some(ext_part) = glob.rsplit('.').next() {
-            // Check for brace expansion: {rs,py,ts}
-            if ext_part.starts_with('{') && ext_part.ends_with('}') {
-                let inner = &ext_part[1..ext_part.len()-1];
-                for ext in inner.split(',') {
-                    let ext = ext.trim();
-                    if !ext.is_empty() && !ext.contains('*') {
-                        extensions.push(ext.to_string());
-                    }
-                }
-            } else if !ext_part.contains('*') && !ext_part.contains('/') {
-                // Simple extension like "rs"
-                extensions.push(ext_part.to_string());
-            }
-        }
-
-        extensions
-    }
-
     /// Walk files using fd (fastest)
-    fn walk_files_fd(&self, extensions: &[String]) -> crate::Result<Vec<PathBuf>> {
+    fn walk_files_fd(&self, glob: &str) -> crate::Result<Vec<PathBuf>> {
         let mut cmd = Command::new("fd");
         cmd.arg("--type").arg("f");
         cmd.arg("--hidden"); // Include hidden, let .gitignore handle it
 
-        // Add extensions
-        for ext in extensions {
-            cmd.arg("-e").arg(ext);
-        }
+        // Use glob pattern for filtering (supports directory patterns like **/auth/**/*.ts)
+        // -p enables full path matching (not just filename)
+        cmd.arg("--glob").arg("-p").arg(glob);
 
         // Add exclusions from config
         for pattern in &self.config.ignore.patterns {
@@ -365,14 +337,14 @@ impl RepoIndex {
         }
 
         // Search in repo root
-        cmd.arg(".").arg(&self.repo_root);
+        cmd.arg(&self.repo_root);
 
         let output = cmd.output()
             .map_err(|e| CanopyError::Io(e))?;
 
         if !output.status.success() {
             // Fallback to ignore crate on error
-            return self.walk_files_ignore(&format!("**/*.{{{}}}", extensions.join(",")));
+            return self.walk_files_ignore(glob);
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -386,15 +358,13 @@ impl RepoIndex {
     }
 
     /// Walk files using ripgrep --files
-    fn walk_files_rg(&self, extensions: &[String]) -> crate::Result<Vec<PathBuf>> {
+    fn walk_files_rg(&self, glob: &str) -> crate::Result<Vec<PathBuf>> {
         let mut cmd = Command::new("rg");
         cmd.arg("--files");
         cmd.arg("--hidden"); // Include hidden, let .gitignore handle it
 
-        // Add type filters (ripgrep uses --type or --glob)
-        for ext in extensions {
-            cmd.arg("--glob").arg(format!("*.{}", ext));
-        }
+        // Use glob pattern for filtering (supports directory patterns like **/auth/**/*.ts)
+        cmd.arg("--glob").arg(glob);
 
         // Add exclusions from config
         for pattern in &self.config.ignore.patterns {
@@ -410,7 +380,7 @@ impl RepoIndex {
 
         if !output.status.success() {
             // Fallback to ignore crate on error
-            return self.walk_files_ignore(&format!("**/*.{{{}}}", extensions.join(",")));
+            return self.walk_files_ignore(glob);
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);
