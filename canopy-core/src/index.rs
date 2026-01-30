@@ -70,11 +70,27 @@ pub struct IndexStatus {
     pub last_indexed: Option<String>,
 }
 
+/// Cached symbol entry for O(1) lookups
+#[derive(Clone)]
+struct SymbolCacheEntry {
+    handle_id: String,
+    file_path: String,
+    node_type: i32,
+    start_byte: usize,
+    end_byte: usize,
+    line_start: usize,
+    line_end: usize,
+    token_count: usize,
+    preview: String,
+}
+
 /// Repository index backed by SQLite
 pub struct RepoIndex {
     repo_root: PathBuf,
     conn: Connection,
     config: Config,
+    /// Symbol cache: name_lower -> entries (preloaded at open for O(1) lookups)
+    symbol_cache: std::collections::HashMap<String, Vec<SymbolCacheEntry>>,
 }
 
 impl RepoIndex {
@@ -124,16 +140,78 @@ impl RepoIndex {
         // Initialize or migrate schema
         Self::init_schema(&conn)?;
 
+        // Load symbol cache for O(1) lookups
+        let symbol_cache = Self::load_symbol_cache(&conn)?;
+
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             conn,
             config,
+            symbol_cache,
         })
+    }
+
+    /// Load symbol cache from database (preload for fast lookups)
+    fn load_symbol_cache(conn: &Connection) -> crate::Result<std::collections::HashMap<String, Vec<SymbolCacheEntry>>> {
+        use std::collections::HashMap;
+
+        let mut cache: HashMap<String, Vec<SymbolCacheEntry>> = HashMap::new();
+
+        // Only load code symbols (function, class, struct, method)
+        let mut stmt = conn.prepare(
+            "SELECT n.name_lower, n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
+                    n.line_start, n.line_end, n.token_count, n.preview
+             FROM nodes n
+             JOIN files f ON n.file_id = f.id
+             WHERE n.name_lower IS NOT NULL
+               AND n.node_type IN (?, ?, ?, ?)",
+        )?;
+
+        let rows = stmt.query_map(
+            params![
+                NodeType::Function.as_int() as i32,
+                NodeType::Class.as_int() as i32,
+                NodeType::Struct.as_int() as i32,
+                NodeType::Method.as_int() as i32,
+            ],
+            |row| {
+                let name_lower: String = row.get(0)?;
+                let handle_id: String = row.get(1)?;
+                let file_path: String = row.get(2)?;
+                let node_type: i32 = row.get(3)?;
+                let start_byte: i64 = row.get(4)?;
+                let end_byte: i64 = row.get(5)?;
+                let line_start: i64 = row.get(6)?;
+                let line_end: i64 = row.get(7)?;
+                let token_count: i64 = row.get(8)?;
+                let preview: Option<String> = row.get(9)?;
+
+                Ok((name_lower, SymbolCacheEntry {
+                    handle_id,
+                    file_path,
+                    node_type,
+                    start_byte: start_byte as usize,
+                    end_byte: end_byte as usize,
+                    line_start: line_start as usize,
+                    line_end: line_end as usize,
+                    token_count: token_count as usize,
+                    preview: preview.unwrap_or_else(|| "...".to_string()),
+                }))
+            },
+        )?;
+
+        for row in rows {
+            if let Ok((name, entry)) = row {
+                cache.entry(name).or_insert_with(Vec::new).push(entry);
+            }
+        }
+
+        Ok(cache)
     }
 
     /// Initialize database schema
     fn init_schema(conn: &Connection) -> crate::Result<()> {
-        // Enable WAL mode for concurrent access
+        // Enable WAL mode for concurrent access + mmap for faster reads
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
@@ -141,6 +219,7 @@ impl RepoIndex {
             PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
             PRAGMA foreign_keys = ON;
+            PRAGMA mmap_size = 268435456;
             ",
         )?;
 
@@ -531,7 +610,7 @@ impl RepoIndex {
     fn index_parsed_file(&mut self, relative_path: &str, parsed: &ParsedFile) -> crate::Result<()> {
         let tx = self.conn.transaction()?;
 
-        // Delete existing entry
+        // Delete existing entry (and remove from cache)
         tx.execute("DELETE FROM files WHERE path = ?", params![relative_path])?;
 
         let mtime = fs::metadata(&parsed.path)
@@ -560,6 +639,9 @@ impl RepoIndex {
         )?;
 
         let file_id = tx.last_insert_rowid();
+
+        // Collect symbols for cache update
+        let mut new_cache_entries: Vec<(String, SymbolCacheEntry)> = Vec::new();
 
         // Insert nodes
         for node in &parsed.nodes {
@@ -604,11 +686,11 @@ impl RepoIndex {
                     node_tokens as i64,
                     node.metadata.to_json(),
                     name,
-                    name_lower,
+                    name_lower.clone(),
                     parent_name,
                     parent_name_lower,
                     parent_handle_id,
-                    preview
+                    preview.clone()
                 ],
             )?;
 
@@ -638,6 +720,23 @@ impl RepoIndex {
                     "INSERT INTO symbol_fts_map (fts_rowid, node_id) VALUES (?, ?)",
                     params![symbol_fts_rowid, node_id],
                 )?;
+
+                // Collect code symbols for cache
+                if matches!(node.node_type, NodeType::Function | NodeType::Class | NodeType::Struct | NodeType::Method) {
+                    if let Some(ref nl) = name_lower {
+                        new_cache_entries.push((nl.clone(), SymbolCacheEntry {
+                            handle_id: handle_id.raw().to_string(),
+                            file_path: relative_path.to_string(),
+                            node_type: node.node_type.as_int() as i32,
+                            start_byte: node.span.start,
+                            end_byte: node.span.end,
+                            line_start: node.line_range.0,
+                            line_end: node.line_range.1,
+                            token_count: node_tokens,
+                            preview: preview.clone(),
+                        }));
+                    }
+                }
             }
         }
 
@@ -694,6 +793,15 @@ impl RepoIndex {
         }
 
         tx.commit()?;
+
+        // Update symbol cache with newly indexed symbols
+        for (name_lower, entry) in new_cache_entries {
+            self.symbol_cache
+                .entry(name_lower)
+                .or_insert_with(Vec::new)
+                .push(entry);
+        }
+
         Ok(())
     }
 
@@ -834,10 +942,12 @@ impl RepoIndex {
                     .collect();
 
                 let mut count = 0;
+                let mut deleted_paths: Vec<String> = Vec::new();
                 for (id, path) in rows {
                     if glob_matcher.is_match(&path) {
                         self.conn
                             .execute("DELETE FROM files WHERE id = ?", params![id])?;
+                        deleted_paths.push(path);
                         count += 1;
                     }
                 }
@@ -847,6 +957,13 @@ impl RepoIndex {
                     "DELETE FROM symbol_fts WHERE rowid NOT IN (SELECT fts_rowid FROM symbol_fts_map)",
                     [],
                 )?;
+
+                // Remove invalidated entries from symbol cache
+                for (_, entries) in self.symbol_cache.iter_mut() {
+                    entries.retain(|e| !deleted_paths.contains(&e.file_path));
+                }
+                // Remove empty entries
+                self.symbol_cache.retain(|_, v| !v.is_empty());
 
                 Ok(count)
             }
@@ -862,6 +979,9 @@ impl RepoIndex {
                 self.conn.execute("DELETE FROM refs", [])?;
                 self.conn.execute("DELETE FROM symbol_fts", [])?;
                 self.conn.execute("DELETE FROM symbol_fts_map", [])?;
+
+                // Clear symbol cache
+                self.symbol_cache.clear();
 
                 Ok(count as usize)
             }
@@ -1060,6 +1180,34 @@ impl RepoIndex {
     pub fn search_code(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
         let symbol_lower = symbol.to_lowercase();
 
+        // Fast path: check symbol cache first (O(1) lookup)
+        if let Some(entries) = self.symbol_cache.get(&symbol_lower) {
+            let handles: Vec<Handle> = entries
+                .iter()
+                .take(limit)
+                .map(|e| {
+                    let node_type = NodeType::from_int(e.node_type as u8).unwrap_or(NodeType::Function);
+                    let span = e.start_byte..e.end_byte;
+
+                    Handle {
+                        id: HandleId::from_raw(e.handle_id.clone()),
+                        file_path: e.file_path.clone(),
+                        node_type,
+                        span,
+                        line_range: (e.line_start, e.line_end),
+                        token_count: e.token_count,
+                        preview: e.preview.clone(),
+                        content: None,
+                    }
+                })
+                .collect();
+
+            if !handles.is_empty() {
+                return Ok(handles);
+            }
+        }
+
+        // Slow path: database query (for symbols not in cache, e.g., newly indexed)
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
                     n.line_start, n.line_end, n.token_count, n.preview
@@ -1445,6 +1593,34 @@ impl RepoIndex {
     pub fn search_definitions(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
         let symbol_lower = symbol.to_lowercase();
 
+        // Fast path: check symbol cache first (O(1) lookup)
+        if let Some(entries) = self.symbol_cache.get(&symbol_lower) {
+            let handles: Vec<Handle> = entries
+                .iter()
+                .take(limit)
+                .map(|e| {
+                    let node_type = NodeType::from_int(e.node_type as u8).unwrap_or(NodeType::Function);
+                    let span = e.start_byte..e.end_byte;
+
+                    Handle {
+                        id: HandleId::from_raw(e.handle_id.clone()),
+                        file_path: e.file_path.clone(),
+                        node_type,
+                        span,
+                        line_range: (e.line_start, e.line_end),
+                        token_count: e.token_count,
+                        preview: e.preview.clone(),
+                        content: None,
+                    }
+                })
+                .collect();
+
+            if !handles.is_empty() {
+                return Ok(handles);
+            }
+        }
+
+        // Slow path: database query
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
                     n.line_start, n.line_end, n.token_count, n.preview
