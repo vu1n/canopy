@@ -180,7 +180,7 @@ impl<'de> Deserialize<'de> for RefType {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        RefType::from_str(&s)
+        RefType::parse(&s)
             .ok_or_else(|| serde::de::Error::custom(format!("Unknown ref type: {}", s)))
     }
 }

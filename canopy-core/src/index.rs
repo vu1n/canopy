@@ -207,10 +207,8 @@ impl RepoIndex {
             },
         )?;
 
-        for row in rows {
-            if let Ok((name, entry)) = row {
-                cache.entry(name).or_insert_with(Vec::new).push(entry);
-            }
+        for (name, entry) in rows.flatten() {
+            cache.entry(name).or_default().push(entry);
         }
 
         Ok(cache)
@@ -425,7 +423,7 @@ impl RepoIndex {
         // Search in repo root
         cmd.arg(&self.repo_root);
 
-        let output = cmd.output().map_err(|e| CanopyError::Io(e))?;
+        let output = cmd.output().map_err(CanopyError::Io)?;
 
         if !output.status.success() {
             // Fallback to ignore crate on error
@@ -460,7 +458,7 @@ impl RepoIndex {
         // Search in repo root
         cmd.arg(&self.repo_root);
 
-        let output = cmd.output().map_err(|e| CanopyError::Io(e))?;
+        let output = cmd.output().map_err(CanopyError::Io)?;
 
         if !output.status.success() {
             // Fallback to ignore crate on error
@@ -753,8 +751,7 @@ impl RepoIndex {
         let node_spans: Vec<(std::ops::Range<usize>, i64)> = parsed
             .nodes
             .iter()
-            .enumerate()
-            .filter_map(|(_, node)| {
+            .filter_map(|node| {
                 // Get the node ID from the database (assumes nodes were inserted in order)
                 let handle_id = HandleId::new(relative_path, node.node_type, &node.span);
                 let node_id: Option<i64> = tx
@@ -805,10 +802,7 @@ impl RepoIndex {
 
         // Update symbol cache with newly indexed symbols
         for (name_lower, entry) in new_cache_entries {
-            self.symbol_cache
-                .entry(name_lower)
-                .or_insert_with(Vec::new)
-                .push(entry);
+            self.symbol_cache.entry(name_lower).or_default().push(entry);
         }
 
         Ok(())
@@ -1938,7 +1932,7 @@ impl RepoIndex {
                     source_handle_id,
                     preview,
                 )| {
-                    let ref_type = RefType::from_str(&ref_type_str).unwrap_or(RefType::Call);
+                    let ref_type = RefType::parse(&ref_type_str).unwrap_or(RefType::Call);
                     let span = span_start..span_end;
 
                     RefHandle {
@@ -1995,7 +1989,7 @@ fn reference_preview(source: &str, span: &std::ops::Range<usize>, max_bytes: usi
 fn escape_fts5_query(query: &str) -> String {
     // For simple queries, wrap in quotes if it contains special chars
     // FTS5 special chars: " ( ) - * < >
-    if query.contains(|c: char| matches!(c, '"' | '(' | ')' | '-' | '*' | '<' | '>')) {
+    if query.contains(['"', '(', ')', '-', '*', '<', '>']) {
         // Quote the entire query for literal search
         format!("\"{}\"", query.replace('"', "\"\""))
     } else {

@@ -53,7 +53,7 @@ patterns = [
 "#;
 
 /// Canopy configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub core: CoreConfig,
@@ -137,17 +137,6 @@ fn default_ignore_patterns() -> Vec<String> {
         "target".to_string(),
         "__pycache__".to_string(),
     ]
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            core: CoreConfig::default(),
-            indexing: IndexingConfig::default(),
-            fts: FtsConfig::default(),
-            ignore: IgnoreConfig::default(),
-        }
-    }
 }
 
 impl Default for CoreConfig {

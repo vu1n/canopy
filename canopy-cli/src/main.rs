@@ -171,6 +171,7 @@ fn cmd_index(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_query(
     root: Option<std::path::PathBuf>,
     query_str: Option<String>,

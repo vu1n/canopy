@@ -218,7 +218,7 @@ impl RefType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "call" => Some(Self::Call),
             "import" => Some(Self::Import),

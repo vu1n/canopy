@@ -238,7 +238,7 @@ fn parse_code_with_tree_sitter(
         FileType::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
         FileType::TypeScript => {
             // Use TSX for .tsx files, regular TS for others
-            if path.extension().map_or(false, |e| e == "tsx") {
+            if path.extension().is_some_and(|e| e == "tsx") {
                 tree_sitter_typescript::LANGUAGE_TSX.into()
             } else {
                 tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
@@ -755,8 +755,8 @@ fn extract_references(
                         // Extract the last component as the name
                         let name = path
                             .trim_matches('"')
-                            .split('/')
-                            .last()
+                            .rsplit('/')
+                            .next()
                             .unwrap_or(&path)
                             .to_string();
                         if !name.is_empty() {
