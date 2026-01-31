@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: canopy-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: canopy-macos-aarch64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: canopy-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: canopy-linux-aarch64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux ARM64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          if [[ "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/canopy dist/canopy
+          cp target/${{ matrix.target }}/release/canopy-mcp dist/canopy-mcp
+          cd dist
+          tar -czvf ../${{ matrix.name }}.tar.gz *
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.tar.gz
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*.tar.gz
+          generate_release_notes: true
+          body: |
+            ## Installation
+
+            Download the appropriate binary for your platform and extract:
+
+            ```bash
+            # macOS (Apple Silicon)
+            tar -xzf canopy-macos-aarch64.tar.gz
+            sudo mv canopy canopy-mcp /usr/local/bin/
+
+            # macOS (Intel)
+            tar -xzf canopy-macos-x86_64.tar.gz
+            sudo mv canopy canopy-mcp /usr/local/bin/
+
+            # Linux (x86_64)
+            tar -xzf canopy-linux-x86_64.tar.gz
+            sudo mv canopy canopy-mcp /usr/local/bin/
+
+            # Linux (ARM64)
+            tar -xzf canopy-linux-aarch64.tar.gz
+            sudo mv canopy canopy-mcp /usr/local/bin/
+            ```
+
+            Then configure Claude Code:
+
+            ```json
+            {
+              "mcpServers": {
+                "canopy": {
+                  "command": "canopy-mcp"
+                }
+              }
+            }
+            ```
+
+            See [README](https://github.com/vu1n/canopy#readme) for full documentation.
