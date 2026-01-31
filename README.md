@@ -2,17 +2,63 @@
 
 Token-efficient codebase indexing and querying for LLM agents.
 
-## Overview
+## Quick Start with Claude Code
 
-Canopy provides semantic code indexing that helps LLM agents explore large codebases efficiently. Instead of reading entire files, agents get **handles** with previews and selectively expand only what they need.
+### 1. Install
 
-### Key Features
+```bash
+# Clone and build
+git clone https://github.com/vu1n/canopy.git
+cd canopy
+cargo build --release
 
-- **Predictive Lazy Indexing**: Query-driven indexing that predicts relevant paths from keywords, avoiding full upfront indexing on large repos
-- **Handle-Based Results**: Returns lightweight handles with previews (~100 bytes) instead of full content
-- **Selective Expansion**: Agents expand only the handles they need, reducing token usage
-- **Symbol Cache**: O(1) symbol lookups via in-memory cache preloaded at startup
-- **SQLite + mmap**: Fast persistent storage with memory-mapped access
+# Copy binary to a permanent location
+sudo cp target/release/canopy-mcp /usr/local/bin/
+# or
+cp target/release/canopy-mcp ~/.local/bin/
+```
+
+### 2. Configure Claude Code
+
+Add to `~/.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "canopy": {
+      "command": "canopy-mcp"
+    }
+  }
+}
+```
+
+Or for a specific project, create `.mcp.json` in the repo root:
+
+```json
+{
+  "mcpServers": {
+    "canopy": {
+      "command": "canopy-mcp",
+      "args": ["--root", "."]
+    }
+  }
+}
+```
+
+### 3. Use It
+
+Claude Code now has access to canopy tools. Ask questions like:
+
+- *"Find the AuthController class"* → Uses `canopy_query(symbol="AuthController")`
+- *"How does authentication work?"* → Uses `canopy_query(pattern="auth")` with predictive indexing
+- *"List all API endpoints"* → Uses `canopy_query(symbol="Controller")` and expands results
+
+The agent automatically:
+1. Indexes relevant paths based on your query (predictive lazy indexing)
+2. Returns handles with previews instead of full files
+3. Expands only the handles it needs
+
+---
 
 ## When to Use Canopy
 
@@ -45,6 +91,8 @@ Is repo >1000 files?
             └─ No → Use Grep/Glob/Read
 ```
 
+---
+
 ## Performance
 
 Tested on n8n (7,600+ files):
@@ -57,79 +105,13 @@ Tested on n8n (7,600+ files):
 | Simple lookup | Same (no overhead) |
 | **Overall** | **6% cost savings** |
 
-## Installation
+---
 
-```bash
-# Build from source
-cargo build --release
-
-# The binaries will be in target/release/
-# - canopy        (CLI)
-# - canopy-mcp    (MCP server)
-```
-
-## Usage
-
-### CLI
-
-```bash
-# Initialize canopy in a repository
-canopy init
-
-# Index files (automatic on first query)
-canopy index
-
-# Query the codebase
-canopy query --pattern "authentication"
-canopy query --symbol "AuthController"
-canopy query --section "API"
-
-# Check index status
-canopy status
-
-# Expand handles to full content
-canopy expand <handle_id>
-```
-
-### MCP Server
-
-Add to your Claude Code MCP config:
-
-```json
-{
-  "mcpServers": {
-    "canopy": {
-      "command": "/path/to/canopy-mcp",
-      "args": ["--root", "/path/to/repo"]
-    }
-  }
-}
-```
-
-Available MCP tools:
-- `canopy_query` - Search with patterns, symbols, sections, globs
-- `canopy_expand` - Expand handles to full content
-- `canopy_status` - Get index status
-
-## Architecture
-
-```
-┌─────────────────┐
-│  canopy-mcp     │  MCP server for Claude Code
-├─────────────────┤
-│  canopy-cli     │  Command-line interface
-├─────────────────┤
-│  canopy-core    │  Core indexing and query engine
-│  ├─ index.rs    │  SQLite FTS5 + symbol cache
-│  ├─ parse.rs    │  Tree-sitter parsing
-│  ├─ query.rs    │  Query DSL and execution
-│  └─ predict.rs  │  Predictive path selection
-└─────────────────┘
-```
+## How It Works
 
 ### Predictive Lazy Indexing
 
-For large repos (>1000 files), canopy uses keyword heuristics to predict relevant paths:
+For large repos, canopy predicts which paths are relevant based on query keywords:
 
 ```
 Query: "How does authentication work?"
@@ -146,7 +128,7 @@ Query: "How does authentication work?"
          │
          ▼
 ┌─────────────────────────────┐
-│  Index matched paths        │  → ~100-500 files (seconds)
+│  Index matched paths        │  → ~100-500 files (seconds, not minutes)
 └─────────────────────────────┘
          │
          ▼
@@ -172,9 +154,74 @@ Agent expands 2 relevant handles (400 tokens)
 Total: 600 tokens (68% reduction)
 ```
 
+---
+
+## MCP Tools
+
+Once configured, Claude Code has these tools:
+
+### canopy_query
+Search indexed content. Returns handles with previews and token counts.
+
+```
+canopy_query(pattern="authentication")
+canopy_query(symbol="AuthController", glob="src/**/*.ts")
+canopy_query(patterns=["TODO", "FIXME"], match="any")
+```
+
+| Param | Type | Description |
+|-------|------|-------------|
+| `pattern` | string | Text pattern to search |
+| `patterns` | array | Multiple patterns |
+| `symbol` | string | Code symbol (function, class, struct, method) |
+| `section` | string | Markdown section heading |
+| `glob` | string | Filter by file glob |
+| `match` | "any" \| "all" | Multi-pattern mode (default: "any") |
+| `limit` | integer | Max results (default: 100) |
+| `expand_budget` | integer | Auto-expand if tokens fit (default: 5000) |
+
+### canopy_expand
+Expand handles to full content.
+
+```
+canopy_expand(handle_ids=["h1a2b3c...", "h5d6e7f..."])
+```
+
+### canopy_status
+Get index statistics.
+
+### canopy_invalidate
+Force reindex of files.
+
+---
+
+## CLI Usage
+
+The CLI is also available for manual use:
+
+```bash
+# Initialize canopy in a repository
+canopy init
+
+# Index files (automatic on first query)
+canopy index
+
+# Query the codebase
+canopy query --pattern "authentication"
+canopy query --symbol "AuthController"
+
+# Check index status
+canopy status
+
+# Expand handles to full content
+canopy expand <handle_id>
+```
+
+---
+
 ## Configuration
 
-Create `.canopy/config.toml`:
+Create `.canopy/config.toml` in your repo:
 
 ```toml
 [core]
@@ -189,6 +236,26 @@ ttl = "24h"
 patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 ```
 
+---
+
+## Architecture
+
+```
+┌─────────────────┐
+│  canopy-mcp     │  MCP server for Claude Code
+├─────────────────┤
+│  canopy-cli     │  Command-line interface
+├─────────────────┤
+│  canopy-core    │  Core indexing and query engine
+│  ├─ index.rs    │  SQLite FTS5 + symbol cache + mmap
+│  ├─ parse.rs    │  Tree-sitter parsing
+│  ├─ query.rs    │  Query DSL and execution
+│  └─ predict.rs  │  Predictive path selection
+└─────────────────┘
+```
+
+---
+
 ## Benchmarking
 
 ```bash
@@ -197,6 +264,8 @@ patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 ```
 
 Results are saved to `benchmark/results/`.
+
+---
 
 ## License
 
