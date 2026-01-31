@@ -24,63 +24,50 @@ canopy_query(pattern="auth")                                      # ERROR: missi
 3. Display: files indexed, total tokens, repo root, file discovery method
 4. Ask user: "Reindex now?" with options for glob pattern
 
-Example response:
-```
-Canopy index status for /Users/vuln/code/myproject:
-- Files indexed: 47 (125k tokens)
-- File discovery: fd
-- Last indexed: 5 minutes ago
-
-Would you like to reindex? [Yes - default glob] [Yes - custom glob] [No]
-```
-
 ---
 
 ## When to Use Canopy
 
-Canopy is a **time-for-tokens tradeoff**: ~36% slower but ~45% fewer tokens (~44% cost savings).
+### Canopy Excels At (benchmarked on n8n, 7,600 files):
 
-### Canopy Excels At:
-| Scenario | Why |
-|----------|-----|
-| **Multi-iteration exploration** | Overhead amortizes; by iter 3, same speed + fewer tokens |
-| **Deep code review / analysis** | Multiple queries benefit from indexed search |
-| **Large codebases (500+ files)** | Index beats repeated file scans |
-| **Semantic symbol search** | `canopy_query(symbol="authenticate")` finds definitions |
-| **Parallel agents on same repo** | Shared index, reduced redundant file reads |
+| Scenario | Improvement | Why |
+|----------|-------------|-----|
+| **Symbol discovery** | 2.3x more detailed | Finds ~200 endpoints vs ~150 with file:line locations |
+| **Subsystem analysis** | 18% faster, 17% cheaper | Cross-file understanding benefits from index |
+| **Multi-file tracing** | 15% faster, 11% cheaper | Execution flow tracing uses indexed refs |
+| **Large codebases (>1000 files)** | No first-query blocking | Predictive lazy indexing indexes only relevant paths |
+| **Parallel agents on same repo** | Shared SQLite index | O(1) symbol lookups via in-memory cache |
 
 ### Skip Canopy For:
+
 | Scenario | Why |
 |----------|-----|
-| **Quick single lookup** | Index overhead not worth it |
-| **Time-critical tasks** | ~36% slower than native tools |
-| **Small repos (<200 files)** | Native tools are fast enough |
+| **Simple file lookup** | Same speed/cost as baseline |
+| **Known file path** | Just use Read tool directly |
+| **Small repos (<500 files)** | Overhead not worth it |
+| **Quick grep for literal** | Grep is 100ms, canopy is ~1s |
 
-### The Iteration Effect (from benchmarks)
-```
-Iteration 1: Canopy ~94% slower (cold start, index building)
-Iteration 2: Canopy ~16% slower (context building)
-Iteration 3: Canopy reaches parity (token savings accumulate)
-```
+### Decision Tree
 
-**Rule of thumb**: If you expect 3+ search iterations, consider Canopy for token savings.
+```
+Is repo >1000 files?
+  └─ Yes → Use canopy (predictive indexing prevents blocking)
+  └─ No → Do you need symbol search or cross-file tracing?
+            └─ Yes → Use canopy
+            └─ No → Use Grep/Glob/Read
+```
 
 ## Quick Reference
-
-### Index first (once per session)
-```
-canopy_index(path="/path/to/repo", glob="**/*.{rs,py,ts,js,go}")
-```
 
 ### Symbol search (unique capability)
 ```
 canopy_query(path="/path/to/repo", symbol="handleError")
-canopy_query(path="/path/to/repo", symbol="authenticate", glob="src/**/*.py")
+canopy_query(path="/path/to/repo", symbol="AuthController", glob="src/**/*.ts")
 ```
 
 ### Text search with token awareness
 ```
-canopy_query(path="/path/to/repo", pattern="TODO")
+canopy_query(path="/path/to/repo", pattern="authentication")
 canopy_query(path="/path/to/repo", pattern="error", glob="src/*.rs")
 ```
 
@@ -99,11 +86,10 @@ canopy_expand(path="/path/to/repo", handle_ids=["h1a2b3c...", "h5d6e7f..."])
 ## API Reference
 
 ### canopy_index
-Index files for querying.
+Index files for querying. Usually not needed - auto-indexes on first query.
 ```
 canopy_index(path="/path/to/repo", glob="**/*.rs")
 ```
-**Required:** `path`, `glob`
 
 ### canopy_query
 Search indexed content. Returns handles with token counts and previews.
@@ -124,14 +110,12 @@ Expand handles to full content.
 ```
 canopy_expand(path="/path/to/repo", handle_ids=["h1a2b3c4d5e6"])
 ```
-**Required:** `path`, `handle_ids`
 
 ### canopy_status
 Get index statistics (file count, tokens, last indexed).
 ```
 canopy_status(path="/path/to/repo")
 ```
-**Required:** `path`
 
 ### canopy_invalidate
 Force reindex of files.
@@ -139,14 +123,23 @@ Force reindex of files.
 canopy_invalidate(path="/path/to/repo")
 canopy_invalidate(path="/path/to/repo", glob="*.rs")
 ```
-**Required:** `path`
 
-## Key Insights
+## Key Features
 
-1. **Time-for-tokens tradeoff**: ~36% slower but ~45% fewer tokens (~44% cost savings)
+1. **Predictive Lazy Indexing**: On large repos, indexes only paths relevant to your query keywords (auth → `**/auth/**`, `**/login/**`). No 10-minute blocking on first query.
 
-2. **Iteration effect**: Canopy overhead amortizes. By iteration 3, it reaches speed parity while maintaining token savings.
+2. **Symbol Cache**: O(1) lookups via in-memory HashMap preloaded at startup. Falls back to SQLite for cache misses.
 
-3. **Unique capability**: Semantic symbol search - find function/class definitions by name
+3. **Handle-Based Results**: Returns lightweight previews (~100 bytes) instead of full content. Expand only what you need.
 
-4. **Decision rule**: Expect 3+ search iterations? Consider Canopy for token/cost savings.
+4. **Multi-Agent Friendly**: SQLite with WAL mode + mmap. Each agent gets its own cache, shares the persistent index.
+
+## Benchmark Results (n8n, 7,600 files)
+
+| Test | Canopy vs Baseline |
+|------|-------------------|
+| Symbol search | 2.3x more detailed output |
+| Subsystem analysis | 18% faster, 17% cheaper |
+| Multi-file tracing | 15% faster, 11% cheaper |
+| Simple lookup | Same (no overhead) |
+| **Overall** | **6% cost savings** |

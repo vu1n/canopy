@@ -14,15 +14,48 @@ Canopy provides semantic code indexing that helps LLM agents explore large codeb
 - **Symbol Cache**: O(1) symbol lookups via in-memory cache preloaded at startup
 - **SQLite + mmap**: Fast persistent storage with memory-mapped access
 
+## When to Use Canopy
+
+### Best For:
+
+| Scenario | Why |
+|----------|-----|
+| **Large codebases (>1000 files)** | Predictive lazy indexing - no blocking on first query |
+| **Symbol discovery** | Finds function/class definitions with file:line locations |
+| **Cross-file tracing** | Understands execution flows across multiple files |
+| **Subsystem analysis** | Indexes relevant paths for faster exploration |
+| **Parallel agents** | Shared SQLite index with per-agent symbol cache |
+
+### Skip Canopy For:
+
+| Scenario | Use Instead |
+|----------|-------------|
+| Known file path | `Read` tool directly |
+| Literal text pattern | `Grep` tool |
+| File by name | `Glob` / `fd` |
+| Small repos (<500 files) | Native tools are fast enough |
+
+### Decision Tree
+
+```
+Is repo >1000 files?
+  └─ Yes → Use canopy (predictive indexing prevents blocking)
+  └─ No → Do you need symbol search or cross-file tracing?
+            └─ Yes → Use canopy
+            └─ No → Use Grep/Glob/Read
+```
+
 ## Performance
 
 Tested on n8n (7,600+ files):
 
-| Metric | Baseline | Canopy | Improvement |
-|--------|----------|--------|-------------|
-| Cost | $1.26 | $1.18 | **6% savings** |
-| Symbol Search Quality | 178 lines | 414 lines | **2.3x more detail** |
-| First Query | Blocks on full index | Instant (predictive) | **No blocking** |
+| Test | Canopy vs Baseline |
+|------|-------------------|
+| Symbol discovery | **2.3x more detailed** (414 vs 178 lines) |
+| Subsystem analysis | **18% faster, 17% cheaper** |
+| Multi-file tracing | **15% faster, 11% cheaper** |
+| Simple lookup | Same (no overhead) |
+| **Overall** | **6% cost savings** |
 
 ## Installation
 
