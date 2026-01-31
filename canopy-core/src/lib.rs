@@ -16,7 +16,9 @@ pub use document::{DocumentNode, NodeMetadata, NodeType, ParsedFile, RefType, Re
 pub use error::CanopyError;
 pub use handle::{Handle, HandleId, RefHandle};
 pub use index::{FileDiscovery, IndexStats, RepoIndex};
-pub use query::{MatchMode, Query, QueryKind, QueryOptions, QueryParams, QueryResult, DEFAULT_EXPAND_BUDGET};
+pub use query::{
+    MatchMode, Query, QueryKind, QueryOptions, QueryParams, QueryResult, DEFAULT_EXPAND_BUDGET,
+};
 
 /// Result type alias for canopy operations
 pub type Result<T> = std::result::Result<T, CanopyError>;

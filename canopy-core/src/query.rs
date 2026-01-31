@@ -202,7 +202,7 @@ impl QueryParams {
         let base_query = match &self.kind {
             QueryKind::Definition => {
                 let symbol = self.symbol.as_ref().unwrap(); // validated above
-                // If parent is specified, use ChildrenNamed, otherwise Definition
+                                                            // If parent is specified, use ChildrenNamed, otherwise Definition
                 if let Some(parent) = &self.parent {
                     Query::ChildrenNamed(parent.clone(), symbol.clone())
                 } else {
@@ -233,7 +233,8 @@ impl QueryParams {
                             message: "Empty patterns array".to_string(),
                         });
                     }
-                    let queries: Vec<Query> = patterns.iter().map(|p| Query::Grep(p.clone())).collect();
+                    let queries: Vec<Query> =
+                        patterns.iter().map(|p| Query::Grep(p.clone())).collect();
                     match self.match_mode {
                         MatchMode::Any => Query::Union(queries),
                         MatchMode::All => Query::Intersect(queries),
@@ -241,7 +242,8 @@ impl QueryParams {
                 } else {
                     return Err(CanopyError::QueryParse {
                         position: 0,
-                        message: "Must specify pattern, patterns, symbol, section, or parent".to_string(),
+                        message: "Must specify pattern, patterns, symbol, section, or parent"
+                            .to_string(),
                     });
                 }
             }
@@ -338,10 +340,14 @@ pub fn execute_query(
     index: &RepoIndex,
     limit_override: Option<usize>,
 ) -> crate::Result<QueryResult> {
-    execute_query_with_options(query, index, QueryOptions {
-        limit: limit_override,
-        expand_budget: None,
-    })
+    execute_query_with_options(
+        query,
+        index,
+        QueryOptions {
+            limit: limit_override,
+            expand_budget: None,
+        },
+    )
 }
 
 /// Execute a query with full options including expand_budget
@@ -359,10 +365,7 @@ pub fn execute_query_with_options(
         let truncated = refs.len() > effective_limit;
         refs.truncate(effective_limit);
 
-        let total_tokens = refs
-            .iter()
-            .map(|r| estimate_tokens(&r.preview))
-            .sum();
+        let total_tokens = refs.iter().map(|r| estimate_tokens(&r.preview)).sum();
 
         return Ok(QueryResult {
             handles: Vec::new(),
@@ -390,7 +393,8 @@ pub fn execute_query_with_options(
             // Expand all handles
             let handle_ids: Vec<String> = handles.iter().map(|h| h.id.to_string()).collect();
             if let Ok(contents) = index.expand(&handle_ids) {
-                let content_map: std::collections::HashMap<String, String> = contents.into_iter().collect();
+                let content_map: std::collections::HashMap<String, String> =
+                    contents.into_iter().collect();
                 for handle in &mut handles {
                     if let Some(content) = content_map.get(&handle.id.to_string()) {
                         handle.content = Some(content.clone());
@@ -491,8 +495,10 @@ fn execute_query_internal(
 
             // Execute first query
             let first_results = execute_query_internal(&queries[0], index, limit * 2)?;
-            let mut result_ids: HashSet<String> =
-                first_results.iter().map(|h| h.id.raw().to_string()).collect();
+            let mut result_ids: HashSet<String> = first_results
+                .iter()
+                .map(|h| h.id.raw().to_string())
+                .collect();
 
             // Intersect with remaining queries
             for q in &queries[1..] {
@@ -720,9 +726,7 @@ impl<'a> QueryParser<'a> {
         }
 
         let num_str = &self.input[start..self.pos];
-        num_str
-            .parse()
-            .map_err(|_| self.error("Expected number"))
+        num_str.parse().map_err(|_| self.error("Expected number"))
     }
 
     fn error(&self, message: &str) -> CanopyError {
@@ -913,7 +917,9 @@ mod tests {
         let result = params.to_query();
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, CanopyError::QueryParse { message, .. } if message.contains("Must specify")));
+        assert!(
+            matches!(err, CanopyError::QueryParse { message, .. } if message.contains("Must specify"))
+        );
     }
 
     #[test]
@@ -922,6 +928,8 @@ mod tests {
         let result = params.to_query();
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, CanopyError::QueryParse { message, .. } if message.contains("Empty patterns")));
+        assert!(
+            matches!(err, CanopyError::QueryParse { message, .. } if message.contains("Empty patterns"))
+        );
     }
 }

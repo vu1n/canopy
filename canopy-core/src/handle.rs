@@ -69,9 +69,9 @@ impl FromStr for HandleId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Handle {
     pub id: HandleId,
-    pub file_path: String,        // Repo-relative
+    pub file_path: String, // Repo-relative
     pub node_type: NodeType,
-    pub span: Span,               // Byte range in file
+    pub span: Span,                 // Byte range in file
     pub line_range: (usize, usize), // For display (1-indexed)
     pub token_count: usize,
     pub preview: String,
@@ -180,9 +180,8 @@ impl<'de> Deserialize<'de> for RefType {
         D: serde::Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        RefType::from_str(&s).ok_or_else(|| {
-            serde::de::Error::custom(format!("Unknown ref type: {}", s))
-        })
+        RefType::from_str(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("Unknown ref type: {}", s)))
     }
 }
 
@@ -193,9 +192,7 @@ pub fn safe_slice(s: &str, start: usize, end: usize) -> &str {
     let end = end.min(len);
 
     // Find valid UTF-8 boundaries
-    let start = (start..len)
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(len);
+    let start = (start..len).find(|&i| s.is_char_boundary(i)).unwrap_or(len);
     let end = (0..=end)
         .rev()
         .find(|&i| s.is_char_boundary(i))
@@ -220,10 +217,7 @@ pub fn generate_preview(source: &str, span: &Span, max_bytes: usize) -> String {
     let preview = preview.trim();
 
     // Collapse multiple whitespace into single space
-    let preview: String = preview
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let preview: String = preview.split_whitespace().collect::<Vec<_>>().join(" ");
 
     if content.len() > max_bytes {
         format!("{}...", preview)

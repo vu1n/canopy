@@ -73,75 +73,76 @@ pub struct DocumentNode {
 /// Type-specific metadata
 #[derive(Debug, Clone)]
 pub enum NodeMetadata {
-    Section { heading: String, level: u8 },
-    CodeBlock { language: Option<String> },
+    Section {
+        heading: String,
+        level: u8,
+    },
+    CodeBlock {
+        language: Option<String>,
+    },
     Paragraph,
-    Function { name: String, signature: Option<String> },
-    Class { name: String },
-    Struct { name: String },
-    Method { name: String, class_name: Option<String> },
-    Chunk { index: usize },
+    Function {
+        name: String,
+        signature: Option<String>,
+    },
+    Class {
+        name: String,
+    },
+    Struct {
+        name: String,
+    },
+    Method {
+        name: String,
+        class_name: Option<String>,
+    },
+    Chunk {
+        index: usize,
+    },
 }
 
 impl NodeMetadata {
     /// Serialize metadata to JSON for storage
     pub fn to_json(&self) -> String {
         match self {
-            Self::Section { heading, level } => {
-                serde_json::json!({
-                    "type": "section",
-                    "heading": heading,
-                    "level": level
-                })
-                .to_string()
-            }
-            Self::CodeBlock { language } => {
-                serde_json::json!({
-                    "type": "code_block",
-                    "language": language
-                })
-                .to_string()
-            }
-            Self::Paragraph => {
-                serde_json::json!({ "type": "paragraph" }).to_string()
-            }
-            Self::Function { name, signature } => {
-                serde_json::json!({
-                    "type": "function",
-                    "name": name,
-                    "signature": signature
-                })
-                .to_string()
-            }
-            Self::Class { name } => {
-                serde_json::json!({
-                    "type": "class",
-                    "name": name
-                })
-                .to_string()
-            }
-            Self::Struct { name } => {
-                serde_json::json!({
-                    "type": "struct",
-                    "name": name
-                })
-                .to_string()
-            }
-            Self::Method { name, class_name } => {
-                serde_json::json!({
-                    "type": "method",
-                    "name": name,
-                    "class_name": class_name
-                })
-                .to_string()
-            }
-            Self::Chunk { index } => {
-                serde_json::json!({
-                    "type": "chunk",
-                    "index": index
-                })
-                .to_string()
-            }
+            Self::Section { heading, level } => serde_json::json!({
+                "type": "section",
+                "heading": heading,
+                "level": level
+            })
+            .to_string(),
+            Self::CodeBlock { language } => serde_json::json!({
+                "type": "code_block",
+                "language": language
+            })
+            .to_string(),
+            Self::Paragraph => serde_json::json!({ "type": "paragraph" }).to_string(),
+            Self::Function { name, signature } => serde_json::json!({
+                "type": "function",
+                "name": name,
+                "signature": signature
+            })
+            .to_string(),
+            Self::Class { name } => serde_json::json!({
+                "type": "class",
+                "name": name
+            })
+            .to_string(),
+            Self::Struct { name } => serde_json::json!({
+                "type": "struct",
+                "name": name
+            })
+            .to_string(),
+            Self::Method { name, class_name } => serde_json::json!({
+                "type": "method",
+                "name": name,
+                "class_name": class_name
+            })
+            .to_string(),
+            Self::Chunk { index } => serde_json::json!({
+                "type": "chunk",
+                "index": index
+            })
+            .to_string(),
         }
     }
 
@@ -160,7 +161,10 @@ impl NodeMetadata {
             NodeType::Paragraph => Some(Self::Paragraph),
             NodeType::Function => Some(Self::Function {
                 name: v.get("name")?.as_str()?.to_string(),
-                signature: v.get("signature").and_then(|s| s.as_str()).map(String::from),
+                signature: v
+                    .get("signature")
+                    .and_then(|s| s.as_str())
+                    .map(String::from),
             }),
             NodeType::Class => Some(Self::Class {
                 name: v.get("name")?.as_str()?.to_string(),
@@ -170,7 +174,10 @@ impl NodeMetadata {
             }),
             NodeType::Method => Some(Self::Method {
                 name: v.get("name")?.as_str()?.to_string(),
-                class_name: v.get("class_name").and_then(|s| s.as_str()).map(String::from),
+                class_name: v
+                    .get("class_name")
+                    .and_then(|s| s.as_str())
+                    .map(String::from),
             }),
             NodeType::Chunk => Some(Self::Chunk {
                 index: v.get("index")?.as_u64()? as usize,

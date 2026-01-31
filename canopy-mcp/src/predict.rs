@@ -213,7 +213,9 @@ mod tests {
     #[test]
     fn test_predict_database_query() {
         let globs = predict_globs("database query optimization", &["ts".to_string()]);
-        assert!(globs.iter().any(|g| g.contains("db") || g.contains("database")));
+        assert!(globs
+            .iter()
+            .any(|g| g.contains("db") || g.contains("database")));
     }
 
     #[test]

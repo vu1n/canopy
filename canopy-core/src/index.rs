@@ -1,12 +1,14 @@
 //! Repository index with SQLite FTS5
 
 use crate::config::{Config, DEFAULT_CONFIG};
+use crate::document::RefType;
 use crate::document::{NodeType, ParsedFile};
 use crate::error::CanopyError;
-use crate::document::RefType;
 use crate::handle::{generate_preview, Handle, HandleId, RefHandle};
 use crate::parse::{estimate_tokens, parse_file};
-use crate::query::{execute_query, execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult};
+use crate::query::{
+    execute_query, execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult,
+};
 use ignore::WalkBuilder;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -152,7 +154,9 @@ impl RepoIndex {
     }
 
     /// Load symbol cache from database (preload for fast lookups)
-    fn load_symbol_cache(conn: &Connection) -> crate::Result<std::collections::HashMap<String, Vec<SymbolCacheEntry>>> {
+    fn load_symbol_cache(
+        conn: &Connection,
+    ) -> crate::Result<std::collections::HashMap<String, Vec<SymbolCacheEntry>>> {
         use std::collections::HashMap;
 
         let mut cache: HashMap<String, Vec<SymbolCacheEntry>> = HashMap::new();
@@ -186,17 +190,20 @@ impl RepoIndex {
                 let token_count: i64 = row.get(8)?;
                 let preview: Option<String> = row.get(9)?;
 
-                Ok((name_lower, SymbolCacheEntry {
-                    handle_id,
-                    file_path,
-                    node_type,
-                    start_byte: start_byte as usize,
-                    end_byte: end_byte as usize,
-                    line_start: line_start as usize,
-                    line_end: line_end as usize,
-                    token_count: token_count as usize,
-                    preview: preview.unwrap_or_else(|| "...".to_string()),
-                }))
+                Ok((
+                    name_lower,
+                    SymbolCacheEntry {
+                        handle_id,
+                        file_path,
+                        node_type,
+                        start_byte: start_byte as usize,
+                        end_byte: end_byte as usize,
+                        line_start: line_start as usize,
+                        line_end: line_end as usize,
+                        token_count: token_count as usize,
+                        preview: preview.unwrap_or_else(|| "...".to_string()),
+                    },
+                ))
             },
         )?;
 
@@ -418,8 +425,7 @@ impl RepoIndex {
         // Search in repo root
         cmd.arg(&self.repo_root);
 
-        let output = cmd.output()
-            .map_err(|e| CanopyError::Io(e))?;
+        let output = cmd.output().map_err(|e| CanopyError::Io(e))?;
 
         if !output.status.success() {
             // Fallback to ignore crate on error
@@ -454,8 +460,7 @@ impl RepoIndex {
         // Search in repo root
         cmd.arg(&self.repo_root);
 
-        let output = cmd.output()
-            .map_err(|e| CanopyError::Io(e))?;
+        let output = cmd.output().map_err(|e| CanopyError::Io(e))?;
 
         if !output.status.success() {
             // Fallback to ignore crate on error
@@ -482,10 +487,8 @@ impl RepoIndex {
 
         // Build glob matcher for inclusion
         let mut glob_builder = globset::GlobSetBuilder::new();
-        glob_builder.add(
-            globset::Glob::new(glob)
-                .map_err(|e| CanopyError::GlobPattern(e.to_string()))?,
-        );
+        glob_builder
+            .add(globset::Glob::new(glob).map_err(|e| CanopyError::GlobPattern(e.to_string()))?);
         let glob_set = glob_builder
             .build()
             .map_err(|e| CanopyError::GlobPattern(e.to_string()))?;
@@ -523,9 +526,7 @@ impl RepoIndex {
                 continue;
             }
 
-            let relative = path
-                .strip_prefix(&self.repo_root)
-                .unwrap_or(path);
+            let relative = path.strip_prefix(&self.repo_root).unwrap_or(path);
 
             if ignore_set.is_match(relative) {
                 continue;
@@ -664,7 +665,9 @@ impl RepoIndex {
             let parent_name_lower = parent_name.map(|p| p.to_lowercase());
             let parent_handle_id = match (node.parent_node_type, node.parent_span.as_ref()) {
                 (Some(parent_node_type), Some(parent_span)) => Some(
-                    HandleId::new(relative_path, parent_node_type, parent_span).raw().to_string(),
+                    HandleId::new(relative_path, parent_node_type, parent_span)
+                        .raw()
+                        .to_string(),
                 ),
                 _ => None,
             };
@@ -722,19 +725,25 @@ impl RepoIndex {
                 )?;
 
                 // Collect code symbols for cache
-                if matches!(node.node_type, NodeType::Function | NodeType::Class | NodeType::Struct | NodeType::Method) {
+                if matches!(
+                    node.node_type,
+                    NodeType::Function | NodeType::Class | NodeType::Struct | NodeType::Method
+                ) {
                     if let Some(ref nl) = name_lower {
-                        new_cache_entries.push((nl.clone(), SymbolCacheEntry {
-                            handle_id: handle_id.raw().to_string(),
-                            file_path: relative_path.to_string(),
-                            node_type: node.node_type.as_int() as i32,
-                            start_byte: node.span.start,
-                            end_byte: node.span.end,
-                            line_start: node.line_range.0,
-                            line_end: node.line_range.1,
-                            token_count: node_tokens,
-                            preview: preview.clone(),
-                        }));
+                        new_cache_entries.push((
+                            nl.clone(),
+                            SymbolCacheEntry {
+                                handle_id: handle_id.raw().to_string(),
+                                file_path: relative_path.to_string(),
+                                node_type: node.node_type.as_int() as i32,
+                                start_byte: node.span.start,
+                                end_byte: node.span.end,
+                                line_start: node.line_range.0,
+                                line_end: node.line_range.1,
+                                token_count: node_tokens,
+                                preview: preview.clone(),
+                            },
+                        ));
                     }
                 }
             }
@@ -812,7 +821,11 @@ impl RepoIndex {
     }
 
     /// Query indexed content with full options including expand_budget
-    pub fn query_with_options(&self, query_str: &str, options: QueryOptions) -> crate::Result<QueryResult> {
+    pub fn query_with_options(
+        &self,
+        query_str: &str,
+        options: QueryOptions,
+    ) -> crate::Result<QueryResult> {
         let query = parse_query(query_str)?;
         execute_query_with_options(&query, self, options)
     }
@@ -883,11 +896,11 @@ impl RepoIndex {
             .conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
 
-        let total_tokens: i64 = self
-            .conn
-            .query_row("SELECT COALESCE(SUM(token_count), 0) FROM files", [], |row| {
-                row.get(0)
-            })?;
+        let total_tokens: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(token_count), 0) FROM files",
+            [],
+            |row| row.get(0),
+        )?;
 
         let last_indexed: Option<i64> = self
             .conn
@@ -1030,7 +1043,17 @@ impl RepoIndex {
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
                     let span = start..end;
@@ -1053,7 +1076,11 @@ impl RepoIndex {
     }
 
     /// Get all nodes of a specific type
-    pub fn get_nodes_by_type(&self, node_type: NodeType, limit: usize) -> crate::Result<Vec<Handle>> {
+    pub fn get_nodes_by_type(
+        &self,
+        node_type: NodeType,
+        limit: usize,
+    ) -> crate::Result<Vec<Handle>> {
         let mut stmt = self.conn.prepare(
             "SELECT n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte,
                     n.line_start, n.line_end, n.token_count, n.preview
@@ -1089,7 +1116,17 @@ impl RepoIndex {
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
                     let span = start..end;
@@ -1154,7 +1191,17 @@ impl RepoIndex {
             )?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Section);
                     let span = start..end;
@@ -1186,7 +1233,8 @@ impl RepoIndex {
                 .iter()
                 .take(limit)
                 .map(|e| {
-                    let node_type = NodeType::from_int(e.node_type as u8).unwrap_or(NodeType::Function);
+                    let node_type =
+                        NodeType::from_int(e.node_type as u8).unwrap_or(NodeType::Function);
                     let span = e.start_byte..e.end_byte;
 
                     Handle {
@@ -1254,7 +1302,17 @@ impl RepoIndex {
             )?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
                     let span = start..end;
@@ -1330,7 +1388,17 @@ impl RepoIndex {
             )?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
                     let span = start..end;
@@ -1358,9 +1426,9 @@ impl RepoIndex {
             .map_err(|e| CanopyError::GlobPattern(e.to_string()))?
             .compile_matcher();
 
-        let mut stmt = self.conn.prepare(
-            "SELECT f.path, f.token_count FROM files f",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT f.path, f.token_count FROM files f")?;
 
         let matches: Vec<(String, usize)> = stmt
             .query_map([], |row| {
@@ -1398,7 +1466,12 @@ impl RepoIndex {
     }
 
     /// Search within specific files (in-file query)
-    pub fn search_in_files(&self, glob: &str, fts_query: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+    pub fn search_in_files(
+        &self,
+        glob: &str,
+        fts_query: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<Handle>> {
         let glob_matcher = globset::Glob::new(glob)
             .map_err(|e| CanopyError::GlobPattern(e.to_string()))?
             .compile_matcher();
@@ -1443,7 +1516,17 @@ impl RepoIndex {
             .filter(|(_, file_path, _, _, _, _, _, _, _)| glob_matcher.is_match(file_path))
             .take(limit)
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
                     let span = start..end;
@@ -1504,7 +1587,17 @@ impl RepoIndex {
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Method);
                     let span = start..end;
@@ -1527,7 +1620,12 @@ impl RepoIndex {
     }
 
     /// Search for named children of a parent symbol
-    pub fn search_children_named(&self, parent: &str, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+    pub fn search_children_named(
+        &self,
+        parent: &str,
+        symbol: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<Handle>> {
         let parent_lower = parent.to_lowercase();
         let symbol_lower = symbol.to_lowercase();
 
@@ -1567,7 +1665,17 @@ impl RepoIndex {
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Method);
                     let span = start..end;
@@ -1599,7 +1707,8 @@ impl RepoIndex {
                 .iter()
                 .take(limit)
                 .map(|e| {
-                    let node_type = NodeType::from_int(e.node_type as u8).unwrap_or(NodeType::Function);
+                    let node_type =
+                        NodeType::from_int(e.node_type as u8).unwrap_or(NodeType::Function);
                     let span = e.start_byte..e.end_byte;
 
                     Handle {
@@ -1667,7 +1776,17 @@ impl RepoIndex {
             )?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
                     let span = start..end;
@@ -1690,7 +1809,11 @@ impl RepoIndex {
     }
 
     /// Search for source nodes containing references to a symbol
-    pub fn search_reference_sources(&self, symbol: &str, limit: usize) -> crate::Result<Vec<Handle>> {
+    pub fn search_reference_sources(
+        &self,
+        symbol: &str,
+        limit: usize,
+    ) -> crate::Result<Vec<Handle>> {
         let symbol_lower = symbol.to_lowercase();
 
         let mut stmt = self.conn.prepare(
@@ -1729,7 +1852,17 @@ impl RepoIndex {
             })?
             .filter_map(|r| r.ok())
             .map(
-                |(handle_id, file_path, node_type_int, start, end, line_start, line_end, tokens, preview)| {
+                |(
+                    handle_id,
+                    file_path,
+                    node_type_int,
+                    start,
+                    end,
+                    line_start,
+                    line_end,
+                    tokens,
+                    preview,
+                )| {
                     let node_type =
                         NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Function);
                     let span = start..end;
@@ -1792,21 +1925,34 @@ impl RepoIndex {
                 ))
             })?
             .filter_map(|r| r.ok())
-            .map(|(file_path, span_start, span_end, line_start, line_end, name, qualifier, ref_type_str, source_handle_id, preview)| {
-                let ref_type = RefType::from_str(&ref_type_str).unwrap_or(RefType::Call);
-                let span = span_start..span_end;
-
-                RefHandle {
+            .map(
+                |(
                     file_path,
-                    span,
-                    line_range: (line_start, line_end),
+                    span_start,
+                    span_end,
+                    line_start,
+                    line_end,
                     name,
                     qualifier,
-                    ref_type,
-                    source_handle: source_handle_id.map(HandleId::from_raw),
+                    ref_type_str,
+                    source_handle_id,
                     preview,
-                }
-            })
+                )| {
+                    let ref_type = RefType::from_str(&ref_type_str).unwrap_or(RefType::Call);
+                    let span = span_start..span_end;
+
+                    RefHandle {
+                        file_path,
+                        span,
+                        line_range: (line_start, line_end),
+                        name,
+                        qualifier,
+                        ref_type,
+                        source_handle: source_handle_id.map(HandleId::from_raw),
+                        preview,
+                    }
+                },
+            )
             .collect();
 
         Ok(refs)
@@ -1819,7 +1965,10 @@ impl RepoIndex {
 }
 
 /// Find the smallest node that encloses the given span
-fn find_smallest_enclosing_node(ref_span: &std::ops::Range<usize>, nodes: &[(std::ops::Range<usize>, i64)]) -> Option<i64> {
+fn find_smallest_enclosing_node(
+    ref_span: &std::ops::Range<usize>,
+    nodes: &[(std::ops::Range<usize>, i64)],
+) -> Option<i64> {
     nodes
         .iter()
         .filter(|(span, _)| span.start <= ref_span.start && ref_span.end <= span.end)
@@ -1860,10 +2009,11 @@ fn update_gitignore(repo_root: &Path) -> crate::Result<()> {
 
     if gitignore_path.exists() {
         let content = fs::read_to_string(&gitignore_path)?;
-        if !content.lines().any(|line| line.trim() == ".canopy" || line.trim() == ".canopy/") {
-            let mut file = fs::OpenOptions::new()
-                .append(true)
-                .open(&gitignore_path)?;
+        if !content
+            .lines()
+            .any(|line| line.trim() == ".canopy" || line.trim() == ".canopy/")
+        {
+            let mut file = fs::OpenOptions::new().append(true).open(&gitignore_path)?;
             use std::io::Write;
             writeln!(file, "\n# Canopy index\n.canopy/")?;
         }

@@ -94,7 +94,18 @@ fn main() {
             glob,
             expand_budget,
             limit,
-        } => cmd_query(cli.root, query, pattern, symbol, parent, kind, glob, expand_budget, limit, cli.json),
+        } => cmd_query(
+            cli.root,
+            query,
+            pattern,
+            symbol,
+            parent,
+            kind,
+            glob,
+            expand_budget,
+            limit,
+            cli.json,
+        ),
         Commands::Expand { handle_ids } => cmd_expand(cli.root, &handle_ids, cli.json),
         Commands::Status => cmd_status(cli.root, cli.json),
         Commands::Invalidate { glob } => cmd_invalidate(cli.root, glob, cli.json),
@@ -221,7 +232,8 @@ fn cmd_query(
     } else {
         return Err(canopy_core::CanopyError::QueryParse {
             position: 0,
-            message: "Must provide either a query s-expression or --pattern/--symbol/--parent flag".to_string(),
+            message: "Must provide either a query s-expression or --pattern/--symbol/--parent flag"
+                .to_string(),
         });
     };
 
@@ -303,7 +315,11 @@ fn cmd_query(
         "({} results, {} tokens{})",
         shown,
         result.total_tokens,
-        if result.auto_expanded { ", auto-expanded" } else { "" }
+        if result.auto_expanded {
+            ", auto-expanded"
+        } else {
+            ""
+        }
     );
     Ok(())
 }
@@ -373,7 +389,11 @@ fn cmd_invalidate(
     if json {
         println!("{}", serde_json::json!({ "files_removed": count }));
     } else {
-        println!("{}: {} files removed from index", "Invalidated".yellow(), count);
+        println!(
+            "{}: {} files removed from index",
+            "Invalidated".yellow(),
+            count
+        );
     }
     Ok(())
 }

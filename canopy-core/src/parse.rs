@@ -58,7 +58,14 @@ pub fn parse_file(path: &Path, source: &str, config: &Config) -> ParsedFile {
         parse_code_with_tree_sitter(path, source, file_type)
     } else if source.len() > config.indexing.chunk_threshold {
         // Large file without grammar: chunk
-        (parse_as_chunks(source, config.indexing.chunk_lines, config.indexing.chunk_overlap), Vec::new())
+        (
+            parse_as_chunks(
+                source,
+                config.indexing.chunk_lines,
+                config.indexing.chunk_overlap,
+            ),
+            Vec::new(),
+        )
     } else {
         // Small file without grammar: single node
         (parse_as_single_node(source), Vec::new())
@@ -217,7 +224,11 @@ fn heading_level_to_u8(level: HeadingLevel) -> u8 {
 }
 
 /// Parse code file with tree-sitter
-fn parse_code_with_tree_sitter(path: &Path, source: &str, file_type: FileType) -> (Vec<DocumentNode>, Vec<Reference>) {
+fn parse_code_with_tree_sitter(
+    path: &Path,
+    source: &str,
+    file_type: FileType,
+) -> (Vec<DocumentNode>, Vec<Reference>) {
     let mut parser = tree_sitter::Parser::new();
 
     // Set language based on file type
@@ -248,7 +259,14 @@ fn parse_code_with_tree_sitter(path: &Path, source: &str, file_type: FileType) -
 
     let mut nodes = Vec::new();
     let mut refs = Vec::new();
-    extract_tree_sitter_nodes(&tree.root_node(), source, &mut nodes, &mut refs, file_type, None);
+    extract_tree_sitter_nodes(
+        &tree.root_node(),
+        source,
+        &mut nodes,
+        &mut refs,
+        file_type,
+        None,
+    );
 
     // If no nodes extracted, fall back to single node
     if nodes.is_empty() {
@@ -302,7 +320,8 @@ fn extract_tree_sitter_nodes(
             }
             "impl_item" => {
                 // Extract impl type name (handles generics like impl<T> Foo<T>)
-                let name = node.child_by_field_name("type")
+                let name = node
+                    .child_by_field_name("type")
                     .map(|t| {
                         if t.kind() == "generic_type" {
                             t.child_by_field_name("type")
@@ -329,7 +348,13 @@ fn extract_tree_sitter_nodes(
             }
             "mod_item" => {
                 let name = find_child_text(node, "identifier", source).unwrap_or_default();
-                Some((NodeType::Section, NodeMetadata::Section { heading: format!("mod {}", name), level: 1 }))
+                Some((
+                    NodeType::Section,
+                    NodeMetadata::Section {
+                        heading: format!("mod {}", name),
+                        level: 1,
+                    },
+                ))
             }
             _ => None,
         },
@@ -339,15 +364,21 @@ fn extract_tree_sitter_nodes(
                 let sig = extract_signature(node, source, "parameters");
                 // If inside a class, it's a method
                 let (node_type, metadata) = if parent_ctx.is_some() {
-                    (NodeType::Method, NodeMetadata::Method {
-                        name,
-                        class_name: parent_ctx.as_ref().map(|p| p.name.clone()),
-                    })
+                    (
+                        NodeType::Method,
+                        NodeMetadata::Method {
+                            name,
+                            class_name: parent_ctx.as_ref().map(|p| p.name.clone()),
+                        },
+                    )
                 } else {
-                    (NodeType::Function, NodeMetadata::Function {
-                        name,
-                        signature: sig,
-                    })
+                    (
+                        NodeType::Function,
+                        NodeMetadata::Function {
+                            name,
+                            signature: sig,
+                        },
+                    )
                 };
                 Some((node_type, metadata))
             }
@@ -426,8 +457,8 @@ fn extract_tree_sitter_nodes(
             "type_declaration" => {
                 // Look for type_spec child
                 find_child_by_kind(node, "type_spec").map(|type_spec| {
-                    let name = find_child_text(&type_spec, "type_identifier", source)
-                        .unwrap_or_default();
+                    let name =
+                        find_child_text(&type_spec, "type_identifier", source).unwrap_or_default();
                     (NodeType::Struct, NodeMetadata::Struct { name })
                 })
             }
@@ -468,7 +499,14 @@ fn extract_tree_sitter_nodes(
     let child_parent_ctx = new_parent_ctx.or(parent_ctx);
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
-            extract_tree_sitter_nodes(&child, source, nodes, refs, file_type, child_parent_ctx.clone());
+            extract_tree_sitter_nodes(
+                &child,
+                source,
+                nodes,
+                refs,
+                file_type,
+                child_parent_ctx.clone(),
+            );
         }
     }
 }
@@ -486,24 +524,22 @@ fn determine_parent_context(
         FileType::Rust => {
             if kind == "impl_item" {
                 // Extract impl type name (handles generics)
-                let name = node.child_by_field_name("type")
-                    .map(|t| {
-                        if t.kind() == "generic_type" {
-                            t.child_by_field_name("type")
-                                .map(|inner| node_text(&inner, source))
-                                .unwrap_or_else(|| node_text(&t, source))
-                        } else {
-                            node_text(&t, source)
-                        }
-                    })?;
+                let name = node.child_by_field_name("type").map(|t| {
+                    if t.kind() == "generic_type" {
+                        t.child_by_field_name("type")
+                            .map(|inner| node_text(&inner, source))
+                            .unwrap_or_else(|| node_text(&t, source))
+                    } else {
+                        node_text(&t, source)
+                    }
+                })?;
                 Some(ParentContext {
                     name,
                     node_type: Some(NodeType::Struct),
                     span: Some(span),
                 })
             } else if kind == "trait_item" {
-                let name = find_child_by_field(node, "name")
-                    .map(|n| node_text(&n, source))?;
+                let name = find_child_by_field(node, "name").map(|n| node_text(&n, source))?;
                 Some(ParentContext {
                     name,
                     node_type: Some(NodeType::Class),
@@ -557,7 +593,9 @@ fn extract_go_receiver_type(node: &tree_sitter::Node, source: &str) -> Option<St
 
     // Handle pointer types like *Foo
     if type_node.kind() == "pointer_type" {
-        type_node.named_child(0).map(|inner| node_text(&inner, source))
+        type_node
+            .named_child(0)
+            .map(|inner| node_text(&inner, source))
     } else {
         Some(node_text(&type_node, source))
     }
@@ -585,7 +623,10 @@ fn extract_references(
                                 qualifier,
                                 ref_type: RefType::Call,
                                 span: node.start_byte()..node.end_byte(),
-                                line_range: (node.start_position().row + 1, node.end_position().row + 1),
+                                line_range: (
+                                    node.start_position().row + 1,
+                                    node.end_position().row + 1,
+                                ),
                             });
                         }
                     }
@@ -614,7 +655,10 @@ fn extract_references(
                                 qualifier,
                                 ref_type: RefType::Call,
                                 span: node.start_byte()..node.end_byte(),
-                                line_range: (node.start_position().row + 1, node.end_position().row + 1),
+                                line_range: (
+                                    node.start_position().row + 1,
+                                    node.end_position().row + 1,
+                                ),
                             });
                         }
                     }
@@ -625,7 +669,8 @@ fn extract_references(
                         if let Some(child) = node.child(i) {
                             if child.kind() == "dotted_name" || child.kind() == "aliased_import" {
                                 let name = if child.kind() == "aliased_import" {
-                                    child.child_by_field_name("name")
+                                    child
+                                        .child_by_field_name("name")
                                         .map(|n| node_text(&n, source))
                                         .unwrap_or_default()
                                 } else {
@@ -637,7 +682,10 @@ fn extract_references(
                                         qualifier: None,
                                         ref_type: RefType::Import,
                                         span: child.start_byte()..child.end_byte(),
-                                        line_range: (child.start_position().row + 1, child.end_position().row + 1),
+                                        line_range: (
+                                            child.start_position().row + 1,
+                                            child.end_position().row + 1,
+                                        ),
                                     });
                                 }
                             }
@@ -659,7 +707,10 @@ fn extract_references(
                                 qualifier,
                                 ref_type: RefType::Call,
                                 span: node.start_byte()..node.end_byte(),
-                                line_range: (node.start_position().row + 1, node.end_position().row + 1),
+                                line_range: (
+                                    node.start_position().row + 1,
+                                    node.end_position().row + 1,
+                                ),
                             });
                         }
                     }
@@ -688,7 +739,10 @@ fn extract_references(
                                 qualifier,
                                 ref_type: RefType::Call,
                                 span: node.start_byte()..node.end_byte(),
-                                line_range: (node.start_position().row + 1, node.end_position().row + 1),
+                                line_range: (
+                                    node.start_position().row + 1,
+                                    node.end_position().row + 1,
+                                ),
                             });
                         }
                     }
@@ -699,15 +753,22 @@ fn extract_references(
                     if let Some(path_node) = node.child_by_field_name("path") {
                         let path = node_text(&path_node, source);
                         // Extract the last component as the name
-                        let name = path.trim_matches('"').split('/').last()
-                            .unwrap_or(&path).to_string();
+                        let name = path
+                            .trim_matches('"')
+                            .split('/')
+                            .last()
+                            .unwrap_or(&path)
+                            .to_string();
                         if !name.is_empty() {
                             refs.push(Reference {
                                 name,
                                 qualifier: Some(path.trim_matches('"').to_string()),
                                 ref_type: RefType::Import,
                                 span: node.start_byte()..node.end_byte(),
-                                line_range: (node.start_position().row + 1, node.end_position().row + 1),
+                                line_range: (
+                                    node.start_position().row + 1,
+                                    node.end_position().row + 1,
+                                ),
                             });
                         }
                     }
@@ -725,7 +786,8 @@ fn extract_call_target(func_node: &tree_sitter::Node, source: &str) -> (String, 
         "identifier" => (node_text(func_node, source), None),
         "member_expression" | "attribute" | "field_expression" => {
             // obj.method or obj.attr
-            let property = func_node.child_by_field_name("property")
+            let property = func_node
+                .child_by_field_name("property")
                 .or_else(|| func_node.child_by_field_name("attribute"))
                 .or_else(|| func_node.child_by_field_name("field"));
             let object = func_node.child_by_field_name("object");
@@ -739,7 +801,8 @@ fn extract_call_target(func_node: &tree_sitter::Node, source: &str) -> (String, 
         "scoped_identifier" => {
             // Rust: module::function
             if let Some(name) = func_node.child_by_field_name("name") {
-                let path = func_node.child_by_field_name("path")
+                let path = func_node
+                    .child_by_field_name("path")
                     .map(|p| node_text(&p, source));
                 (node_text(&name, source), path)
             } else {
@@ -749,7 +812,8 @@ fn extract_call_target(func_node: &tree_sitter::Node, source: &str) -> (String, 
         "selector_expression" => {
             // Go: obj.Method
             if let Some(field) = func_node.child_by_field_name("field") {
-                let operand = func_node.child_by_field_name("operand")
+                let operand = func_node
+                    .child_by_field_name("operand")
                     .map(|o| node_text(&o, source));
                 (node_text(&field, source), operand)
             } else {
@@ -812,7 +876,8 @@ fn extract_rust_use_names(node: &tree_sitter::Node, source: &str, refs: &mut Vec
         "scoped_identifier" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = node_text(&name_node, source);
-                let path = node.child_by_field_name("path")
+                let path = node
+                    .child_by_field_name("path")
                     .map(|p| node_text(&p, source));
                 if !name.is_empty() {
                     refs.push(Reference {
@@ -829,7 +894,10 @@ fn extract_rust_use_names(node: &tree_sitter::Node, source: &str, refs: &mut Vec
     }
 }
 
-fn find_child_by_kind<'a>(node: &'a tree_sitter::Node, kind: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_kind<'a>(
+    node: &'a tree_sitter::Node,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i) {
             if child.kind() == kind {
@@ -840,7 +908,10 @@ fn find_child_by_kind<'a>(node: &'a tree_sitter::Node, kind: &str) -> Option<tre
     None
 }
 
-fn find_child_by_field<'a>(node: &'a tree_sitter::Node, field: &str) -> Option<tree_sitter::Node<'a>> {
+fn find_child_by_field<'a>(
+    node: &'a tree_sitter::Node,
+    field: &str,
+) -> Option<tree_sitter::Node<'a>> {
     node.child_by_field_name(field)
 }
 
@@ -967,9 +1038,15 @@ More text.
         let nodes = parse_markdown(source);
 
         // Should have sections, paragraphs, and code blocks
-        assert!(nodes.iter().any(|n| matches!(n.node_type, NodeType::Section)));
-        assert!(nodes.iter().any(|n| matches!(n.node_type, NodeType::Paragraph)));
-        assert!(nodes.iter().any(|n| matches!(n.node_type, NodeType::CodeBlock)));
+        assert!(nodes
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::Section)));
+        assert!(nodes
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::Paragraph)));
+        assert!(nodes
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::CodeBlock)));
     }
 
     #[test]
@@ -989,16 +1066,24 @@ impl Foo {
     }
 }
 "#;
-        let (nodes, _refs) = parse_code_with_tree_sitter(Path::new("test.rs"), source, FileType::Rust);
+        let (nodes, _refs) =
+            parse_code_with_tree_sitter(Path::new("test.rs"), source, FileType::Rust);
 
         // Should have function and struct
-        assert!(nodes.iter().any(|n| matches!(n.node_type, NodeType::Function)));
-        assert!(nodes.iter().any(|n| matches!(n.node_type, NodeType::Struct)));
+        assert!(nodes
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::Function)));
+        assert!(nodes
+            .iter()
+            .any(|n| matches!(n.node_type, NodeType::Struct)));
     }
 
     #[test]
     fn test_parse_chunks() {
-        let source = (0..100).map(|i| format!("line {}", i)).collect::<Vec<_>>().join("\n");
+        let source = (0..100)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         let nodes = parse_as_chunks(&source, 10, 2);
 
         assert!(!nodes.is_empty());
@@ -1007,10 +1092,22 @@ impl Foo {
 
     #[test]
     fn test_file_type_detection() {
-        assert_eq!(FileType::from_path(Path::new("README.md")), FileType::Markdown);
-        assert_eq!(FileType::from_path(Path::new("src/main.rs")), FileType::Rust);
-        assert_eq!(FileType::from_path(Path::new("app.tsx")), FileType::TypeScript);
-        assert_eq!(FileType::from_path(Path::new("script.js")), FileType::JavaScript);
+        assert_eq!(
+            FileType::from_path(Path::new("README.md")),
+            FileType::Markdown
+        );
+        assert_eq!(
+            FileType::from_path(Path::new("src/main.rs")),
+            FileType::Rust
+        );
+        assert_eq!(
+            FileType::from_path(Path::new("app.tsx")),
+            FileType::TypeScript
+        );
+        assert_eq!(
+            FileType::from_path(Path::new("script.js")),
+            FileType::JavaScript
+        );
         assert_eq!(FileType::from_path(Path::new("main.go")), FileType::Go);
         assert_eq!(FileType::from_path(Path::new("data.csv")), FileType::Other);
     }

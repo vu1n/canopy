@@ -289,9 +289,7 @@ impl McpServer {
 
         let repo_root = self.get_repo_root(args)?;
         let mut index = self.open_index_at(&repo_root)?;
-        let stats = index
-            .index(glob)
-            .map_err(|e| (-32000, e.to_string()))?;
+        let stats = index.index(glob).map_err(|e| (-32000, e.to_string()))?;
 
         // Include repo_root for debugging
         let mut result = serde_json::to_value(&stats).unwrap();
@@ -382,7 +380,10 @@ impl McpServer {
 
         // Check if DSL query is provided (fallback path)
         if let Some(query_str) = args.get("query").and_then(|v| v.as_str()) {
-            let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let limit = args
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             let result = index
                 .query(query_str, limit)
                 .map_err(|e| (-32000, e.to_string()))?;
@@ -458,7 +459,7 @@ impl McpServer {
             args.get("expand_budget")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize)
-                .unwrap_or(5000)
+                .unwrap_or(5000),
         );
 
         // Validate that at least one search param is provided
@@ -470,7 +471,8 @@ impl McpServer {
         {
             return Err((
                 -32602,
-                "Must specify one of: pattern, patterns, symbol, section, parent, or query".to_string(),
+                "Must specify one of: pattern, patterns, symbol, section, parent, or query"
+                    .to_string(),
             ));
         }
 
