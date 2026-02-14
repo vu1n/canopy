@@ -31,6 +31,7 @@ pub struct DirtyState {
 
 impl DirtyState {
     /// Check if a path is dirty
+    #[cfg(test)]
     pub fn is_dirty(&self, path: &str) -> bool {
         self.files.iter().any(|f| f.path == path)
     }
@@ -62,13 +63,10 @@ pub fn detect_dirty(repo_root: &Path) -> canopy_core::Result<DirtyState> {
         .map_err(CanopyError::Io)?;
 
     if !output.status.success() {
-        return Err(CanopyError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!(
-                "git status failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        )));
+        return Err(CanopyError::Io(std::io::Error::other(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ))));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -120,9 +118,9 @@ fn parse_porcelain_v2(output: &str) -> Vec<DirtyFile> {
                     status: DirtyStatus::Unmerged,
                 });
             }
-        } else if entry.starts_with("? ") {
+        } else if let Some(rest) = entry.strip_prefix("? ") {
             // Untracked
-            let path = entry[2..].to_string();
+            let path = rest.to_string();
             files.push(DirtyFile {
                 path,
                 status: DirtyStatus::Added,

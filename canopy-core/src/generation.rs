@@ -41,10 +41,11 @@ impl std::fmt::Display for Generation {
 }
 
 /// Status of a repository shard in the service
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ShardStatus {
     /// Registered but not yet indexed
+    #[default]
     Pending,
     /// Currently indexing
     Indexing,
@@ -52,12 +53,6 @@ pub enum ShardStatus {
     Ready,
     /// Indexing failed
     Error,
-}
-
-impl Default for ShardStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 /// A repository shard managed by the service

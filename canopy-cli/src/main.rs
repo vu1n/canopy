@@ -354,6 +354,7 @@ fn cmd_query(
 }
 
 /// Build QueryParams from CLI arguments
+#[allow(clippy::too_many_arguments)]
 fn build_query_params(
     _query_str: Option<&str>,
     pattern: Option<&str>,

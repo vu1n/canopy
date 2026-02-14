@@ -49,7 +49,7 @@ pub async fn query(
         Ok::<_, canopy_core::CanopyError>(result)
     })
     .await
-    .map_err(|e| AppError::internal(e))??;
+    .map_err(AppError::internal)??;
 
     Ok(Json(result))
 }
@@ -108,7 +108,7 @@ pub async fn expand(
         index.expand(&handle_ids)
     })
     .await
-    .map_err(|e| AppError::internal(e))??;
+    .map_err(AppError::internal)??;
 
     Ok(Json(ExpandResponse {
         contents: contents
@@ -159,7 +159,7 @@ pub async fn add_repo(
             move || RepoIndex::init(Path::new(&path))
         })
         .await
-        .map_err(|e| AppError::internal(e))??;
+        .map_err(AppError::internal)??;
     }
 
     let name = req.name.unwrap_or_else(|| {
