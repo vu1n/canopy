@@ -22,14 +22,6 @@ impl ErrorEnvelope {
         }
     }
 
-    pub fn not_found(what: &str) -> Self {
-        Self::new(
-            "not_found",
-            format!("{} not found", what),
-            "Check the repo ID and try again",
-        )
-    }
-
     pub fn stale_generation(expected: u64, found: u64) -> Self {
         Self::new(
             "stale_generation",
@@ -49,10 +41,25 @@ pub struct AppError {
 }
 
 impl AppError {
-    pub fn not_found(what: &str) -> Self {
+    pub fn repo_not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
-            body: ErrorEnvelope::not_found(what),
+            body: ErrorEnvelope::new(
+                "repo_not_found",
+                "Repository not found",
+                "Register the repo via POST /repos/add first",
+            ),
+        }
+    }
+
+    pub fn handle_not_found(handle_id: &str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            body: ErrorEnvelope::new(
+                "handle_not_found",
+                format!("Handle {} not found", handle_id),
+                "The handle may have been invalidated by a reindex",
+            ),
         }
     }
 
@@ -80,7 +87,7 @@ impl IntoResponse for AppError {
 impl From<canopy_core::CanopyError> for AppError {
     fn from(err: canopy_core::CanopyError) -> Self {
         match &err {
-            canopy_core::CanopyError::HandleNotFound(_) => AppError::not_found("handle"),
+            canopy_core::CanopyError::HandleNotFound(id) => AppError::handle_not_found(id),
             canopy_core::CanopyError::StaleGeneration { expected, found } => {
                 AppError::stale(*expected, *found)
             }

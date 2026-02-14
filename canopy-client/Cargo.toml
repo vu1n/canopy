@@ -1,17 +1,15 @@
 [package]
-name = "canopy-mcp"
+name = "canopy-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "MCP server for canopy token-efficient codebase queries"
-
-[[bin]]
-name = "canopy-mcp"
-path = "src/main.rs"
+description = "Shared client runtime for canopy CLI and MCP"
 
 [dependencies]
 canopy-core = { path = "../canopy-core" }
-canopy-client = { path = "../canopy-client" }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

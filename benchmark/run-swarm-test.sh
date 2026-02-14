@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 set -e
 
-# Swarm Benchmark: N concurrent agents, baseline vs canopy
+# Swarm Benchmark: N concurrent agents, baseline vs canopy vs canopy-service
 # Measures: token economy, speed, quality across parallel agents
 
 REPO="${1:?Usage: $0 /path/to/repo}"
 AGENTS="${AGENTS:-5}"
-MODE="${MODE:-}"  # "" = both, "baseline", or "canopy"
+MODE="${MODE:-}"  # "" = all (baseline + canopy + canopy-service), "baseline", "canopy", "canopy-service"
 MODEL="${MODEL:-}"
 MAX_TURNS="${MAX_TURNS:-15}"
 DATE=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="${OUTPUT_DIR:-benchmark/results/swarm-$DATE}"
+SERVICE_PORT="${SERVICE_PORT:-3099}"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -23,6 +24,8 @@ TASKS=(
   "Map the plugin/extension architecture — how are plugins loaded and executed?"
 )
 
+SERVICE_PID=""
+
 mkdir -p "$OUTPUT_DIR"
 
 echo "=============================================="
@@ -31,7 +34,7 @@ echo "=============================================="
 echo "Repository:  $REPO"
 echo "Agents:      $AGENTS"
 echo "Max turns:   $MAX_TURNS"
-echo "Mode:        ${MODE:-both}"
+echo "Mode:        ${MODE:-all}"
 echo "Model:       ${MODEL:-default}"
 echo "Output:      $OUTPUT_DIR"
 echo "=============================================="
@@ -43,7 +46,7 @@ cat > "$OUTPUT_DIR/config.json" << EOF
   "repo": "$REPO",
   "agents": $AGENTS,
   "max_turns": $MAX_TURNS,
-  "mode": "${MODE:-both}",
+  "mode": "${MODE:-all}",
   "model": "${MODEL:-default}",
   "date": "$DATE",
   "tasks": $(printf '%s\n' "${TASKS[@]}" | jq -R . | jq -s .)
@@ -54,6 +57,90 @@ EOF
 echo "Building canopy..."
 (cd "$PROJECT_ROOT" && cargo build --release -q 2>/dev/null)
 echo ""
+
+# ── Service lifecycle ──
+
+start_service() {
+  echo "  Starting canopy-service on port $SERVICE_PORT..."
+  "$PROJECT_ROOT/target/release/canopy-service" --port "$SERVICE_PORT" &
+  SERVICE_PID=$!
+
+  # Wait for service to be ready
+  local retries=0
+  while ! curl -sf "http://127.0.0.1:$SERVICE_PORT/status" >/dev/null 2>&1; do
+    retries=$((retries + 1))
+    if [ $retries -gt 30 ]; then
+      echo "  ERROR: canopy-service failed to start"
+      kill "$SERVICE_PID" 2>/dev/null || true
+      return 1
+    fi
+    sleep 0.5
+  done
+  echo "  canopy-service ready (pid=$SERVICE_PID)"
+}
+
+stop_service() {
+  if [ -n "$SERVICE_PID" ]; then
+    echo "  Stopping canopy-service (pid=$SERVICE_PID)..."
+    kill "$SERVICE_PID" 2>/dev/null || true
+    wait "$SERVICE_PID" 2>/dev/null || true
+    SERVICE_PID=""
+  fi
+}
+
+# Clean up service on exit
+trap stop_service EXIT
+
+register_and_index_repo() {
+  local service_url="http://127.0.0.1:$SERVICE_PORT"
+
+  echo "  Registering repo with service..."
+  local add_resp
+  add_resp=$(curl -sf -X POST "$service_url/repos/add" \
+    -H 'Content-Type: application/json' \
+    -d "{\"path\": \"$REPO\"}")
+
+  local repo_id
+  repo_id=$(echo "$add_resp" | jq -r '.repo_id')
+  echo "  Repo ID: $repo_id"
+
+  echo "  Triggering reindex..."
+  curl -sf -X POST "$service_url/reindex" \
+    -H 'Content-Type: application/json' \
+    -d "{\"repo\": \"$repo_id\"}" >/dev/null
+
+  # Poll until ready
+  echo -n "  Waiting for index..."
+  local retries=0
+  while true; do
+    local status
+    status=$(curl -sf "$service_url/repos" | jq -r ".[] | select(.repo_id==\"$repo_id\") | .status")
+    if [ "$status" = "\"ready\"" ] || [ "$status" = "ready" ]; then
+      echo " ready!"
+      break
+    fi
+    if [ "$status" = "\"error\"" ] || [ "$status" = "error" ]; then
+      echo " ERROR: indexing failed"
+      return 1
+    fi
+    retries=$((retries + 1))
+    if [ $retries -gt 120 ]; then
+      echo " TIMEOUT"
+      return 1
+    fi
+    echo -n "."
+    sleep 1
+  done
+}
+
+fetch_service_metrics() {
+  local service_url="http://127.0.0.1:$SERVICE_PORT"
+  local metrics_file="$OUTPUT_DIR/canopy-service/service-metrics.json"
+
+  if curl -sf "$service_url/metrics" > "$metrics_file" 2>/dev/null; then
+    echo "  Service metrics saved to $metrics_file"
+  fi
+}
 
 run_agent() {
   local mode=$1
@@ -82,6 +169,13 @@ run_agent() {
     local mcp_config
     mcp_config=$(cat << MCPEOF
 {"mcpServers":{"canopy":{"command":"$PROJECT_ROOT/target/release/canopy-mcp","args":["--root","$REPO"]}}}
+MCPEOF
+    )
+    cmd_args+=(--mcp-config "$mcp_config")
+  elif [ "$mode" = "canopy-service" ]; then
+    local mcp_config
+    mcp_config=$(cat << MCPEOF
+{"mcpServers":{"canopy":{"command":"$PROJECT_ROOT/target/release/canopy-mcp","args":["--root","$REPO"],"env":{"CANOPY_SERVICE_URL":"http://127.0.0.1:$SERVICE_PORT"}}}}
 MCPEOF
     )
     cmd_args+=(--mcp-config "$mcp_config")
@@ -149,6 +243,12 @@ run_mode() {
   # Clean slate for fair comparison
   rm -rf "$REPO/.canopy"
 
+  # Start service for canopy-service mode
+  if [ "$mode" = "canopy-service" ]; then
+    start_service
+    register_and_index_repo
+  fi
+
   local start_time=$(date +%s)
   local pids=()
 
@@ -172,6 +272,12 @@ run_mode() {
 
   local end_time=$(date +%s)
   local wall_time=$((end_time - start_time))
+
+  # Fetch service metrics before stopping
+  if [ "$mode" = "canopy-service" ]; then
+    fetch_service_metrics
+    stop_service
+  fi
 
   echo ""
   echo "  Mode $mode complete: ${wall_time}s wall time, $failures failures"
@@ -214,11 +320,15 @@ EOF
     done < "$OUTPUT_DIR/metrics.jsonl"
   fi
 
-  # Generate aggregate comparison if both modes ran
-  local has_baseline=$(jq -r 'select(.mode=="baseline")' "$OUTPUT_DIR/metrics.jsonl" 2>/dev/null | head -1)
-  local has_canopy=$(jq -r 'select(.mode=="canopy")' "$OUTPUT_DIR/metrics.jsonl" 2>/dev/null | head -1)
+  # Generate aggregate comparison — dynamic based on modes that ran
+  local modes_ran=()
+  if [ -f "$OUTPUT_DIR/metrics.jsonl" ]; then
+    while IFS= read -r m; do
+      modes_ran+=("$m")
+    done < <(jq -r '.mode' "$OUTPUT_DIR/metrics.jsonl" | sort -u)
+  fi
 
-  if [ -n "$has_baseline" ] && [ -n "$has_canopy" ]; then
+  if [ ${#modes_ran[@]} -ge 2 ]; then
     cat >> "$summary_file" << 'DIVIDER'
 
 ---
@@ -230,50 +340,54 @@ DIVIDER
     # Sum helper: reads lines of numbers, outputs their sum via awk
     sum_lines() { awk '{s+=$1} END {print s+0}'; }
 
-    # Calculate aggregates per mode
-    for mode in baseline canopy; do
-      local total_tokens=$(jq -r "select(.mode==\"$mode\") | .total_tokens" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
-      local total_cost=$(jq -r "select(.mode==\"$mode\") | .cost" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
-      local max_duration=$(jq -r "select(.mode==\"$mode\") | .duration_s" "$OUTPUT_DIR/metrics.jsonl" | sort -n | tail -1)
-      local agent_count=$(jq -r "select(.mode==\"$mode\") | .agent" "$OUTPUT_DIR/metrics.jsonl" | wc -l | tr -d ' ')
-      local avg_tokens=$((total_tokens / (agent_count > 0 ? agent_count : 1)))
-      local total_lines=$(jq -r "select(.mode==\"$mode\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
-      local compactions=$(jq -r "select(.mode==\"$mode\") | .compacted" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
+    # Build header row dynamically
+    local header="| Metric |"
+    local separator="|--------|"
+    for m in "${modes_ran[@]}"; do
+      header="$header $m |"
+      separator="$separator------|"
+    done
+    echo "$header" >> "$summary_file"
+    echo "$separator" >> "$summary_file"
 
-      eval "${mode}_total_tokens=$total_tokens"
-      eval "${mode}_total_cost=$total_cost"
-      eval "${mode}_max_duration=$max_duration"
-      eval "${mode}_avg_tokens=$avg_tokens"
-      eval "${mode}_total_lines=$total_lines"
-      eval "${mode}_compactions=$compactions"
+    # Calculate aggregates per mode
+    declare -A mode_total_tokens mode_total_cost mode_max_duration mode_avg_tokens mode_total_lines mode_compactions
+    for m in "${modes_ran[@]}"; do
+      mode_total_tokens[$m]=$(jq -r "select(.mode==\"$m\") | .total_tokens" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
+      mode_total_cost[$m]=$(jq -r "select(.mode==\"$m\") | .cost" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
+      mode_max_duration[$m]=$(jq -r "select(.mode==\"$m\") | .duration_s" "$OUTPUT_DIR/metrics.jsonl" | sort -n | tail -1)
+      local agent_count=$(jq -r "select(.mode==\"$m\") | .agent" "$OUTPUT_DIR/metrics.jsonl" | wc -l | tr -d ' ')
+      mode_avg_tokens[$m]=$(( ${mode_total_tokens[$m]} / (agent_count > 0 ? agent_count : 1) ))
+      mode_total_lines[$m]=$(jq -r "select(.mode==\"$m\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
+      mode_compactions[$m]=$(jq -r "select(.mode==\"$m\") | .compacted" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
     done
 
-    # Calculate deltas
-    calc_delta() {
-      local baseline=$1
-      local canopy=$2
-      if [ "$baseline" = "0" ] || [ -z "$baseline" ]; then
-        echo "N/A"
-        return
-      fi
-      echo "scale=0; ($canopy - $baseline) * 100 / $baseline" | bc 2>/dev/null || echo "N/A"
-    }
+    # Build rows dynamically
+    for metric in "Max agent time:max_duration:s" "Total tokens:total_tokens:" "Total cost:total_cost:\$" "Avg tokens/agent:avg_tokens:" "Total output lines:total_lines:" "Compactions:compactions:"; do
+      local label=$(echo "$metric" | cut -d: -f1)
+      local key=$(echo "$metric" | cut -d: -f2)
+      local prefix=$(echo "$metric" | cut -d: -f3)
+      local suffix=""
+      if [ "$key" = "max_duration" ]; then suffix="s"; fi
 
-    local delta_tokens=$(calc_delta "$baseline_total_tokens" "$canopy_total_tokens")
-    local delta_cost=$(calc_delta "${baseline_total_cost%.*}1" "${canopy_total_cost%.*}1" 2>/dev/null || echo "N/A")
-
-    cat >> "$summary_file" << EOF
-| Metric | Baseline | Canopy | Delta |
-|--------|----------|--------|-------|
-| Max agent time | ${baseline_max_duration}s | ${canopy_max_duration}s | |
-| Total tokens | $baseline_total_tokens | $canopy_total_tokens | ${delta_tokens}% |
-| Total cost | \$$baseline_total_cost | \$$canopy_total_cost | |
-| Avg tokens/agent | $baseline_avg_tokens | $canopy_avg_tokens | |
-| Total output lines | $baseline_total_lines | $canopy_total_lines | |
-| Compactions | $baseline_compactions | $canopy_compactions | |
-EOF
+      local row="| $label |"
+      for m in "${modes_ran[@]}"; do
+        local val=""
+        case "$key" in
+          total_tokens) val="${mode_total_tokens[$m]}" ;;
+          total_cost) val="${mode_total_cost[$m]}" ;;
+          max_duration) val="${mode_max_duration[$m]}" ;;
+          avg_tokens) val="${mode_avg_tokens[$m]}" ;;
+          total_lines) val="${mode_total_lines[$m]}" ;;
+          compactions) val="${mode_compactions[$m]}" ;;
+        esac
+        row="$row ${prefix}${val}${suffix} |"
+      done
+      echo "$row" >> "$summary_file"
+    done
   fi
 
+  echo "" >> "$summary_file"
   echo ""
   echo "=============================================="
   echo "  Summary"
@@ -290,6 +404,10 @@ fi
 
 if [ -z "$MODE" ] || [ "$MODE" = "canopy" ]; then
   run_mode "canopy"
+fi
+
+if [ -z "$MODE" ] || [ "$MODE" = "canopy-service" ]; then
+  run_mode "canopy-service"
 fi
 
 generate_summary

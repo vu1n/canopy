@@ -192,11 +192,21 @@ checksum = "b35204fbdc0b3f4446b89fc1ac2cf84a8a68971995d0bf2e925ec7cd960f9cb3"
 
 [[package]]
 name = "canopy-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "canopy-client",
  "canopy-core",
  "clap",
  "colored",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "canopy-client"
+version = "0.4.0"
+dependencies = [
+ "canopy-core",
  "hex",
  "reqwest",
  "serde",
@@ -206,7 +216,7 @@ dependencies = [
 
 [[package]]
 name = "canopy-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "globset",
  "hex",
@@ -230,17 +240,17 @@ dependencies = [
 
 [[package]]
 name = "canopy-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
+ "canopy-client",
  "canopy-core",
  "serde",
  "serde_json",
- "tokio",
 ]
 
 [[package]]
 name = "canopy-service"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "canopy-core",

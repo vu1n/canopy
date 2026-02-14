@@ -223,11 +223,12 @@ patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 
 ```
 ┌─────────────────┐
-│  canopy-service  │  HTTP service for multi-repo indexing (v3)
+│  canopy-service  │  HTTP service for multi-repo indexing
 ├─────────────────┤
 │  canopy-mcp     │  MCP server for Claude Code
+│  canopy-cli     │  Command-line interface
 ├─────────────────┤
-│  canopy-cli     │  CLI with service integration + dirty overlay
+│  canopy-client  │  Shared runtime (service client, dirty overlay, merge, predict)
 ├─────────────────┤
 │  canopy-core    │  Core indexing and query engine
 │  ├─ index.rs    │  SQLite FTS5 + symbol cache + mmap
@@ -237,6 +238,44 @@ patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 │  └─ generation  │  Generation, RepoShard, ShardStatus
 └─────────────────┘
 ```
+
+---
+
+## Operating Modes
+
+Canopy supports two operating modes:
+
+### Standalone Mode (solo dev)
+
+Default when no service URL is configured. Local index with predictive indexing for large repos.
+
+```bash
+# CLI
+canopy query --pattern "auth"
+
+# MCP (automatic — no config needed)
+```
+
+Best for: solo developers, small-medium repos, quick setup.
+
+### Service Mode (teams/swarms)
+
+Shared pre-indexed service for multi-agent scenarios. Set `CANOPY_SERVICE_URL` to enable.
+
+```bash
+# Start the service
+canopy-service --port 3000
+
+# CLI with service
+CANOPY_SERVICE_URL=http://localhost:3000 canopy query --symbol "Config"
+
+# MCP with service (set env in MCP config)
+# The MCP server reads CANOPY_SERVICE_URL from its environment
+```
+
+Best for: teams, CI, multi-agent swarms, large repos where upfront indexing pays off.
+
+The `canopy-client` crate provides a `ClientRuntime` that handles both modes transparently — CLI and MCP stay in sync without duplicating mode-switching logic.
 
 ---
 

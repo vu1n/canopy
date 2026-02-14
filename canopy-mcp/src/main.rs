@@ -1,20 +1,19 @@
 //! Canopy MCP Server - MCP interface for token-efficient codebase queries
 
-mod predict;
-
-use canopy_core::{FileDiscovery, MatchMode, QueryKind, QueryParams, RepoIndex};
-use predict::{extract_extensions_from_glob, extract_query_text, predict_globs};
+use canopy_client::predict::extract_query_text;
+use canopy_client::{ClientRuntime, IndexResult, QueryInput, StandalonePolicy};
+use canopy_core::{MatchMode, QueryKind, QueryParams, RepoIndex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     let reader = BufReader::new(stdin.lock());
 
-    let server = McpServer::new();
+    let mut server = McpServer::new();
 
     for line in reader.lines() {
         let line = match line {
@@ -34,7 +33,9 @@ fn main() {
     }
 }
 
-struct McpServer;
+struct McpServer {
+    runtime: ClientRuntime,
+}
 
 #[derive(Deserialize)]
 #[allow(dead_code)]
@@ -63,10 +64,13 @@ struct JsonRpcError {
 
 impl McpServer {
     fn new() -> Self {
-        Self
+        let service_url = std::env::var("CANOPY_SERVICE_URL").ok();
+        Self {
+            runtime: ClientRuntime::new(service_url.as_deref(), StandalonePolicy::Predictive),
+        }
     }
 
-    fn handle_request(&self, line: &str) -> Option<String> {
+    fn handle_request(&mut self, line: &str) -> Option<String> {
         let req: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
@@ -267,7 +271,7 @@ impl McpServer {
         }))
     }
 
-    fn handle_tools_call(&self, params: &Option<Value>) -> Result<Value, (i32, String)> {
+    fn handle_tools_call(&mut self, params: &Option<Value>) -> Result<Value, (i32, String)> {
         let params = params
             .as_ref()
             .ok_or((-32602, "Missing params".to_string()))?;
@@ -290,203 +294,65 @@ impl McpServer {
         }
     }
 
-    fn tool_index(&self, args: &Value) -> Result<Value, (i32, String)> {
+    fn tool_index(&mut self, args: &Value) -> Result<Value, (i32, String)> {
         let glob = args
             .get("glob")
             .and_then(|v| v.as_str())
             .ok_or((-32602, "Missing 'glob' parameter".to_string()))?;
 
         let repo_root = self.get_repo_root(args)?;
-        let mut index = self.open_index_at(&repo_root)?;
-        let stats = index.index(glob).map_err(|e| (-32000, e.to_string()))?;
+        let result = self
+            .runtime
+            .index(&repo_root, Some(glob))
+            .map_err(|e| (-32000, e.to_string()))?;
 
-        // Include repo_root for debugging
-        let mut result = serde_json::to_value(&stats).unwrap();
-        if let Some(obj) = result.as_object_mut() {
-            obj.insert(
-                "repo_root".to_string(),
-                json!(repo_root.display().to_string()),
-            );
-        }
+        let result_json = match result {
+            IndexResult::Local(stats) => {
+                let mut val = serde_json::to_value(&stats).unwrap();
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "repo_root".to_string(),
+                        json!(repo_root.display().to_string()),
+                    );
+                }
+                val
+            }
+            IndexResult::Service(resp) => {
+                json!({
+                    "generation": resp.generation,
+                    "status": resp.status,
+                    "commit_sha": resp.commit_sha,
+                    "repo_root": repo_root.display().to_string(),
+                })
+            }
+        };
 
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(&result).unwrap()
+                "text": serde_json::to_string_pretty(&result_json).unwrap()
             }]
         }))
     }
 
-    fn tool_query(&self, args: &Value) -> Result<Value, (i32, String)> {
+    fn tool_query(&mut self, args: &Value) -> Result<Value, (i32, String)> {
         let repo_root = self.get_repo_root(args)?;
-        let mut index = self.open_index_at(&repo_root)?;
 
-        // Auto-index: use predictive indexing for large repos
-        let default_glob = index.config().default_glob().to_string();
-        let status = index.status().map_err(|e| (-32000, e.to_string()))?;
-
-        // Count files to determine if this is a large repo
-        // Only count once (when no files indexed yet) to avoid repeated walks
-        const LARGE_REPO_THRESHOLD: usize = 1000;
-        const MAX_PREDICTIVE_FILES: usize = 500;
-
-        let is_large_repo = if status.files_indexed == 0 {
-            let all_files = index.walk_files(&default_glob).unwrap_or_default();
-            all_files.len() > LARGE_REPO_THRESHOLD
-        } else {
-            // If already indexed, check if we indexed less than full repo would have
-            // (heuristic: if indexed < threshold, assume it was predictive)
-            status.files_indexed < LARGE_REPO_THRESHOLD
-        };
-
-        if status.files_indexed == 0 && !is_large_repo {
-            // Small repo with no index: full index is fine
-            index
-                .index(&default_glob)
-                .map_err(|e| (-32000, e.to_string()))?;
-        } else if is_large_repo {
-            // Large repo: always run predictive indexing
-            // needs_reindex() will skip already-indexed files, so this is safe
-            // for multi-agent fan-out where each agent has different queries
+        // In standalone predictive mode, do predictive indexing before query
+        if !self.runtime.is_service_mode() {
             let query_text = extract_query_text(args);
-            let extensions = extract_extensions_from_glob(&default_glob);
-            let predicted_globs = predict_globs(&query_text, &extensions);
-
-            eprintln!(
-                "[canopy] Large repo, predictive indexing for: {:?}",
-                predicted_globs.iter().take(5).collect::<Vec<_>>()
-            );
-
-            // Index predicted globs until we hit file cap
-            let mut total_indexed = 0;
-            for glob in &predicted_globs {
-                if total_indexed >= MAX_PREDICTIVE_FILES {
-                    break;
-                }
-                match index.index(glob) {
-                    Ok(stats) => {
-                        total_indexed += stats.files_indexed;
-                    }
-                    Err(_e) => {
-                        // Glob might not match any files, that's ok
-                    }
-                }
-            }
-
-            if total_indexed > 0 {
-                eprintln!("[canopy] Predictively indexed {} new files", total_indexed);
-            }
-
-            // If prediction found nothing AND no files exist, fall back to entry points
-            let current_status = index.status().map_err(|e| (-32000, e.to_string()))?;
-            if current_status.files_indexed == 0 {
-                eprintln!("[canopy] No files indexed, adding entry points");
-                let _ = index.index("**/main.*");
-                let _ = index.index("**/index.*");
-                let _ = index.index("**/app.*");
-            }
-        }
-
-        // Check if DSL query is provided (fallback path)
-        if let Some(query_str) = args.get("query").and_then(|v| v.as_str()) {
-            let limit = args
-                .get("limit")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize);
-            let result = index
-                .query(query_str, limit)
+            let mut index = self.open_index_at(&repo_root)?;
+            self.runtime
+                .predictive_index_for_query(&mut index, &query_text)
                 .map_err(|e| (-32000, e.to_string()))?;
-
-            return Ok(json!({
-                "content": [{
-                    "type": "text",
-                    "text": serde_json::to_string_pretty(&result).unwrap()
-                }]
-            }));
         }
 
-        // Build QueryParams from individual params
-        let mut params = QueryParams::new();
+        // Build QueryInput from MCP args
+        let input = build_query_input(args)?;
 
-        // Set pattern or patterns
-        if let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) {
-            params.pattern = Some(pattern.to_string());
-        } else if let Some(patterns_arr) = args.get("patterns").and_then(|v| v.as_array()) {
-            let patterns: Vec<String> = patterns_arr
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-            if !patterns.is_empty() {
-                params.patterns = Some(patterns);
-            }
-        }
-
-        // Set symbol
-        if let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) {
-            params.symbol = Some(symbol.to_string());
-        }
-
-        // Set section
-        if let Some(section) = args.get("section").and_then(|v| v.as_str()) {
-            params.section = Some(section.to_string());
-        }
-
-        // Set parent filter
-        if let Some(parent) = args.get("parent").and_then(|v| v.as_str()) {
-            params.parent = Some(parent.to_string());
-        }
-
-        // Set kind
-        if let Some(kind) = args.get("kind").and_then(|v| v.as_str()) {
-            params.kind = match kind {
-                "definition" => QueryKind::Definition,
-                "reference" => QueryKind::Reference,
-                _ => QueryKind::Any,
-            };
-        }
-
-        // Set glob filter
-        if let Some(glob) = args.get("glob").and_then(|v| v.as_str()) {
-            params.glob = Some(glob.to_string());
-        }
-
-        // Set match mode
-        if let Some(match_mode) = args.get("match").and_then(|v| v.as_str()) {
-            params.match_mode = match match_mode {
-                "all" => MatchMode::All,
-                _ => MatchMode::Any,
-            };
-        }
-
-        // Set limit
-        if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
-            params.limit = Some(limit as usize);
-        }
-
-        // Set expand_budget (default to 5000 if not specified)
-        params.expand_budget = Some(
-            args.get("expand_budget")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .unwrap_or(5000),
-        );
-
-        // Validate that at least one search param is provided
-        if params.pattern.is_none()
-            && params.patterns.is_none()
-            && params.symbol.is_none()
-            && params.section.is_none()
-            && params.parent.is_none()
-        {
-            return Err((
-                -32602,
-                "Must specify one of: pattern, patterns, symbol, section, parent, or query"
-                    .to_string(),
-            ));
-        }
-
-        let result = index
-            .query_params(params)
+        let result = self
+            .runtime
+            .query(&repo_root, input)
             .map_err(|e| (-32000, e.to_string()))?;
 
         Ok(json!({
@@ -497,7 +363,7 @@ impl McpServer {
         }))
     }
 
-    fn tool_expand(&self, args: &Value) -> Result<Value, (i32, String)> {
+    fn tool_expand(&mut self, args: &Value) -> Result<Value, (i32, String)> {
         let handle_ids: Vec<String> = args
             .get("handle_ids")
             .and_then(|v| v.as_array())
@@ -511,23 +377,33 @@ impl McpServer {
         }
 
         let repo_root = self.get_repo_root(args)?;
-        let index = self.open_index_at(&repo_root)?;
-        let contents = index
-            .expand(&handle_ids)
+        let outcome = self
+            .runtime
+            .expand(&repo_root, &handle_ids)
             .map_err(|e| (-32000, e.to_string()))?;
 
         // Format as readable text
-        let text = contents
+        let mut text = outcome
+            .contents
             .iter()
             .map(|(id, content)| format!("// {}\n{}", id, content))
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        // Include failed_ids in response
+        if !outcome.failed_ids.is_empty() {
+            text.push_str(&format!(
+                "\n\n// Failed to expand: {}",
+                outcome.failed_ids.join(", ")
+            ));
+        }
+
         Ok(json!({
             "content": [{
                 "type": "text",
                 "text": text
-            }]
+            }],
+            "failed_ids": outcome.failed_ids
         }))
     }
 
@@ -536,7 +412,6 @@ impl McpServer {
         let index = self.open_index_at(&repo_root)?;
         let status = index.status().map_err(|e| (-32000, e.to_string()))?;
 
-        // Include repo_root and file_discovery for debugging
         let mut result = serde_json::to_value(&status).unwrap();
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
@@ -545,7 +420,7 @@ impl McpServer {
             );
             obj.insert(
                 "file_discovery".to_string(),
-                json!(FileDiscovery::detect().name()),
+                json!(canopy_core::FileDiscovery::detect().name()),
             );
         }
 
@@ -585,8 +460,7 @@ impl McpServer {
     }
 
     /// Open index at a specific path (with auto-init)
-    fn open_index_at(&self, root: &Path) -> Result<RepoIndex, (i32, String)> {
-        // Auto-init if .canopy doesn't exist
+    fn open_index_at(&self, root: &std::path::Path) -> Result<RepoIndex, (i32, String)> {
         if !root.join(".canopy").exists() {
             RepoIndex::init(root).map_err(|e| (-32000, e.to_string()))?;
         }
@@ -600,4 +474,95 @@ impl McpServer {
             .map(PathBuf::from)
             .ok_or_else(|| (-32602, "Missing required 'path' parameter".to_string()))
     }
+}
+
+/// Build QueryInput from MCP JSON-RPC arguments
+fn build_query_input(args: &Value) -> Result<QueryInput, (i32, String)> {
+    // Check if DSL query is provided (fallback path)
+    if let Some(query_str) = args.get("query").and_then(|v| v.as_str()) {
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        return Ok(QueryInput::Dsl(
+            query_str.to_string(),
+            canopy_core::QueryOptions {
+                limit,
+                expand_budget: None,
+            },
+        ));
+    }
+
+    // Build QueryParams from individual params
+    let mut params = QueryParams::new();
+
+    if let Some(pattern) = args.get("pattern").and_then(|v| v.as_str()) {
+        params.pattern = Some(pattern.to_string());
+    } else if let Some(patterns_arr) = args.get("patterns").and_then(|v| v.as_array()) {
+        let patterns: Vec<String> = patterns_arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+        if !patterns.is_empty() {
+            params.patterns = Some(patterns);
+        }
+    }
+
+    if let Some(symbol) = args.get("symbol").and_then(|v| v.as_str()) {
+        params.symbol = Some(symbol.to_string());
+    }
+
+    if let Some(section) = args.get("section").and_then(|v| v.as_str()) {
+        params.section = Some(section.to_string());
+    }
+
+    if let Some(parent) = args.get("parent").and_then(|v| v.as_str()) {
+        params.parent = Some(parent.to_string());
+    }
+
+    if let Some(kind) = args.get("kind").and_then(|v| v.as_str()) {
+        params.kind = match kind {
+            "definition" => QueryKind::Definition,
+            "reference" => QueryKind::Reference,
+            _ => QueryKind::Any,
+        };
+    }
+
+    if let Some(glob) = args.get("glob").and_then(|v| v.as_str()) {
+        params.glob = Some(glob.to_string());
+    }
+
+    if let Some(match_mode) = args.get("match").and_then(|v| v.as_str()) {
+        params.match_mode = match match_mode {
+            "all" => MatchMode::All,
+            _ => MatchMode::Any,
+        };
+    }
+
+    if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
+        params.limit = Some(limit as usize);
+    }
+
+    // Set expand_budget (default to 5000 if not specified)
+    params.expand_budget = Some(
+        args.get("expand_budget")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(5000),
+    );
+
+    // Validate that at least one search param is provided
+    if params.pattern.is_none()
+        && params.patterns.is_none()
+        && params.symbol.is_none()
+        && params.section.is_none()
+        && params.parent.is_none()
+    {
+        return Err((
+            -32602,
+            "Must specify one of: pattern, patterns, symbol, section, parent, or query".to_string(),
+        ));
+    }
+
+    Ok(QueryInput::Params(params))
 }

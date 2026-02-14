@@ -8,7 +8,7 @@ Canopy is a token-efficient codebase indexing system for LLM agents. It helps ag
 
 ```
 canopy/
-├── canopy-core/     # Core library
+├── canopy-core/     # Core library (pure, no reqwest)
 │   └── src/
 │       ├── index.rs       # SQLite FTS5 index + symbol cache
 │       ├── parse.rs       # Tree-sitter parsing (TS, Python, Rust, etc.)
@@ -18,24 +18,28 @@ canopy/
 │       ├── config.rs      # Configuration loading
 │       ├── document.rs    # Parsed document types
 │       └── error.rs       # Error types including StaleGeneration, ServiceError
+├── canopy-client/   # Shared client runtime (CLI + MCP stay in sync)
+│   └── src/
+│       ├── runtime.rs        # ClientRuntime: unified mode orchestration
+│       ├── service_client.rs # HTTP client for canopy-service (blocking reqwest)
+│       ├── dirty.rs          # Git dirty file detection and local index overlay
+│       ├── merge.rs          # Result merge logic (local + service)
+│       └── predict.rs        # Predictive path selection heuristics
 ├── canopy-service/  # HTTP service for multi-repo indexing
 │   └── src/
 │       ├── main.rs     # Axum router, CLI args (--port, --bind)
-│       ├── routes.rs   # 6 HTTP endpoints (query, expand, repos/add, repos, status, reindex)
+│       ├── routes.rs   # 7 HTTP endpoints (query, expand, repos/add, repos, status, reindex, metrics)
 │       ├── state.rs    # AppState with RwLock<HashMap<String, RepoShard>>
 │       └── error.rs    # Structured error envelope {code, message, hint}
 ├── canopy-mcp/      # MCP server for Claude Code
 │   └── src/
-│       ├── main.rs     # MCP protocol handler
-│       └── predict.rs  # Predictive path selection heuristics
+│       └── main.rs     # MCP protocol handler (uses ClientRuntime)
 ├── canopy-cli/      # Command-line interface
 │   └── src/
-│       ├── main.rs     # CLI commands (init, index, query, expand, status, repos, reindex, service-status)
-│       ├── dirty.rs    # Git dirty file detection and local index overlay
-│       ├── client.rs   # HTTP client for canopy-service
-│       └── merge.rs    # Result merge logic (local + service)
-└── benchmark/       # A/B testing
+│       └── main.rs     # CLI commands (uses ClientRuntime)
+└── benchmark/       # A/B testing + swarm benchmarks
     ├── run-ab-test.sh
+    ├── run-swarm-test.sh  # baseline vs canopy vs canopy-service
     └── results/
 ```
 
@@ -70,10 +74,10 @@ Canopy v3 adds a shared indexing service for multi-agent scenarios:
 - Handles stamped with `source: "service"`, `commit_sha`, and `generation`
 - Stale generation on expand returns 409 with structured error
 
-**CLI dirty overlay**: CLI detects local uncommitted changes and merges with service results.
+**Client dirty overlay**: `canopy-client` detects local uncommitted changes and merges with service results.
 - `git status --porcelain=v2` detects dirty files
 - Local index rebuilt for dirty files only (fingerprint-cached)
-- Merge: local handles override service handles for overlapping ranges in dirty files
+- Merge: drops ALL service handles (and ref_handles) for dirty file paths, keeps local
 
 **Shared contracts** on `Handle`:
 - `source: HandleSource` -- `Local` or `Service`
@@ -111,7 +115,7 @@ cargo run -p canopy-service -- --port 3000
 
 # CLI with service integration
 cargo run -p canopy-cli -- --service-url http://localhost:3000 query --pattern "auth"
-cargo run -p canopy-cli -- --mode service-only --service-url http://localhost:3000 query --symbol "Config"
+cargo run -p canopy-cli -- --service-url http://localhost:3000 query --symbol "Config"
 cargo run -p canopy-cli -- --service-url http://localhost:3000 repos
 cargo run -p canopy-cli -- --service-url http://localhost:3000 service-status
 ```
@@ -124,7 +128,7 @@ cargo run -p canopy-cli -- --service-url http://localhost:3000 service-status
 3. Add MCP tool parameter handling in `canopy-mcp/src/main.rs`
 
 ### Adding predictive keyword mappings
-Edit `KEYWORD_PATTERNS` in `canopy-mcp/src/predict.rs`:
+Edit `KEYWORD_PATTERNS` in `canopy-client/src/predict.rs`:
 ```rust
 const KEYWORD_PATTERNS: &[(&[&str], &[&str])] = &[
     (&["auth", "login"], &["**/auth/**", "**/login/**"]),
@@ -136,12 +140,15 @@ const KEYWORD_PATTERNS: &[(&[&str], &[&str])] = &[
 1. Add route handler in `canopy-service/src/routes.rs`
 2. Add request/response types in the same file
 3. Register route in `canopy-service/src/main.rs` router
-4. Add client method in `canopy-cli/src/client.rs`
-5. Add CLI subcommand in `canopy-cli/src/main.rs`
+4. Add client method in `canopy-client/src/service_client.rs`
+5. Add runtime method in `canopy-client/src/runtime.rs`
+6. Add CLI subcommand in `canopy-cli/src/main.rs`
 
 ### Running benchmarks
 ```bash
 ./benchmark/run-ab-test.sh /path/to/large/repo
+./benchmark/run-swarm-test.sh /path/to/large/repo  # baseline + canopy + canopy-service
+AGENTS=2 MODE=canopy-service ./benchmark/run-swarm-test.sh /path/to/repo
 ```
 
 ## Code Style

@@ -44,9 +44,7 @@ pub async fn query(
     let repo_label = req.repo.clone();
 
     let shards = state.shards.read().await;
-    let shard = shards
-        .get(&req.repo)
-        .ok_or_else(|| AppError::not_found("repo"))?;
+    let shard = shards.get(&req.repo).ok_or_else(AppError::repo_not_found)?;
 
     if shard.status != ShardStatus::Ready {
         return Err(AppError::internal(format!(
@@ -186,9 +184,7 @@ pub async fn expand(
     let handle_count = req.handles.len();
 
     let shards = state.shards.read().await;
-    let shard = shards
-        .get(&req.repo)
-        .ok_or_else(|| AppError::not_found("repo"))?;
+    let shard = shards.get(&req.repo).ok_or_else(AppError::repo_not_found)?;
 
     if shard.status != ShardStatus::Ready {
         return Err(AppError::internal(format!(
@@ -306,11 +302,17 @@ pub async fn add_repo(
         });
     }
 
+    // Canonicalize path ONCE before taking the lock
+    let canonical = std::fs::canonicalize(&req.path)
+        .map_err(AppError::internal)?
+        .to_string_lossy()
+        .to_string();
+
     // Init canopy if needed
     if !path.join(".canopy").exists() {
         tokio::task::spawn_blocking({
-            let path = req.path.clone();
-            move || RepoIndex::init(Path::new(&path))
+            let canonical = canonical.clone();
+            move || RepoIndex::init(Path::new(&canonical))
         })
         .await
         .map_err(AppError::internal)??;
@@ -322,18 +324,36 @@ pub async fn add_repo(
             .unwrap_or_else(|| "unnamed".to_string())
     });
 
+    // Idempotent: check if a shard with the same canonical root already exists
+    let mut shards = state.shards.write().await;
+    for (id, shard) in shards.iter() {
+        if shard.repo_root == canonical {
+            eprintln!(
+                "[{}] POST /repos/add name={} repo_id={} (existing)",
+                timestamp(),
+                shard.name,
+                id
+            );
+            return Ok(Json(AddRepoResponse {
+                repo_id: id.clone(),
+                name: shard.name.clone(),
+            }));
+        }
+    }
+
     let repo_id = uuid::Uuid::new_v4().to_string();
 
     let shard = RepoShard {
         repo_id: repo_id.clone(),
-        repo_root: req.path.clone(),
+        repo_root: canonical,
         name: name.clone(),
         commit_sha: None,
         generation: Generation::new(),
         status: ShardStatus::Pending,
     };
 
-    state.shards.write().await.insert(repo_id.clone(), shard);
+    shards.insert(repo_id.clone(), shard);
+    drop(shards);
 
     eprintln!(
         "[{}] POST /repos/add name={} repo_id={}",
@@ -388,7 +408,7 @@ pub async fn reindex(
     let mut shards = state.shards.write().await;
     let shard = shards
         .get_mut(&req.repo)
-        .ok_or_else(|| AppError::not_found("repo"))?;
+        .ok_or_else(AppError::repo_not_found)?;
 
     // Coalesce: if already indexing, return current generation
     if shard.status == ShardStatus::Indexing {
@@ -470,9 +490,7 @@ pub async fn reindex(
 
     // Return current state (indexing has started)
     let shards = state.shards.read().await;
-    let shard = shards
-        .get(&req.repo)
-        .ok_or_else(|| AppError::not_found("repo"))?;
+    let shard = shards.get(&req.repo).ok_or_else(AppError::repo_not_found)?;
     Ok(Json(ReindexResponse {
         generation: shard.generation.value(),
         status: "indexing".to_string(),
