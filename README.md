@@ -7,45 +7,28 @@ Token-efficient codebase indexing and querying for LLM agents.
 ### 1. Install
 
 ```bash
-# Clone and build
+curl -fsSL https://raw.githubusercontent.com/vu1n/canopy/main/install.sh | sh
+```
+
+This installs `canopy` + `canopy-mcp` to `~/.local/bin/` and configures Claude Code automatically.
+
+**Options:**
+- `--no-claude-setup` — skip Claude Code MCP configuration
+- `--prefix /usr/local` — install to a custom location
+
+<details>
+<summary>Build from source</summary>
+
+```bash
 git clone https://github.com/vu1n/canopy.git
 cd canopy
-cargo build --release
-
-# Copy binary to a permanent location
-sudo cp target/release/canopy-mcp /usr/local/bin/
-# or
-cp target/release/canopy-mcp ~/.local/bin/
+make install        # builds + installs canopy + canopy-mcp
+make setup-claude   # configures Claude Code
 ```
 
-### 2. Configure Claude Code
+</details>
 
-Add to `~/.claude/settings.json`:
-
-```json
-{
-  "mcpServers": {
-    "canopy": {
-      "command": "canopy-mcp"
-    }
-  }
-}
-```
-
-Or for a specific project, create `.mcp.json` in the repo root:
-
-```json
-{
-  "mcpServers": {
-    "canopy": {
-      "command": "canopy-mcp",
-      "args": ["--root", "."]
-    }
-  }
-}
-```
-
-### 3. Use It
+### 2. Use It
 
 Claude Code now has access to canopy tools. Ask questions like:
 
@@ -270,8 +253,11 @@ patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 Canopy v3 adds a shared HTTP service for multi-agent scenarios:
 
 ```bash
+# Install the service
+curl -fsSL https://raw.githubusercontent.com/vu1n/canopy/main/install-service.sh | sh
+
 # Start the service
-cargo run -p canopy-service -- --port 3000
+canopy-service --port 3000
 
 # Register and index a repo
 curl -X POST localhost:3000/repos/add -H 'Content-Type: application/json' \

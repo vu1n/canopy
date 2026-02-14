@@ -54,6 +54,7 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/canopy dist/canopy
           cp target/${{ matrix.target }}/release/canopy-mcp dist/canopy-mcp
+          cp target/${{ matrix.target }}/release/canopy-service dist/canopy-service
           cd dist
           tar -czvf ../${{ matrix.name }}.tar.gz *
 
@@ -84,38 +85,23 @@ jobs:
           files: artifacts/**/*.tar.gz
           generate_release_notes: true
           body: |
-            ## Installation
-
-            Download the appropriate binary for your platform and extract:
+            ## Quick Install
 
             ```bash
-            # macOS (Apple Silicon)
-            tar -xzf canopy-macos-aarch64.tar.gz
-            sudo mv canopy canopy-mcp /usr/local/bin/
+            # Client (canopy CLI + canopy-mcp)
+            curl -fsSL https://raw.githubusercontent.com/vu1n/canopy/main/install.sh | sh
 
-            # macOS (Intel)
-            tar -xzf canopy-macos-x86_64.tar.gz
-            sudo mv canopy canopy-mcp /usr/local/bin/
-
-            # Linux (x86_64)
-            tar -xzf canopy-linux-x86_64.tar.gz
-            sudo mv canopy canopy-mcp /usr/local/bin/
-
-            # Linux (ARM64)
-            tar -xzf canopy-linux-aarch64.tar.gz
-            sudo mv canopy canopy-mcp /usr/local/bin/
+            # Service (canopy-service)
+            curl -fsSL https://raw.githubusercontent.com/vu1n/canopy/main/install-service.sh | sh
             ```
 
-            Then configure Claude Code:
+            ## Manual Install
 
-            ```json
-            {
-              "mcpServers": {
-                "canopy": {
-                  "command": "canopy-mcp"
-                }
-              }
-            }
+            Download the appropriate tarball for your platform and extract:
+
+            ```bash
+            tar -xzf canopy-<platform>.tar.gz
+            mv canopy canopy-mcp canopy-service ~/.local/bin/
             ```
 
             See [README](https://github.com/vu1n/canopy#readme) for full documentation.
