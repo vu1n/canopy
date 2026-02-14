@@ -254,6 +254,14 @@ impl McpServer {
                         },
                         "required": ["path"]
                     }
+                },
+                {
+                    "name": "canopy_agent_readme",
+                    "description": "Returns usage instructions for AI agents using canopy MCP tools. Call this if unfamiliar with canopy to learn the query workflow, available parameters, response formats, and best practices.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {}
+                    }
                 }
             ]
         }))
@@ -277,6 +285,7 @@ impl McpServer {
             "canopy_expand" => self.tool_expand(&arguments),
             "canopy_status" => self.tool_status(&arguments),
             "canopy_invalidate" => self.tool_invalidate(&arguments),
+            "canopy_agent_readme" => self.tool_agent_readme(),
             _ => Err((-32602, format!("Unknown tool: {}", name))),
         }
     }
@@ -561,6 +570,16 @@ impl McpServer {
             "content": [{
                 "type": "text",
                 "text": format!("Invalidated {} files", count)
+            }]
+        }))
+    }
+
+    fn tool_agent_readme(&self) -> Result<Value, (i32, String)> {
+        let readme = include_str!("../../AGENT-MCP.md");
+        Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": readme
             }]
         }))
     }
