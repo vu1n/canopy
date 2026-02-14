@@ -30,15 +30,34 @@ pub async fn query(
         )));
     }
 
+    let repo_id = shard.repo_id.clone();
     let repo_root = shard.repo_root.clone();
     let commit_sha = shard.commit_sha.clone();
     let generation = shard.generation.value();
     drop(shards);
 
     let params = req.params;
+    let cache_key = serde_json::to_string(&params).map_err(AppError::internal)?;
+
+    if let Some(result) = state
+        .get_cached_query(&repo_id, &cache_key, generation)
+        .await
+    {
+        return Ok(Json(result));
+    }
+
+    let cached_index = state
+        .get_or_open_index(&repo_id, &repo_root, generation)
+        .await
+        .map_err(AppError::from)?;
+
     // Run blocking index operations in spawn_blocking
     let result = tokio::task::spawn_blocking(move || {
-        let index = RepoIndex::open(Path::new(&repo_root))?;
+        let index = cached_index.index.lock().map_err(|err| {
+            canopy_core::CanopyError::Io(std::io::Error::other(format!(
+                "Index mutex poisoned: {err}"
+            )))
+        })?;
         let mut result = index.query_params(params)?;
         // Stamp handles with service metadata
         for handle in &mut result.handles {
@@ -50,6 +69,12 @@ pub async fn query(
     })
     .await
     .map_err(AppError::internal)??;
+
+    if !result.auto_expanded {
+        state
+            .insert_cached_query(&repo_id, cache_key, result.clone(), generation)
+            .await;
+    }
 
     Ok(Json(result))
 }
@@ -88,6 +113,15 @@ pub async fn expand(
         .get(&req.repo)
         .ok_or_else(|| AppError::not_found("repo"))?;
 
+    if shard.status != ShardStatus::Ready {
+        return Err(AppError::internal(format!(
+            "Repo {} is not ready (status: {:?})",
+            req.repo, shard.status
+        )));
+    }
+
+    let repo_id = shard.repo_id.clone();
+    let repo_root = shard.repo_root.clone();
     let current_gen = shard.generation.value();
     // Validate generation if provided
     for h in &req.handles {
@@ -97,14 +131,20 @@ pub async fn expand(
             }
         }
     }
-
-    let repo_root = shard.repo_root.clone();
     drop(shards);
 
     let handle_ids: Vec<String> = req.handles.iter().map(|h| h.id.clone()).collect();
+    let cached_index = state
+        .get_or_open_index(&repo_id, &repo_root, current_gen)
+        .await
+        .map_err(AppError::from)?;
 
     let contents = tokio::task::spawn_blocking(move || {
-        let index = RepoIndex::open(Path::new(&repo_root))?;
+        let index = cached_index.index.lock().map_err(|err| {
+            canopy_core::CanopyError::Io(std::io::Error::other(format!(
+                "Index mutex poisoned: {err}"
+            )))
+        })?;
         index.expand(&handle_ids)
     })
     .await
@@ -275,15 +315,19 @@ pub async fn reindex(
         })
         .await;
 
-        let mut shards = state_clone.shards.write().await;
-        if let Some(shard) = shards.get_mut(&repo_id) {
-            match result {
-                Ok(Ok(commit_sha)) => {
+        match result {
+            Ok(Ok(commit_sha)) => {
+                state_clone.invalidate_repo(&repo_id).await;
+                let mut shards = state_clone.shards.write().await;
+                if let Some(shard) = shards.get_mut(&repo_id) {
                     shard.generation = shard.generation.next();
                     shard.commit_sha = commit_sha;
                     shard.status = ShardStatus::Ready;
                 }
-                _ => {
+            }
+            _ => {
+                let mut shards = state_clone.shards.write().await;
+                if let Some(shard) = shards.get_mut(&repo_id) {
                     shard.status = ShardStatus::Error;
                 }
             }

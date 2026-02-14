@@ -276,7 +276,7 @@ impl QueryParams {
 }
 
 /// Query result with handles
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResult {
     pub handles: Vec<Handle>,
     #[serde(skip_serializing_if = "Option::is_none")]
