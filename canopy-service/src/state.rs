@@ -2,11 +2,60 @@ use canopy_core::{CanopyError, QueryResult, RepoIndex, RepoShard};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
 pub type SharedState = Arc<AppState>;
 pub const QUERY_CACHE_MAX_ENTRIES: usize = 128;
+
+pub struct ServiceMetrics {
+    pub query_count: AtomicU64,
+    pub query_cache_hits: AtomicU64,
+    pub query_cache_misses: AtomicU64,
+    pub expand_count: AtomicU64,
+    pub index_cache_hits: AtomicU64,
+    pub index_cache_misses: AtomicU64,
+    pub reindex_count: AtomicU64,
+    pub total_query_ms: AtomicU64,
+    pub total_expand_ms: AtomicU64,
+    pub analytics: Mutex<QueryAnalytics>,
+}
+
+impl ServiceMetrics {
+    pub fn new() -> Self {
+        Self {
+            query_count: AtomicU64::new(0),
+            query_cache_hits: AtomicU64::new(0),
+            query_cache_misses: AtomicU64::new(0),
+            expand_count: AtomicU64::new(0),
+            index_cache_hits: AtomicU64::new(0),
+            index_cache_misses: AtomicU64::new(0),
+            reindex_count: AtomicU64::new(0),
+            total_query_ms: AtomicU64::new(0),
+            total_expand_ms: AtomicU64::new(0),
+            analytics: Mutex::new(QueryAnalytics::new()),
+        }
+    }
+}
+
+pub struct QueryAnalytics {
+    pub top_symbols: HashMap<String, u64>,
+    pub top_patterns: HashMap<String, u64>,
+    pub top_expanded_files: HashMap<String, u64>,
+    pub queries_by_repo: HashMap<String, u64>,
+}
+
+impl QueryAnalytics {
+    pub fn new() -> Self {
+        Self {
+            top_symbols: HashMap::new(),
+            top_patterns: HashMap::new(),
+            top_expanded_files: HashMap::new(),
+            queries_by_repo: HashMap::new(),
+        }
+    }
+}
 
 pub struct CachedIndex {
     pub index: Mutex<RepoIndex>,
@@ -68,6 +117,7 @@ impl RepoQueryCache {
 
 pub struct AppState {
     pub shards: RwLock<HashMap<String, RepoShard>>,
+    pub metrics: ServiceMetrics,
     indexes: RwLock<HashMap<String, Arc<CachedIndex>>>,
     query_caches: RwLock<HashMap<String, RepoQueryCache>>,
 }
@@ -76,6 +126,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             shards: RwLock::new(HashMap::new()),
+            metrics: ServiceMetrics::new(),
             indexes: RwLock::new(HashMap::new()),
             query_caches: RwLock::new(HashMap::new()),
         }
@@ -91,10 +142,16 @@ impl AppState {
             let indexes = self.indexes.read().await;
             if let Some(cached) = indexes.get(repo_id) {
                 if cached.generation == generation {
+                    self.metrics
+                        .index_cache_hits
+                        .fetch_add(1, Ordering::Relaxed);
                     return Ok(Arc::clone(cached));
                 }
             }
         }
+        self.metrics
+            .index_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
 
         let repo_root = repo_root.to_string();
         let index = tokio::task::spawn_blocking(move || RepoIndex::open(Path::new(&repo_root)))

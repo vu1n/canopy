@@ -78,15 +78,7 @@ Is repo >1000 files?
 
 ## Performance
 
-Tested on n8n (7,600+ files):
-
-| Test | Canopy vs Baseline |
-|------|-------------------|
-| Symbol discovery | **2.3x more detailed** (414 vs 178 lines) |
-| Subsystem analysis | **18% faster, 17% cheaper** |
-| Multi-file tracing | **15% faster, 11% cheaper** |
-| Simple lookup | Same (no overhead) |
-| **Overall** | **6% cost savings** |
+See [Benchmarking](#benchmarking) below for how to run your own measurements.
 
 ---
 
@@ -278,8 +270,26 @@ Features:
 
 ## Benchmarking
 
+### Swarm Benchmark (multi-agent)
+
+Simulates N concurrent agents exploring a codebase — measures token economy, speed, and quality across parallel workloads.
+
 ```bash
-# Run A/B test comparing baseline vs canopy
+# Run with defaults (5 agents, both baseline + canopy)
+./benchmark/run-swarm-test.sh /path/to/repo
+
+# Customize via env vars
+AGENTS=3 MODE=canopy MAX_TURNS=15 ./benchmark/run-swarm-test.sh /path/to/repo
+
+# Baseline only
+AGENTS=5 MODE=baseline ./benchmark/run-swarm-test.sh /path/to/repo
+```
+
+Each agent gets a different task (round-robin) to simulate real multi-agent workloads. Results include per-agent metrics and an aggregate comparison table in `benchmark/results/swarm-{date}/summary.md`.
+
+### Single-Agent A/B Test
+
+```bash
 ./benchmark/run-ab-test.sh /path/to/repo
 ```
 

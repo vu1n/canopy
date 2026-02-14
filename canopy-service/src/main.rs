@@ -30,6 +30,7 @@ async fn main() {
         .route("/repos", get(routes::list_repos))
         .route("/status", get(routes::status))
         .route("/reindex", post(routes::reindex))
+        .route("/metrics", get(routes::metrics))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
