@@ -90,20 +90,23 @@ MCPEOF
   # Run agent, capture output
   "${cmd_args[@]}" 2>/dev/null > "$json_file" || true
 
-  # Extract metrics from JSON
-  local duration_ms=$(jq -r '.duration_ms // 0' "$json_file" 2>/dev/null || echo "0")
-  local num_turns=$(jq -r '.num_turns // 0' "$json_file" 2>/dev/null || echo "0")
-  local input_tokens=$(jq -r '.usage.input_tokens // 0' "$json_file" 2>/dev/null || echo "0")
-  local cache_read=$(jq -r '.usage.cache_read_input_tokens // 0' "$json_file" 2>/dev/null || echo "0")
-  local cache_create=$(jq -r '.usage.cache_creation_input_tokens // 0' "$json_file" 2>/dev/null || echo "0")
-  local output_tokens=$(jq -r '.usage.output_tokens // 0' "$json_file" 2>/dev/null || echo "0")
-  local cost=$(jq -r '.total_cost_usd // 0' "$json_file" 2>/dev/null || echo "0")
-  local result=$(jq -r '.result // "No result"' "$json_file" 2>/dev/null)
+  # Extract metrics from JSON (default to 0 for missing/empty values)
+  jq_num() { local v; v=$(jq -r "$1" "$2" 2>/dev/null); echo "${v:-0}"; }
+  local duration_ms=$(jq_num '.duration_ms // 0' "$json_file")
+  local num_turns=$(jq_num '.num_turns // 0' "$json_file")
+  local input_tokens=$(jq_num '.usage.input_tokens // 0' "$json_file")
+  local cache_read=$(jq_num '.usage.cache_read_input_tokens // 0' "$json_file")
+  local cache_create=$(jq_num '.usage.cache_creation_input_tokens // 0' "$json_file")
+  local output_tokens=$(jq_num '.usage.output_tokens // 0' "$json_file")
+  local cost=$(jq_num '.total_cost_usd // 0' "$json_file")
+  local result
+  result=$(jq -r '.result // "No result"' "$json_file" 2>/dev/null) || result="No result"
+  [ -z "$result" ] && result="No result"
   local result_lines=$(echo "$result" | wc -l | tr -d ' ')
   local duration_s=$(echo "scale=2; $duration_ms / 1000" | bc 2>/dev/null || echo "0")
   local total_tokens=$((input_tokens + cache_create + output_tokens))
   local compacted=0
-  if [ "$num_turns" -ge "$MAX_TURNS" ]; then
+  if [ "$num_turns" -ge "$MAX_TURNS" ] 2>/dev/null; then
     compacted=1
   fi
 
