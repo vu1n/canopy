@@ -4,7 +4,7 @@ use crate::config::{Config, DEFAULT_CONFIG};
 use crate::document::RefType;
 use crate::document::{NodeType, ParsedFile};
 use crate::error::CanopyError;
-use crate::handle::{generate_preview, Handle, HandleId, RefHandle};
+use crate::handle::{generate_preview, Handle, HandleId, HandleSource, RefHandle};
 use crate::parse::{estimate_tokens, parse_file};
 use crate::query::{
     execute_query, execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult,
@@ -1061,6 +1061,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1134,6 +1137,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1209,6 +1215,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1240,6 +1249,9 @@ impl RepoIndex {
                         token_count: e.token_count,
                         preview: e.preview.clone(),
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 })
                 .collect();
@@ -1320,6 +1332,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1406,6 +1421,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1452,6 +1470,9 @@ impl RepoIndex {
                     token_count,
                     preview,
                     content: None,
+                    source: HandleSource::Local,
+                    commit_sha: None,
+                    generation: None,
                 });
             }
         }
@@ -1534,6 +1555,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1605,6 +1629,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1683,6 +1710,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1714,6 +1744,9 @@ impl RepoIndex {
                         token_count: e.token_count,
                         preview: e.preview.clone(),
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 })
                 .collect();
@@ -1794,6 +1827,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )
@@ -1870,6 +1906,9 @@ impl RepoIndex {
                         token_count: tokens,
                         preview,
                         content: None,
+                        source: HandleSource::Local,
+                        commit_sha: None,
+                        generation: None,
                     }
                 },
             )

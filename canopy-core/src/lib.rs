@@ -6,6 +6,7 @@
 pub mod config;
 pub mod document;
 pub mod error;
+pub mod generation;
 pub mod handle;
 pub mod index;
 pub mod parse;
@@ -14,7 +15,8 @@ pub mod query;
 pub use config::Config;
 pub use document::{DocumentNode, NodeMetadata, NodeType, ParsedFile, RefType, Reference, Span};
 pub use error::CanopyError;
-pub use handle::{Handle, HandleId, RefHandle};
+pub use generation::{Generation, RepoShard, ShardStatus};
+pub use handle::{Handle, HandleId, HandleSource, RefHandle};
 pub use index::{FileDiscovery, IndexStats, RepoIndex};
 pub use query::{
     MatchMode, Query, QueryKind, QueryOptions, QueryParams, QueryResult, DEFAULT_EXPAND_BUDGET,

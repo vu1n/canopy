@@ -65,6 +65,15 @@ impl FromStr for HandleId {
     }
 }
 
+/// Source of a handle — local index or remote service
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HandleSource {
+    #[default]
+    Local,
+    Service,
+}
+
 /// A handle representing a reference to content
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Handle {
@@ -78,6 +87,15 @@ pub struct Handle {
     /// Full content, populated when expand_budget is set and results fit
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Where this handle originated from
+    #[serde(default)]
+    pub source: HandleSource,
+    /// Git commit SHA the index was built from
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    /// Generation counter for staleness detection
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
 }
 
 impl Handle {
@@ -100,6 +118,9 @@ impl Handle {
             token_count,
             preview,
             content: None,
+            source: HandleSource::Local,
+            commit_sha: None,
+            generation: None,
         }
     }
 

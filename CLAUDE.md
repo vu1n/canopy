@@ -10,19 +10,30 @@ Canopy is a token-efficient codebase indexing system for LLM agents. It helps ag
 canopy/
 ├── canopy-core/     # Core library
 │   └── src/
-│       ├── index.rs    # SQLite FTS5 index + symbol cache
-│       ├── parse.rs    # Tree-sitter parsing (TS, Python, Rust, etc.)
-│       ├── query.rs    # Query DSL and execution
-│       ├── handle.rs   # Handle types and preview generation
-│       ├── config.rs   # Configuration loading
-│       └── document.rs # Parsed document types
+│       ├── index.rs       # SQLite FTS5 index + symbol cache
+│       ├── parse.rs       # Tree-sitter parsing (TS, Python, Rust, etc.)
+│       ├── query.rs       # Query DSL and execution
+│       ├── handle.rs      # Handle types, HandleSource, preview generation
+│       ├── generation.rs  # Generation tracking (Generation, RepoShard, ShardStatus)
+│       ├── config.rs      # Configuration loading
+│       ├── document.rs    # Parsed document types
+│       └── error.rs       # Error types including StaleGeneration, ServiceError
+├── canopy-service/  # HTTP service for multi-repo indexing
+│   └── src/
+│       ├── main.rs     # Axum router, CLI args (--port, --bind)
+│       ├── routes.rs   # 6 HTTP endpoints (query, expand, repos/add, repos, status, reindex)
+│       ├── state.rs    # AppState with RwLock<HashMap<String, RepoShard>>
+│       └── error.rs    # Structured error envelope {code, message, hint}
 ├── canopy-mcp/      # MCP server for Claude Code
 │   └── src/
 │       ├── main.rs     # MCP protocol handler
 │       └── predict.rs  # Predictive path selection heuristics
 ├── canopy-cli/      # Command-line interface
 │   └── src/
-│       └── main.rs     # CLI commands (init, index, query, expand, status)
+│       ├── main.rs     # CLI commands (init, index, query, expand, status, repos, reindex, service-status)
+│       ├── dirty.rs    # Git dirty file detection and local index overlay
+│       ├── client.rs   # HTTP client for canopy-service
+│       └── merge.rs    # Result merge logic (local + service)
 └── benchmark/       # A/B testing
     ├── run-ab-test.sh
     └── results/
@@ -49,6 +60,37 @@ In-memory HashMap preloaded at index open for O(1) symbol lookups. Updated incre
 - FTS5 for full-text search
 - Symbol FTS for fuzzy symbol matching
 
+### Service Architecture (v3)
+
+Canopy v3 adds a shared indexing service for multi-agent scenarios:
+
+**canopy-service**: HTTP service that indexes committed code for multiple repos with generation tracking.
+- Repos registered via `POST /repos/add`, indexed via `POST /reindex`
+- Each repo has a `Generation` counter that bumps on reindex
+- Handles stamped with `source: "service"`, `commit_sha`, and `generation`
+- Stale generation on expand returns 409 with structured error
+
+**CLI dirty overlay**: CLI detects local uncommitted changes and merges with service results.
+- `git status --porcelain=v2` detects dirty files
+- Local index rebuilt for dirty files only (fingerprint-cached)
+- Merge: local handles override service handles for overlapping ranges in dirty files
+
+**Shared contracts** on `Handle`:
+- `source: HandleSource` -- `Local` or `Service`
+- `commit_sha: Option<String>` -- git commit the index was built from
+- `generation: Option<u64>` -- generation counter for staleness detection
+
+### HTTP API
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/query` | POST | Query a repo (body: `{ repo, ...QueryParams }`) |
+| `/expand` | POST | Expand handles (body: `{ repo, handles: [{id, generation?}] }`) |
+| `/repos/add` | POST | Register a repo (body: `{ path, name? }`) |
+| `/repos` | GET | List registered repos |
+| `/status` | GET | Service health + shard states |
+| `/reindex` | POST | Trigger reindex (body: `{ repo, glob? }`) |
+
 ## Development
 
 ```bash
@@ -63,6 +105,15 @@ cargo run -p canopy-mcp -- --root /path/to/repo
 
 # Run CLI
 cargo run -p canopy-cli -- query --pattern "auth" --root /path/to/repo
+
+# Run service
+cargo run -p canopy-service -- --port 3000
+
+# CLI with service integration
+cargo run -p canopy-cli -- --service-url http://localhost:3000 query --pattern "auth"
+cargo run -p canopy-cli -- --mode service-only --service-url http://localhost:3000 query --symbol "Config"
+cargo run -p canopy-cli -- --service-url http://localhost:3000 repos
+cargo run -p canopy-cli -- --service-url http://localhost:3000 service-status
 ```
 
 ## Common Tasks
@@ -80,6 +131,13 @@ const KEYWORD_PATTERNS: &[(&[&str], &[&str])] = &[
     // Add new mappings here
 ];
 ```
+
+### Adding a service endpoint
+1. Add route handler in `canopy-service/src/routes.rs`
+2. Add request/response types in the same file
+3. Register route in `canopy-service/src/main.rs` router
+4. Add client method in `canopy-cli/src/client.rs`
+5. Add CLI subcommand in `canopy-cli/src/main.rs`
 
 ### Running benchmarks
 ```bash

@@ -36,7 +36,7 @@ canopy_query(pattern="auth")                                      # ERROR: missi
 | **Subsystem analysis** | 18% faster, 17% cheaper | Cross-file understanding benefits from index |
 | **Multi-file tracing** | 15% faster, 11% cheaper | Execution flow tracing uses indexed refs |
 | **Large codebases (>1000 files)** | No first-query blocking | Predictive lazy indexing indexes only relevant paths |
-| **Parallel agents on same repo** | Shared SQLite index | O(1) symbol lookups via in-memory cache |
+| **Parallel agents on same repo** | Shared service index | canopy-service provides shared indexing with generation tracking |
 
 ### Skip Canopy For:
 
@@ -82,6 +82,15 @@ Results auto-expand if they fit budget. For large results:
 ```
 canopy_expand(path="/path/to/repo", handle_ids=["h1a2b3c...", "h5d6e7f..."])
 ```
+
+### Service-backed queries (v3)
+```
+CANOPY_SERVICE_URL=http://localhost:3000 canopy_query(path="/path/to/repo", symbol="handleError")
+```
+When service is configured, canopy automatically:
+1. Detects dirty (uncommitted) files
+2. Queries both local and service indexes
+3. Merges results (local overrides service for dirty files)
 
 ## API Reference
 
@@ -133,6 +142,16 @@ canopy_invalidate(path="/path/to/repo", glob="*.rs")
 3. **Handle-Based Results**: Returns lightweight previews (~100 bytes) instead of full content. Expand only what you need.
 
 4. **Multi-Agent Friendly**: SQLite with WAL mode + mmap. Each agent gets its own cache, shares the persistent index.
+
+5. **Canopy Service (v3)**: Optional HTTP service for shared indexing across agents. Handles are stamped with `source`, `commit_sha`, and `generation` for staleness detection. CLI merges local dirty-file results with service results automatically.
+
+### Service Mode (v3)
+
+When `CANOPY_SERVICE_URL` is set, the CLI operates in hybrid mode:
+- **auto** (default): Queries both local and service, merges results
+- **service-only**: Only queries the service, skips local index
+
+Service handles include `source: "service"`, `commit_sha`, and `generation` for staleness detection. Expanding with a stale generation returns a clear error.
 
 ## Benchmark Results (n8n, 7,600 files)
 

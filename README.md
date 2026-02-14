@@ -215,6 +215,12 @@ canopy status
 
 # Expand handles to full content
 canopy expand <handle_id>
+
+# Service integration (v3)
+canopy-service --port 3000                              # Start service
+canopy --service-url http://localhost:3000 repos         # List repos
+canopy --service-url http://localhost:3000 reindex <id>  # Trigger reindex
+canopy --service-url http://localhost:3000 query --symbol "Config"  # Query via service
 ```
 
 ---
@@ -242,17 +248,45 @@ patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 
 ```
 ┌─────────────────┐
+│  canopy-service  │  HTTP service for multi-repo indexing (v3)
+├─────────────────┤
 │  canopy-mcp     │  MCP server for Claude Code
 ├─────────────────┤
-│  canopy-cli     │  Command-line interface
+│  canopy-cli     │  CLI with service integration + dirty overlay
 ├─────────────────┤
 │  canopy-core    │  Core indexing and query engine
 │  ├─ index.rs    │  SQLite FTS5 + symbol cache + mmap
 │  ├─ parse.rs    │  Tree-sitter parsing
 │  ├─ query.rs    │  Query DSL and execution
-│  └─ predict.rs  │  Predictive path selection
+│  ├─ handle.rs   │  HandleSource, generation tracking
+│  └─ generation  │  Generation, RepoShard, ShardStatus
 └─────────────────┘
 ```
+
+---
+
+## Service Mode (v3)
+
+Canopy v3 adds a shared HTTP service for multi-agent scenarios:
+
+```bash
+# Start the service
+cargo run -p canopy-service -- --port 3000
+
+# Register and index a repo
+curl -X POST localhost:3000/repos/add -H 'Content-Type: application/json' \
+  -d '{"path": "/path/to/repo", "name": "my-repo"}'
+curl -X POST localhost:3000/reindex -H 'Content-Type: application/json' \
+  -d '{"repo": "<repo-id>"}'
+
+# CLI auto-merges local + service results
+CANOPY_SERVICE_URL=http://localhost:3000 canopy query --symbol "Config"
+```
+
+Features:
+- **Generation tracking**: Each reindex bumps a generation counter; stale expands return 409
+- **Dirty overlay**: CLI detects uncommitted changes and merges local results with service
+- **Handle metadata**: Handles include `source` (local/service), `commit_sha`, `generation`
 
 ---
 

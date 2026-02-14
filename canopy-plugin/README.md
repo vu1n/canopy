@@ -107,7 +107,7 @@ O(1) symbol lookups via in-memory HashMap preloaded at index open. Falls back to
 Returns lightweight handles with previews (~100 bytes) instead of full content. Agents expand only what they need, reducing token usage.
 
 ### Multi-Agent Support
-SQLite with WAL mode + mmap. Each agent has its own cache, shares the persistent index.
+SQLite with WAL mode + mmap. Each agent has its own cache, shares the persistent index. With canopy-service (v3), multiple agents share a centralized index with generation-based staleness detection.
 
 ## API Reference
 
@@ -161,15 +161,21 @@ canopy-core (Rust)
   - Tree-sitter parsing (Rust, Python, JS, TS, Go)
   - Symbol cache (HashMap preloaded at open)
   - Predictive path selection
+  - HandleSource, generation tracking (v3)
+
+canopy-service (HTTP, v3)
+  - Shared multi-repo indexing
+  - Generation-based staleness detection
+  - 6 REST endpoints (query, expand, repos, reindex, status)
 
 canopy-mcp (MCP Server)
   - JSON-RPC 2.0 over stdio
   - Claude Code plugin integration
   - Keyword-to-glob prediction
 
-canopy-cli (Optional)
-  - Command-line interface
-  - Same functionality as MCP tools
+canopy-cli (CLI)
+  - Command-line interface with service integration
+  - Dirty file detection and local/service result merging
 ```
 
 ## CLI Usage
@@ -193,6 +199,18 @@ canopy status
 
 # Force reindex
 canopy invalidate
+```
+
+## Service Mode (v3)
+
+```bash
+# Start the service
+cargo run -p canopy-service -- --port 3000
+
+# CLI with service integration
+CANOPY_SERVICE_URL=http://localhost:3000 canopy query --symbol "Config"
+canopy --service-url http://localhost:3000 repos
+canopy --service-url http://localhost:3000 service-status
 ```
 
 ## Supported Languages

@@ -43,4 +43,14 @@ pub enum CanopyError {
 
     #[error("Schema version mismatch: database is v{found}, expected v{expected}. Run 'canopy invalidate' then 'canopy index' to reindex.")]
     SchemaVersionMismatch { found: i32, expected: i32 },
+
+    #[error("Stale generation: expected {expected}, found {found}")]
+    StaleGeneration { expected: u64, found: u64 },
+
+    #[error("Service error [{code}]: {message} — {hint}")]
+    ServiceError {
+        code: String,
+        message: String,
+        hint: String,
+    },
 }

@@ -276,7 +276,7 @@ impl QueryParams {
 }
 
 /// Query result with handles
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QueryResult {
     pub handles: Vec<Handle>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -285,7 +285,7 @@ pub struct QueryResult {
     pub truncated: bool,
     pub total_matches: usize,
     /// True if handles have content populated (auto-expanded)
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub auto_expanded: bool,
     /// Message when expand_budget is exceeded
     #[serde(skip_serializing_if = "Option::is_none")]
