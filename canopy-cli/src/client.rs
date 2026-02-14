@@ -80,16 +80,16 @@ impl ServiceClient {
             repo: repo.to_string(),
             params,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .map_err(|e| CanopyError::ServiceError {
-                code: "connection_error".to_string(),
-                message: e.to_string(),
-                hint: "Is canopy-service running?".to_string(),
-            })?;
+        let resp =
+            self.client
+                .post(&url)
+                .json(&req)
+                .send()
+                .map_err(|e| CanopyError::ServiceError {
+                    code: "connection_error".to_string(),
+                    message: e.to_string(),
+                    hint: "Is canopy-service running?".to_string(),
+                })?;
 
         if !resp.status().is_success() {
             return self.handle_error(resp);
@@ -120,28 +120,26 @@ impl ServiceClient {
                 })
                 .collect(),
         };
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .map_err(|e| CanopyError::ServiceError {
-                code: "connection_error".to_string(),
-                message: e.to_string(),
-                hint: "Is canopy-service running?".to_string(),
-            })?;
+        let resp =
+            self.client
+                .post(&url)
+                .json(&req)
+                .send()
+                .map_err(|e| CanopyError::ServiceError {
+                    code: "connection_error".to_string(),
+                    message: e.to_string(),
+                    hint: "Is canopy-service running?".to_string(),
+                })?;
 
         if !resp.status().is_success() {
             return self.handle_error(resp);
         }
 
-        let body: ExpandResponse =
-            resp.json()
-                .map_err(|e| CanopyError::ServiceError {
-                    code: "parse_error".to_string(),
-                    message: e.to_string(),
-                    hint: "Unexpected response from service".to_string(),
-                })?;
+        let body: ExpandResponse = resp.json().map_err(|e| CanopyError::ServiceError {
+            code: "parse_error".to_string(),
+            message: e.to_string(),
+            hint: "Unexpected response from service".to_string(),
+        })?;
 
         Ok(body
             .contents
@@ -206,16 +204,16 @@ impl ServiceClient {
             repo: repo.to_string(),
             glob,
         };
-        let resp = self
-            .client
-            .post(&url)
-            .json(&req)
-            .send()
-            .map_err(|e| CanopyError::ServiceError {
-                code: "connection_error".to_string(),
-                message: e.to_string(),
-                hint: "Is canopy-service running?".to_string(),
-            })?;
+        let resp =
+            self.client
+                .post(&url)
+                .json(&req)
+                .send()
+                .map_err(|e| CanopyError::ServiceError {
+                    code: "connection_error".to_string(),
+                    message: e.to_string(),
+                    hint: "Is canopy-service running?".to_string(),
+                })?;
 
         if !resp.status().is_success() {
             return self.handle_error(resp);

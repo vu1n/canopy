@@ -1,8 +1,8 @@
 //! Canopy CLI - Command-line interface for token-efficient codebase queries
 
-mod dirty;
 #[cfg(feature = "service")]
 mod client;
+mod dirty;
 mod merge;
 
 use clap::{Parser, Subcommand};
@@ -419,10 +419,7 @@ fn build_query_params(
 }
 
 /// Print query results in text or JSON format
-fn print_query_result(
-    result: &canopy_core::QueryResult,
-    json: bool,
-) -> canopy_core::Result<()> {
+fn print_query_result(result: &canopy_core::QueryResult, json: bool) -> canopy_core::Result<()> {
     use colored::Colorize;
 
     if json {

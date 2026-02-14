@@ -72,11 +72,7 @@ fn wait_for_service(base_url: &str, timeout: Duration) -> bool {
     let client = reqwest::blocking::Client::new();
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
-        if client
-            .get(&format!("{}/status", base_url))
-            .send()
-            .is_ok()
-        {
+        if client.get(&format!("{}/status", base_url)).send().is_ok() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));

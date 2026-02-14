@@ -297,8 +297,7 @@ mod tests {
 
     #[test]
     fn test_parse_renamed() {
-        let output =
-            "2 R. N... 100644 100644 100644 abc123 def456 R100 new_name.rs\0old_name.rs\0";
+        let output = "2 R. N... 100644 100644 100644 abc123 def456 R100 new_name.rs\0old_name.rs\0";
         let files = parse_porcelain_v2(output);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "new_name.rs");
@@ -316,8 +315,7 @@ mod tests {
 
     #[test]
     fn test_parse_unmerged() {
-        let output =
-            "u UU N... 100644 100644 100644 100644 abc123 def456 789abc src/conflict.rs\0";
+        let output = "u UU N... 100644 100644 100644 100644 abc123 def456 789abc src/conflict.rs\0";
         let files = parse_porcelain_v2(output);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, "src/conflict.rs");
