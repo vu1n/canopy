@@ -227,15 +227,18 @@ EOF
 
 DIVIDER
 
+    # Sum helper: reads lines of numbers, outputs their sum via awk
+    sum_lines() { awk '{s+=$1} END {print s+0}'; }
+
     # Calculate aggregates per mode
     for mode in baseline canopy; do
-      local total_tokens=$(jq -r "select(.mode==\"$mode\") | .total_tokens" "$OUTPUT_DIR/metrics.jsonl" | paste -sd+ | bc 2>/dev/null || echo "0")
-      local total_cost=$(jq -r "select(.mode==\"$mode\") | .cost" "$OUTPUT_DIR/metrics.jsonl" | paste -sd+ | bc 2>/dev/null || echo "0")
+      local total_tokens=$(jq -r "select(.mode==\"$mode\") | .total_tokens" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
+      local total_cost=$(jq -r "select(.mode==\"$mode\") | .cost" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
       local max_duration=$(jq -r "select(.mode==\"$mode\") | .duration_s" "$OUTPUT_DIR/metrics.jsonl" | sort -n | tail -1)
       local agent_count=$(jq -r "select(.mode==\"$mode\") | .agent" "$OUTPUT_DIR/metrics.jsonl" | wc -l | tr -d ' ')
       local avg_tokens=$((total_tokens / (agent_count > 0 ? agent_count : 1)))
-      local total_lines=$(jq -r "select(.mode==\"$mode\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" | paste -sd+ | bc 2>/dev/null || echo "0")
-      local compactions=$(jq -r "select(.mode==\"$mode\") | .compacted" "$OUTPUT_DIR/metrics.jsonl" | paste -sd+ | bc 2>/dev/null || echo "0")
+      local total_lines=$(jq -r "select(.mode==\"$mode\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
+      local compactions=$(jq -r "select(.mode==\"$mode\") | .compacted" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
 
       eval "${mode}_total_tokens=$total_tokens"
       eval "${mode}_total_cost=$total_cost"
