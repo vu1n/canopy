@@ -12,6 +12,7 @@ MAX_TURNS="${MAX_TURNS:-15}"
 DATE=$(date +%Y%m%d-%H%M%S)
 OUTPUT_DIR="${OUTPUT_DIR:-benchmark/results/swarm-$DATE}"
 SERVICE_PORT="${SERVICE_PORT:-3099}"
+INDEX_TIMEOUT="${INDEX_TIMEOUT:-600}"  # seconds to wait for indexing (default 10 min)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -124,8 +125,8 @@ register_and_index_repo() {
       return 1
     fi
     retries=$((retries + 1))
-    if [ $retries -gt 120 ]; then
-      echo " TIMEOUT"
+    if [ $retries -gt "$INDEX_TIMEOUT" ]; then
+      echo " TIMEOUT (${INDEX_TIMEOUT}s)"
       return 1
     fi
     echo -n "."

@@ -18,7 +18,7 @@ use std::time::Instant;
 
 const PROVENANCE_CAP: usize = 10_000;
 const RECENT_QUERY_EVENT_CAP: usize = 10_000;
-const ENSURE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const ENSURE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Indexing policy for standalone mode
