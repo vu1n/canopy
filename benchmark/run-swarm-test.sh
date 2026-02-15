@@ -203,12 +203,12 @@ run_agent() {
 
   mkdir -p "$mode_dir"
 
-  # For canopy modes, prepend instruction to use canopy MCP tools
+  # For canopy modes, add a short hint to use canopy for initial exploration
   local effective_task="$task"
   if [ "$mode" = "canopy" ] || [ "$mode" = "canopy-service" ]; then
-    effective_task="You have access to canopy MCP tools for exploring this codebase. You MUST use the canopy MCP tools (mcp__canopy__canopy_query, mcp__canopy__canopy_expand, mcp__canopy__canopy_status) instead of Read/Grep/Glob/Bash to explore code. Start by querying canopy with relevant patterns or symbols, then expand the handles you need. Do NOT use Read, Grep, Glob, or Bash to search the codebase.
+    effective_task="Use canopy tools to explore this codebase. Start with canopy_query to find relevant code, expand interesting handles with canopy_expand, then read specific files if needed for detail.
 
-Task: $task"
+$task"
   fi
 
   local cmd_args=(
