@@ -12,9 +12,9 @@ curl -fsSL https://raw.githubusercontent.com/vu1n/canopy/main/install.sh | sh
 
 This installs `canopy` + `canopy-mcp` to `~/.local/bin/` and configures Claude Code automatically.
 
-**Options:**
-- `--no-claude-setup` — skip Claude Code MCP configuration
-- `--prefix /usr/local` — install to a custom location
+Options:
+- `--no-claude-setup`: skip Claude Code MCP configuration.
+- `--prefix /usr/local`: install to a custom location.
 
 <details>
 <summary>Build from source</summary>
@@ -32,102 +32,77 @@ make setup-claude   # configures Claude Code
 
 Claude Code now has access to canopy tools. Ask questions like:
 
-- *"Find the AuthController class"* → Uses `canopy_query(symbol="AuthController")`
-- *"How does authentication work?"* → Uses `canopy_query(pattern="auth")` with predictive indexing
-- *"List all API endpoints"* → Uses `canopy_query(symbol="Controller")` and expands results
+- "Find the AuthController class" -> `canopy_query(symbol="AuthController")`
+- "How does authentication work?" -> `canopy_query(pattern="auth")`
+- "List all API endpoints" -> `canopy_query(symbol="Controller")` plus selective expands
 
-The agent automatically:
-1. Indexes relevant paths based on your query (predictive lazy indexing)
-2. Returns handles with previews instead of full files
-3. Expands only the handles it needs
+Typical agent flow:
+1. Index relevant paths based on query intent (predictive lazy indexing).
+2. Return compact handles + previews instead of full files.
+3. Expand only handles needed for the final answer.
 
 ---
 
 ## When to Use Canopy
 
-### Best For:
+### Best For
 
 | Scenario | Why |
 |----------|-----|
-| **Large codebases (>1000 files)** | Predictive lazy indexing - no blocking on first query |
-| **Symbol discovery** | Finds function/class definitions with file:line locations |
-| **Cross-file tracing** | Understands execution flows across multiple files |
-| **Subsystem analysis** | Indexes relevant paths for faster exploration |
-| **Parallel agents** | Shared SQLite index with per-agent symbol cache |
+| Large codebases (>1000 files) | Predictive indexing avoids blocking on full upfront index |
+| Symbol discovery | Finds function/class definitions with file:line anchors |
+| Cross-file tracing | Follows execution paths across files |
+| Subsystem analysis | Scopes indexing/query to relevant areas |
+| Parallel agents | Shared index behavior is better for concurrent exploration |
 
-### Skip Canopy For:
+### Skip Canopy For
 
 | Scenario | Use Instead |
 |----------|-------------|
 | Known file path | `Read` tool directly |
 | Literal text pattern | `Grep` tool |
 | File by name | `Glob` / `fd` |
-| Small repos (<500 files) | Native tools are fast enough |
-
-### Decision Tree
-
-```
-Is repo >1000 files?
-  └─ Yes → Use canopy (predictive indexing prevents blocking)
-  └─ No → Do you need symbol search or cross-file tracing?
-            └─ Yes → Use canopy
-            └─ No → Use Grep/Glob/Read
-```
+| Small repos (<500 files) | Native tools are usually enough |
 
 ---
 
-## Performance & Methodology
+## How Canopy Works
 
-We are not publishing definitive benchmark numbers yet. This section documents the optimization methods and how we measure them.
+Canopy treats repository understanding as a budgeted retrieval loop: broad cheap retrieval first, then selective expansion under explicit token and turn constraints.
 
 ### Token-Efficiency Methods
 
-1. **Handle-first retrieval**
-   `canopy_query` returns compact handles and previews first; full content is fetched only via `canopy_expand`.
-2. **Predictive lazy indexing**
-   Query intent predicts likely globs so indexing is targeted before search, instead of indexing the entire repo up front.
-3. **Feedback-reranked retrieval**
-   Query/expand feedback is stored in `.canopy/feedback.db` and reused for reranking:
+1. Handle-first retrieval
+   `canopy_query` returns compact handles and previews first; full content is fetched with `canopy_expand`.
+2. Predictive lazy indexing
+   Query intent predicts likely globs so indexing is targeted before search.
+3. Feedback-reranked retrieval
+   Query/expand feedback in `.canopy/feedback.db` reranks future retrieval:
    - glob ranking (`glob_hit_rate_at_k`)
-   - node-type priors (`handle_expand_accept_rate`-driven)
-4. **Retrieve -> Local overlay -> Merge execution loop**
-   In service mode, results are retrieved from service, then merged with dirty local changes to keep answers fresh without full reindex.
-5. **Worst-case budget policy**
-   The system is tuned to reduce worst-case token blowups, not just average-case wins:
-   - bounded expansion (`expand_budget`)
-   - bounded result set (`limit`)
-   - explicit tracking of compaction pressure (`max_turns` in swarm tests)
+   - node-type priors (`handle_expand_accept_rate`)
+4. Retrieve -> local overlay -> merge (service mode)
+   Service results are merged with local dirty-file overlays to keep answers fresh without full reindex.
+5. Worst-case budget policy
+   Retrieval is constrained by `expand_budget`, `limit`, and turn budget (`MAX_TURNS` in swarm tests).
 
-### Theory: Budgeted Retrieval as a Control Loop
-
-Canopy treats code understanding as a budgeted sequential retrieval problem:
-
-1. Start with a broad but cheap probe (`canopy_query`) to get compact evidence (handles + previews).
-2. Rank candidate handles by expected usefulness per token.
-3. Expand only the top candidates while budget remains.
-4. Re-evaluate uncertainty; either iterate or stop.
+### Theory: Budgeted Retrieval Control Loop
 
 Informal objective:
-- maximize answer utility (grounding, completeness, correctness)
+- maximize answer utility (grounding, coverage, correctness)
 - minimize token cost and tail-risk of runaway context growth
 
-In practice, this means:
-- **coarse-to-fine retrieval** instead of full-file ingestion
-- **budget-aware stopping** when marginal utility drops
-- **feedback-driven ranking** from observed expand behavior
+Mental model for ranking:
 
-One useful mental model for handle ranking is:
-
-```
+```text
 score(handle) =
   w_text * lexical_relevance +
   w_type * node_type_prior +
   w_feedback * historical_expand_acceptance
 ```
 
-where the ranker prefers higher expected utility per token, not just raw relevance.
+The ranker optimizes expected utility per token, not just raw relevance.
 
-### Retrieval/Ranking Diagram
+### Diagram: Retrieval and Ranking Loop
 
 ```text
 User Question
@@ -149,8 +124,8 @@ Budget Gate
   - expand top-k within budget
   - keep strict limit / expand_budget
     |
-    +--> unresolved + budget left? ---- yes ----> re-query / re-rank / expand
-    |                                           (iterate)
+    +--> unresolved + budget left? -- yes --> re-query / re-rank / expand
+    |                                       (iterate)
     |
     no
     |
@@ -159,41 +134,41 @@ Synthesize Answer
   (grounded in expanded evidence)
 ```
 
-### Service Mode Merge Diagram
+### Diagram: Service Mode Merge Loop
 
 ```text
-                     +------------------------------+
-                     |        canopy-service        |
-                     |  pre-indexed repo snapshots  |
-                     +---------------+--------------+
-                                     |
-                                     v
+                    +------------------------------+
+                    |        canopy-service        |
+                    |  pre-indexed repo snapshots  |
+                    +---------------+--------------+
+                                    |
+                                    v
 User Question -> canopy-mcp -> Service Query/Expand (generation-tagged handles)
-                                     |
-                                     v
-                           Service Candidate Set
-                                     |
-                                     v
-                    Dirty-File Detector (local working tree)
-                                     |
-                     +---------------+---------------+
-                     |                               |
-               clean |                               | dirty
-                     v                               v
-               use service                    local incremental index
-                result as-is                  on dirty subset only
-                     |                               |
-                     +---------------+---------------+
-                                     |
-                                     v
-                       Local/Service Result Merge
-                       (dedupe + freshness preference)
-                                     |
-                                     v
-                           Grounded Final Answer
+                                    |
+                                    v
+                          Service Candidate Set
+                                    |
+                                    v
+                   Dirty-File Detector (local working tree)
+                                    |
+                    +---------------+---------------+
+                    |                               |
+              clean |                               | dirty
+                    v                               v
+            use service result               local incremental index
+               directly                      on dirty subset only
+                    |                               |
+                    +---------------+---------------+
+                                    |
+                                    v
+                      Local/Service Result Merge
+                      (dedupe + freshness preference)
+                                    |
+                                    v
+                          Grounded Final Answer
 ```
 
-### Feedback Learning Loop Diagram
+### Diagram: Feedback Learning Loop
 
 ```text
 Query Issued
@@ -223,53 +198,10 @@ Apply priors during future ranking
 Better next-query ordering under same token budget
 ```
 
-### What We Get From These Methods
-
-1. **Lower context bloat by default**
-   The default path is query -> shortlist -> selective expand, not bulk file reads.
-2. **Better worst-case stability**
-   Budget caps and compaction-aware evaluation make runaway contexts easier to detect and control.
-3. **Better grounding signals**
-   Feedback loops and strict quality checks favor answers with concrete file references and structure.
-
-Use `canopy feedback-stats` to inspect local feedback metrics.
-
----
-
-## How It Works
-
-### Predictive Lazy Indexing
-
-For large repos, canopy predicts which paths are relevant based on query keywords:
-
-```
-Query: "How does authentication work?"
-         │
-         ▼
-┌─────────────────────────────┐
-│  Extract keywords           │  → "auth", "authentication"
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│  Match to glob patterns     │  → "**/auth/**", "**/login/**"
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│  Index matched paths        │  → ~100-500 files (seconds, not minutes)
-└─────────────────────────────┘
-         │
-         ▼
-┌─────────────────────────────┐
-│  Execute query              │  → Token-efficient results
-└─────────────────────────────┘
-```
-
-### Token Economy
+### Token Economy (Illustrative)
 
 Traditional approach:
-``` 
+```text
 Agent reads file1.ts (500 tokens)
 Agent reads file2.ts (800 tokens)
 Agent reads file3.ts (600 tokens)
@@ -277,11 +209,13 @@ Total: 1900 tokens
 ```
 
 Canopy approach:
-```
-Agent queries "auth" → 10 handles with previews (200 tokens)
+```text
+Agent queries "auth" -> 10 handles with previews (200 tokens)
 Agent expands 2 relevant handles (400 tokens)
-Total: 600 tokens (illustrative example)
+Total: 600 tokens
 ```
+
+Use `canopy feedback-stats` to inspect local retrieval feedback metrics.
 
 ---
 
@@ -289,10 +223,10 @@ Total: 600 tokens (illustrative example)
 
 Once configured, Claude Code has these tools:
 
-### canopy_query
+### `canopy_query`
 Search indexed content. Returns handles with previews and token counts.
 
-```
+```text
 canopy_query(pattern="authentication")
 canopy_query(symbol="AuthController", glob="src/**/*.ts")
 canopy_query(patterns=["TODO", "FIXME"], match="any")
@@ -305,28 +239,29 @@ canopy_query(patterns=["TODO", "FIXME"], match="any")
 | `symbol` | string | Code symbol (function, class, struct, method) |
 | `section` | string | Markdown section heading |
 | `glob` | string | Filter by file glob |
-| `match` | "any" \| "all" | Multi-pattern mode (default: "any") |
+| `match` | `any` \| `all` | Multi-pattern mode |
 | `limit` | integer | Max results (default: 100) |
-| `expand_budget` | integer | Auto-expand if tokens fit (default: 5000) |
+| `expand_budget` | integer | Auto-expand if within budget (default: 5000) |
 
-### canopy_expand
+### `canopy_expand`
 Expand handles to full content.
 
-```
+```text
 canopy_expand(handle_ids=["h1a2b3c...", "h5d6e7f..."])
 ```
 
-### canopy_status
+### `canopy_status`
 Get index statistics.
 
-### canopy_invalidate
+### `canopy_invalidate`
 Force reindex of files.
+
+### `canopy_agent_readme`
+Return usage guidance for agents/tool callers.
 
 ---
 
 ## CLI Usage
-
-The CLI is also available for manual use:
 
 ```bash
 # Initialize canopy in a repository
@@ -339,18 +274,55 @@ canopy index
 canopy query --pattern "authentication"
 canopy query --symbol "AuthController"
 
-# Check index status
-canopy status
-
 # Expand handles to full content
 canopy expand <handle_id>
 
-# Service integration (v3)
-canopy-service --port 3000                              # Start service
-canopy --service-url http://localhost:3000 repos         # List repos
-canopy --service-url http://localhost:3000 reindex <id>  # Trigger reindex
-canopy --service-url http://localhost:3000 query --symbol "Config"  # Query via service
+# Check index status
+canopy status
+
+# Local feedback metrics
+canopy feedback-stats
 ```
+
+---
+
+## Operating Modes
+
+Canopy supports two modes through the shared `canopy-client` runtime.
+
+### Standalone Mode
+
+Default when no service URL is configured.
+
+```bash
+canopy query --pattern "auth"
+```
+
+Best for: solo developers, small/medium repos, quick setup.
+
+### Service Mode
+
+For multi-agent and team workflows with shared indexing.
+
+```bash
+# Install and start service
+curl -fsSL https://raw.githubusercontent.com/vu1n/canopy/main/install-service.sh | sh
+canopy-service --port 3000
+
+# Register and reindex repo
+curl -X POST localhost:3000/repos/add -H 'Content-Type: application/json' \
+  -d '{"path": "/path/to/repo", "name": "my-repo"}'
+curl -X POST localhost:3000/reindex -H 'Content-Type: application/json' \
+  -d '{"repo": "<repo-id>"}'
+
+# Query via service
+CANOPY_SERVICE_URL=http://localhost:3000 canopy query --symbol "Config"
+```
+
+Service mode features:
+- Generation tracking for stale-handle safety.
+- Dirty-file local overlay merge for freshness.
+- Handle metadata (`source`, `commit_sha`, `generation`).
 
 ---
 
@@ -375,148 +347,42 @@ patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 
 ## Architecture
 
+```text
++-----------------+
+| canopy-service  |  HTTP service for multi-repo indexing
++-----------------+
+| canopy-mcp      |  MCP server for Claude Code
+| canopy-cli      |  Command-line interface
++-----------------+
+| canopy-client   |  Shared runtime (service client, dirty overlay, merge, predict)
++-----------------+
+| canopy-core     |  Indexing and query engine
+|  - index.rs     |  SQLite FTS5 + symbol cache + mmap
+|  - parse.rs     |  Tree-sitter parsing
+|  - query.rs     |  Query DSL and execution
+|  - handle.rs    |  HandleSource + generation metadata
++-----------------+
 ```
-┌─────────────────┐
-│  canopy-service  │  HTTP service for multi-repo indexing
-├─────────────────┤
-│  canopy-mcp     │  MCP server for Claude Code
-│  canopy-cli     │  Command-line interface
-├─────────────────┤
-│  canopy-client  │  Shared runtime (service client, dirty overlay, merge, predict)
-├─────────────────┤
-│  canopy-core    │  Core indexing and query engine
-│  ├─ index.rs    │  SQLite FTS5 + symbol cache + mmap
-│  ├─ parse.rs    │  Tree-sitter parsing
-│  ├─ query.rs    │  Query DSL and execution
-│  ├─ handle.rs   │  HandleSource, generation tracking
-│  └─ generation  │  Generation, RepoShard, ShardStatus
-└─────────────────┘
-```
-
----
-
-## Operating Modes
-
-Canopy supports two operating modes:
-
-### Standalone Mode (solo dev)
-
-Default when no service URL is configured. Local index with predictive indexing for large repos.
-
-```bash
-# CLI
-canopy query --pattern "auth"
-
-# MCP (automatic — no config needed)
-```
-
-Best for: solo developers, small-medium repos, quick setup.
-
-### Service Mode (teams/swarms)
-
-Shared pre-indexed service for multi-agent scenarios. Set `CANOPY_SERVICE_URL` to enable.
-
-```bash
-# Start the service
-canopy-service --port 3000
-
-# CLI with service
-CANOPY_SERVICE_URL=http://localhost:3000 canopy query --symbol "Config"
-
-# MCP with service (set env in MCP config)
-# The MCP server reads CANOPY_SERVICE_URL from its environment
-```
-
-Best for: teams, CI, multi-agent swarms, large repos where upfront indexing pays off.
-
-The `canopy-client` crate provides a `ClientRuntime` that handles both modes transparently — CLI and MCP stay in sync without duplicating mode-switching logic.
-
----
-
-## Service Mode (v3)
-
-Canopy v3 adds a shared HTTP service for multi-agent scenarios:
-
-```bash
-# Install the service
-curl -fsSL https://raw.githubusercontent.com/vu1n/canopy/main/install-service.sh | sh
-
-# Start the service
-canopy-service --port 3000
-
-# Register and index a repo
-curl -X POST localhost:3000/repos/add -H 'Content-Type: application/json' \
-  -d '{"path": "/path/to/repo", "name": "my-repo"}'
-curl -X POST localhost:3000/reindex -H 'Content-Type: application/json' \
-  -d '{"repo": "<repo-id>"}'
-
-# CLI auto-merges local + service results
-CANOPY_SERVICE_URL=http://localhost:3000 canopy query --symbol "Config"
-```
-
-Features:
-- **Generation tracking**: Each reindex bumps a generation counter; stale expands return 409
-- **Dirty overlay**: CLI detects uncommitted changes and merges local results with service
-- **Handle metadata**: Handles include `source` (local/service), `commit_sha`, `generation`
 
 ---
 
 ## Benchmarking
 
-No canonical benchmark claims are published yet. The scripts below are for reproducible local evaluation.
+No canonical benchmark claims are published yet.
 
-### Swarm Benchmark (multi-agent)
-
-Simulates N concurrent agents exploring a codebase — measures token economy, speed, and quality across parallel workloads.
+For local evaluation:
 
 ```bash
-# Run with defaults (5 agents, both baseline + canopy)
-./benchmark/run-swarm-test.sh /path/to/repo
-
-# Customize via env vars
-AGENTS=3 MODE=canopy MAX_TURNS=15 ./benchmark/run-swarm-test.sh /path/to/repo
-
-# Baseline only
-AGENTS=5 MODE=baseline ./benchmark/run-swarm-test.sh /path/to/repo
-
-# Explicit mode comparison
+# Multi-agent comparison
 MODE=compare COMPARE_MODES="baseline canopy canopy-service" \
 AGENTS=4 MAX_TURNS=5 INDEX_TIMEOUT=1200 \
 ./benchmark/run-swarm-test.sh /path/to/repo
-```
 
-Each agent gets a different task (round-robin) to simulate real multi-agent workloads. Results include per-agent metrics and an aggregate comparison table in `benchmark/results/swarm-{date}/summary.md`.
-
-### Measurement Protocol (Methods, Not Claims)
-
-1. **Keep setup controlled**
-   Same repo, same model, same tasks, same `MAX_TURNS`, same agent count across modes.
-2. **Compare three modes**
-   - `baseline`: no canopy MCP
-   - `canopy`: local canopy MCP
-   - `canopy-service`: canopy MCP backed by `canopy-service`
-3. **Track both token views**
-   - **Reported tokens**: `input + cache_create + output`
-   - **Effective tokens**: `reported + cache_read`
-4. **Track worst-case behavior**
-   - max agent time
-   - compactions (`num_turns >= MAX_TURNS`)
-5. **Track answer quality and grounding heuristics**
-   - success rate (non-empty, not compacted)
-   - grounded outputs (file-path references)
-   - structured outputs (headings + bullets/fences)
-6. **Verify retrieval path usage**
-   - local feedback events: `query_events`, `expand_events`
-   - service metrics: `/query` and `/expand` call counts
-   - if service query/expand are `0`, the run did not exercise service retrieval
-
-### Single-Agent A/B Test
-
-```bash
+# Single-agent A/B
 ./benchmark/run-ab-test.sh /path/to/repo
 ```
 
-Results are saved to `benchmark/results/`.
+Detailed protocol, metric definitions, and troubleshooting live in `docs/benchmarking.md`.
 
 ---
 
