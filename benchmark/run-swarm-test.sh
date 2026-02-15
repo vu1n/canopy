@@ -203,13 +203,16 @@ run_agent() {
 
   mkdir -p "$mode_dir"
 
-  # For canopy modes, add a short hint to use canopy for initial exploration
-  local effective_task="$task"
+  # Build effective prompt: canopy hint (if applicable) + task + output format
+  local effective_task=""
   if [ "$mode" = "canopy" ] || [ "$mode" = "canopy-service" ]; then
     effective_task="Use canopy tools to explore this codebase. Start with canopy_query to find relevant code, expand interesting handles with canopy_expand, then read specific files if needed for detail.
 
-$task"
+"
   fi
+  effective_task+="$task
+
+Respond with a structured analysis: use headings, reference specific file paths, include code snippets where relevant, and explain the architecture."
 
   local cmd_args=(
     claude
