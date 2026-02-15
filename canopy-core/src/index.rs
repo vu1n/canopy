@@ -839,25 +839,62 @@ impl RepoIndex {
 
     /// Expand handles to full content
     pub fn expand(&self, handle_ids: &[String]) -> crate::Result<Vec<(String, String)>> {
+        let expanded = self.expand_with_details(handle_ids)?;
+        Ok(expanded
+            .into_iter()
+            .map(|(handle_id, _file_path, _node_type, _token_count, content)| (handle_id, content))
+            .collect())
+    }
+
+    /// Expand handles to full content, including file path for analytics.
+    pub fn expand_with_paths(
+        &self,
+        handle_ids: &[String],
+    ) -> crate::Result<Vec<(String, String, String)>> {
+        let expanded = self.expand_with_details(handle_ids)?;
+        Ok(expanded
+            .into_iter()
+            .map(
+                |(handle_id, file_path, _node_type, _token_count, content)| {
+                    (handle_id, file_path, content)
+                },
+            )
+            .collect())
+    }
+
+    /// Expand handles to full content with metadata for feedback/analytics.
+    pub fn expand_with_details(
+        &self,
+        handle_ids: &[String],
+    ) -> crate::Result<Vec<(String, String, NodeType, usize, String)>> {
         let mut results = Vec::new();
 
         for handle_id_str in handle_ids {
             let handle_id: HandleId = handle_id_str.parse()?;
 
             // Get node info
-            let row: Option<(String, i64, i64, Vec<u8>)> = self
+            let row: Option<(String, i64, i64, i64, i64, Vec<u8>)> = self
                 .conn
                 .query_row(
-                    "SELECT f.path, n.start_byte, n.end_byte, f.content_hash
+                    "SELECT f.path, n.start_byte, n.end_byte, n.node_type, n.token_count, f.content_hash
                      FROM nodes n
                      JOIN files f ON n.file_id = f.id
                      WHERE n.handle_id = ?",
                     params![handle_id.raw()],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
                 )
                 .optional()?;
 
-            let Some((path, start, end, db_hash)) = row else {
+            let Some((path, start, end, node_type_int, token_count, db_hash)) = row else {
                 return Err(CanopyError::HandleNotFound(handle_id.to_string()));
             };
 
@@ -877,8 +914,15 @@ impl RepoIndex {
             let start = start as usize;
             let end = (end as usize).min(source.len());
             let content = source[start..end].to_string();
+            let node_type = NodeType::from_int(node_type_int as u8).unwrap_or(NodeType::Chunk);
 
-            results.push((handle_id.to_string(), content));
+            results.push((
+                handle_id.to_string(),
+                path,
+                node_type,
+                token_count as usize,
+                content,
+            ));
         }
 
         Ok(results)

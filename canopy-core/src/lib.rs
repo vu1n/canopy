@@ -6,11 +6,13 @@
 pub mod config;
 pub mod document;
 pub mod error;
+pub mod feedback;
 pub mod generation;
 pub mod handle;
 pub mod index;
 pub mod parse;
 pub mod query;
+pub mod scoring;
 
 pub use config::Config;
 pub use document::{DocumentNode, NodeMetadata, NodeType, ParsedFile, RefType, Reference, Span};

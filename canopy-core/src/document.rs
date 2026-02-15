@@ -7,7 +7,7 @@ use std::path::PathBuf;
 pub type Span = Range<usize>;
 
 /// Node type enum (stored as integer in DB)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum NodeType {
     Section = 0,

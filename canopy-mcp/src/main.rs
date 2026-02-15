@@ -2,6 +2,7 @@
 
 use canopy_client::predict::extract_query_text;
 use canopy_client::{ClientRuntime, IndexResult, QueryInput, StandalonePolicy};
+use canopy_core::feedback::FeedbackStore;
 use canopy_core::{MatchMode, QueryKind, QueryParams, RepoIndex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -343,7 +344,7 @@ impl McpServer {
             let query_text = extract_query_text(args);
             let mut index = self.open_index_at(&repo_root)?;
             self.runtime
-                .predictive_index_for_query(&mut index, &query_text)
+                .predictive_index_for_query(&repo_root, &mut index, &query_text)
                 .map_err(|e| (-32000, e.to_string()))?;
         }
 
@@ -422,6 +423,19 @@ impl McpServer {
                 "file_discovery".to_string(),
                 json!(canopy_core::FileDiscovery::detect().name()),
             );
+            if let Ok(feedback_store) = FeedbackStore::open(&repo_root) {
+                if let Ok(metrics) = feedback_store.compute_metrics(7.0) {
+                    obj.insert(
+                        "feedback".to_string(),
+                        json!({
+                            "glob_hit_rate_at_k": metrics.glob_hit_rate_at_k,
+                            "handle_expand_accept_rate": metrics.handle_expand_accept_rate,
+                            "avg_tokens_per_expand": metrics.avg_tokens_per_expand,
+                            "sample_count": metrics.sample_count,
+                        }),
+                    );
+                }
+            }
         }
 
         Ok(json!({
@@ -489,6 +503,7 @@ fn build_query_input(args: &Value) -> Result<QueryInput, (i32, String)> {
             canopy_core::QueryOptions {
                 limit,
                 expand_budget: None,
+                node_type_priors: None,
             },
         ));
     }

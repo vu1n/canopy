@@ -2,8 +2,13 @@ use crate::error::AppError;
 use crate::state::SharedState;
 use axum::extract::State;
 use axum::Json;
-use canopy_core::{Generation, HandleSource, QueryParams, RepoIndex, RepoShard, ShardStatus};
+use canopy_core::feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle};
+use canopy_core::{
+    query::execute_query_with_options, Generation, HandleSource, QueryParams, QueryResult,
+    RepoIndex, RepoShard, ShardStatus,
+};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -26,6 +31,110 @@ fn timestamp() -> String {
         mins,
         s
     )
+}
+
+fn query_params_text(params: &QueryParams) -> String {
+    let mut parts = Vec::new();
+    if let Some(s) = &params.pattern {
+        parts.push(s.clone());
+    }
+    if let Some(ss) = &params.patterns {
+        parts.extend(ss.clone());
+    }
+    if let Some(s) = &params.symbol {
+        parts.push(s.clone());
+    }
+    if let Some(s) = &params.section {
+        parts.push(s.clone());
+    }
+    if let Some(s) = &params.parent {
+        parts.push(s.clone());
+    }
+    if let Some(s) = &params.glob {
+        parts.push(s.clone());
+    }
+    parts.join(" ")
+}
+
+fn try_record_feedback_query(
+    feedback_store: Option<&std::sync::Arc<std::sync::Mutex<FeedbackStore>>>,
+    params: &QueryParams,
+    result: &QueryResult,
+) -> Option<i64> {
+    let Some(feedback_store) = feedback_store else {
+        return None;
+    };
+    let Ok(store) = feedback_store.lock() else {
+        eprintln!("[canopy-service] feedback lock poisoned while recording query");
+        return None;
+    };
+
+    let event = QueryEvent {
+        query_text: query_params_text(params),
+        predicted_globs: None,
+        files_indexed: 0,
+        handles_returned: result.handles.len(),
+        total_tokens: result.total_tokens,
+    };
+
+    let Ok(query_event_id) = store.record_query_event(&event) else {
+        return None;
+    };
+
+    let handles: Vec<QueryHandle> = result
+        .handles
+        .iter()
+        .map(|handle| QueryHandle {
+            handle_id: handle.id.to_string(),
+            file_path: handle.file_path.clone(),
+            node_type: handle.node_type,
+            token_count: handle.token_count,
+            first_match_glob: None,
+        })
+        .collect();
+    let _ = store.record_query_handles(query_event_id, &handles);
+
+    for handle in result.handles.iter().filter(|h| h.content.is_some()) {
+        let _ = store.record_expand_event(&ExpandEvent {
+            query_event_id: Some(query_event_id),
+            handle_id: handle.id.to_string(),
+            file_path: handle.file_path.clone(),
+            node_type: handle.node_type,
+            token_count: handle.token_count,
+            auto_expanded: true,
+        });
+    }
+
+    Some(query_event_id)
+}
+
+fn try_record_feedback_expand(
+    feedback_store: Option<&std::sync::Arc<std::sync::Mutex<FeedbackStore>>>,
+    rows: &[(String, String, canopy_core::NodeType, usize, String)],
+    recent_query_event_ids: &HashMap<String, i64>,
+) -> bool {
+    let Some(feedback_store) = feedback_store else {
+        return false;
+    };
+    let Ok(store) = feedback_store.lock() else {
+        eprintln!("[canopy-service] feedback lock poisoned while recording expand");
+        return false;
+    };
+
+    let mut wrote_any = false;
+    for (handle_id, file_path, node_type, token_count, _content) in rows {
+        let _ = store.record_expand_event(&ExpandEvent {
+            query_event_id: recent_query_event_ids.get(handle_id).copied(),
+            handle_id: handle_id.clone(),
+            file_path: file_path.clone(),
+            node_type: *node_type,
+            token_count: *token_count,
+            auto_expanded: false,
+        });
+        wrote_any = true;
+    }
+
+    wrote_any
 }
 
 // POST /query
@@ -60,7 +169,10 @@ pub async fn query(
     drop(shards);
 
     let params = req.params;
+    let params_for_feedback = params.clone();
     let cache_key = serde_json::to_string(&params).map_err(AppError::internal)?;
+    let feedback_store = state.feedback_store_for_repo(&repo_id, &repo_root).await;
+    let node_type_priors = state.load_node_type_priors(&repo_id, &repo_root).await;
 
     // Track analytics
     if let Ok(mut analytics) = state.metrics.analytics.lock() {
@@ -82,6 +194,15 @@ pub async fn query(
         .get_cached_query(&repo_id, &cache_key, generation)
         .await
     {
+        if let Some(query_event_id) =
+            try_record_feedback_query(feedback_store.as_ref(), &params, &result)
+        {
+            let handle_ids: Vec<String> = result.handles.iter().map(|h| h.id.to_string()).collect();
+            state
+                .remember_query_event_for_handles(&repo_id, &handle_ids, query_event_id)
+                .await;
+            state.invalidate_node_type_priors_cache(&repo_id).await;
+        }
         state
             .metrics
             .query_cache_hits
@@ -117,7 +238,12 @@ pub async fn query(
                 "Index mutex poisoned: {err}"
             )))
         })?;
-        let mut result = index.query_params(params)?;
+        let query = params.to_query()?;
+        let mut options = params.to_options();
+        if options.node_type_priors.is_none() {
+            options.node_type_priors = node_type_priors;
+        }
+        let mut result = execute_query_with_options(&query, &index, options)?;
         // Stamp handles with service metadata
         for handle in &mut result.handles {
             handle.source = HandleSource::Service;
@@ -133,6 +259,15 @@ pub async fn query(
         state
             .insert_cached_query(&repo_id, cache_key, result.clone(), generation)
             .await;
+    }
+    if let Some(query_event_id) =
+        try_record_feedback_query(feedback_store.as_ref(), &params_for_feedback, &result)
+    {
+        let handle_ids: Vec<String> = result.handles.iter().map(|h| h.id.to_string()).collect();
+        state
+            .remember_query_event_for_handles(&repo_id, &handle_ids, query_event_id)
+            .await;
+        state.invalidate_node_type_priors_cache(&repo_id).await;
     }
 
     let duration_ms = start.elapsed().as_millis();
@@ -205,6 +340,7 @@ pub async fn expand(
         }
     }
     drop(shards);
+    let feedback_store = state.feedback_store_for_repo(&repo_id, &repo_root).await;
 
     state.metrics.expand_count.fetch_add(1, Ordering::Relaxed);
 
@@ -222,29 +358,39 @@ pub async fn expand(
         .await
         .map_err(AppError::from)?;
 
-    let contents = tokio::task::spawn_blocking(move || {
+    let expanded_details = tokio::task::spawn_blocking(move || {
         let index = cached_index.index.lock().map_err(|err| {
             canopy_core::CanopyError::Io(std::io::Error::other(format!(
                 "Index mutex poisoned: {err}"
             )))
         })?;
-        index.expand(&handle_ids)
+        index.expand_with_details(&handle_ids)
     })
     .await
     .map_err(AppError::internal)??;
 
     // Track expanded file paths
     if let Ok(mut analytics) = state.metrics.analytics.lock() {
-        for (id, _) in &contents {
-            // handle id format: h<hash>:<file_path>:<start>-<end>
-            // extract file path from handle id if possible
-            if let Some(path) = id.split(':').nth(1) {
-                *analytics
-                    .top_expanded_files
-                    .entry(path.to_string())
-                    .or_insert(0) += 1;
-            }
+        for (_id, path, _node_type, _token_count, _content) in &expanded_details {
+            *analytics
+                .top_expanded_files
+                .entry(path.clone())
+                .or_insert(0) += 1;
         }
+    }
+    let expanded_ids: Vec<String> = expanded_details
+        .iter()
+        .map(|(id, _path, _node_type, _token_count, _content)| id.clone())
+        .collect();
+    let recent_query_event_ids = state
+        .recent_query_events_for_handles(&repo_id, &expanded_ids)
+        .await;
+    if try_record_feedback_expand(
+        feedback_store.as_ref(),
+        &expanded_details,
+        &recent_query_event_ids,
+    ) {
+        state.invalidate_node_type_priors_cache(&repo_id).await;
     }
 
     let duration_ms = start.elapsed().as_millis();
@@ -261,12 +407,14 @@ pub async fn expand(
     );
 
     Ok(Json(ExpandResponse {
-        contents: contents
+        contents: expanded_details
             .into_iter()
-            .map(|(id, content)| ExpandedContent {
-                handle_id: id,
-                content,
-            })
+            .map(
+                |(id, _path, _node_type, _token_count, content)| ExpandedContent {
+                    handle_id: id,
+                    content,
+                },
+            )
             .collect(),
     }))
 }
@@ -545,6 +693,15 @@ pub struct AnalyticsMetrics {
     pub top_patterns: Vec<PatternCount>,
     pub top_expanded_files: Vec<PathCount>,
     pub queries_by_repo: std::collections::HashMap<String, u64>,
+    pub feedback_by_repo: std::collections::HashMap<String, FeedbackSummary>,
+}
+
+#[derive(Serialize, Clone)]
+pub struct FeedbackSummary {
+    pub glob_hit_rate_at_k: f64,
+    pub handle_expand_accept_rate: f64,
+    pub avg_tokens_per_expand: f64,
+    pub sample_count: usize,
 }
 
 fn top_n_sorted(map: &std::collections::HashMap<String, u64>, n: usize) -> Vec<(String, u64)> {
@@ -583,6 +740,33 @@ pub async fn metrics(State(state): State<SharedState>) -> Json<MetricsResponse> 
         0
     };
 
+    let feedback_by_repo = {
+        let shards = state.shards.read().await;
+        let mut out = std::collections::HashMap::new();
+        for shard in shards.values() {
+            if let Some(store) = state
+                .feedback_store_for_repo(&shard.repo_id, &shard.repo_root)
+                .await
+            {
+                let Ok(store_guard) = store.lock() else {
+                    continue;
+                };
+                if let Ok(m) = store_guard.compute_metrics(7.0) {
+                    out.insert(
+                        shard.repo_id.clone(),
+                        FeedbackSummary {
+                            glob_hit_rate_at_k: m.glob_hit_rate_at_k,
+                            handle_expand_accept_rate: m.handle_expand_accept_rate,
+                            avg_tokens_per_expand: m.avg_tokens_per_expand,
+                            sample_count: m.sample_count,
+                        },
+                    );
+                }
+            }
+        }
+        out
+    };
+
     let analytics = if let Ok(a) = state.metrics.analytics.lock() {
         AnalyticsMetrics {
             top_symbols: top_n_sorted(&a.top_symbols, TOP_N)
@@ -598,6 +782,7 @@ pub async fn metrics(State(state): State<SharedState>) -> Json<MetricsResponse> 
                 .map(|(path, count)| PathCount { path, count })
                 .collect(),
             queries_by_repo: a.queries_by_repo.clone(),
+            feedback_by_repo: feedback_by_repo.clone(),
         }
     } else {
         AnalyticsMetrics {
@@ -605,6 +790,7 @@ pub async fn metrics(State(state): State<SharedState>) -> Json<MetricsResponse> 
             top_patterns: Vec::new(),
             top_expanded_files: Vec::new(),
             queries_by_repo: std::collections::HashMap::new(),
+            feedback_by_repo,
         }
     };
 

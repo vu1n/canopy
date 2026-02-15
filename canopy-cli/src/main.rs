@@ -97,6 +97,13 @@ enum Commands {
 
     /// Show service status
     ServiceStatus,
+
+    /// Show local feedback metrics
+    FeedbackStats {
+        /// Lookback window in days (default: 7)
+        #[arg(long)]
+        lookback_days: Option<f64>,
+    },
 }
 
 fn main() {
@@ -137,6 +144,9 @@ fn main() {
             cmd_reindex(cli.service_url.as_deref(), repo, glob, cli.json)
         }
         Commands::ServiceStatus => cmd_service_status(cli.service_url.as_deref(), cli.json),
+        Commands::FeedbackStats { lookback_days } => {
+            cmd_feedback_stats(cli.root, cli.json, lookback_days)
+        }
     };
 
     if let Err(e) = result {
@@ -261,6 +271,7 @@ fn cmd_query(
                 canopy_core::QueryOptions {
                     limit,
                     expand_budget,
+                    node_type_priors: None,
                 },
             )
         } else {
@@ -430,6 +441,12 @@ fn print_query_result(result: &canopy_core::QueryResult, json: bool) -> canopy_c
             ""
         }
     );
+    if result.expanded_count > 0 {
+        println!(
+            "({} expanded handles, {} expanded tokens)",
+            result.expanded_count, result.expanded_tokens
+        );
+    }
     Ok(())
 }
 
@@ -493,6 +510,52 @@ fn cmd_status(root: Option<std::path::PathBuf>, json: bool) -> canopy_core::Resu
             println!("{}: {}", "Last indexed".blue(), last);
         }
     }
+    Ok(())
+}
+
+fn cmd_feedback_stats(
+    root: Option<std::path::PathBuf>,
+    json: bool,
+    lookback_days: Option<f64>,
+) -> canopy_core::Result<()> {
+    use canopy_core::feedback::FeedbackStore;
+    use colored::Colorize;
+
+    let repo_root = detect_repo_root(root)?;
+    let store = FeedbackStore::open(&repo_root)?;
+    let metrics = store.compute_metrics(lookback_days.unwrap_or(7.0))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "glob_hit_rate_at_k": metrics.glob_hit_rate_at_k,
+                "handle_expand_accept_rate": metrics.handle_expand_accept_rate,
+                "avg_tokens_per_expand": metrics.avg_tokens_per_expand,
+                "sample_count": metrics.sample_count,
+            }))
+            .unwrap()
+        );
+    } else {
+        println!("{}:", "Feedback".blue());
+        println!(
+            "  {} {:.3}",
+            "glob_hit_rate_at_k".green(),
+            metrics.glob_hit_rate_at_k
+        );
+        println!(
+            "  {} {:.3}",
+            "handle_expand_accept_rate".green(),
+            metrics.handle_expand_accept_rate
+        );
+        println!(
+            "  {} {:.1}",
+            "avg_tokens_per_expand".green(),
+            metrics.avg_tokens_per_expand
+        );
+        println!("  {} {}", "sample_count".green(), metrics.sample_count);
+    }
+
     Ok(())
 }
 

@@ -1,5 +1,7 @@
 //! Query-driven path prediction for lazy indexing
 
+use canopy_core::feedback::FeedbackStore;
+
 /// Keyword to directory pattern mappings
 /// Patterns use ** for recursive matching, will be combined with extensions
 const KEYWORD_PATTERNS: &[(&[&str], &[&str])] = &[
@@ -153,6 +155,43 @@ pub fn predict_globs(query: &str, extensions: &[String]) -> Vec<String> {
     globs
 }
 
+/// Predict glob patterns and rerank using feedback-derived glob scores.
+///
+/// Falls back to static order if score lookup fails or no feedback exists.
+pub fn predict_globs_with_feedback(
+    query: &str,
+    extensions: &[String],
+    feedback: &FeedbackStore,
+) -> Vec<String> {
+    let mut globs = predict_globs(query, extensions);
+    let base_order: std::collections::HashMap<String, usize> = globs
+        .iter()
+        .enumerate()
+        .map(|(idx, g)| (g.clone(), idx))
+        .collect();
+
+    let scores = match feedback.get_glob_scores(&globs, 7.0) {
+        Ok(s) => s,
+        Err(_) => return globs,
+    };
+
+    if scores.is_empty() {
+        return globs;
+    }
+
+    globs.sort_by(|a, b| {
+        let sa = scores.get(a).copied().unwrap_or(0.0);
+        let sb = scores.get(b).copied().unwrap_or(0.0);
+        sb.total_cmp(&sa).then_with(|| {
+            let ia = base_order.get(a).copied().unwrap_or(usize::MAX);
+            let ib = base_order.get(b).copied().unwrap_or(usize::MAX);
+            ia.cmp(&ib)
+        })
+    });
+
+    globs
+}
+
 /// Extract extensions from a glob pattern like "**/*.{ts,tsx,js}"
 pub fn extract_extensions_from_glob(glob: &str) -> Vec<String> {
     // Look for {ext1,ext2} or *.ext patterns
@@ -202,6 +241,20 @@ pub fn extract_query_text(args: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use canopy_core::feedback::{ExpandEvent, QueryEvent, QueryHandle};
+    use canopy_core::NodeType;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo() -> std::path::PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("canopy-predict-test-{ts}"));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
 
     #[test]
     fn test_predict_auth_query() {
@@ -251,5 +304,89 @@ mod tests {
     fn test_extract_query_text_empty() {
         let args = serde_json::json!({});
         assert_eq!(extract_query_text(&args), "");
+    }
+
+    #[test]
+    fn test_predict_with_feedback_reranks() {
+        let repo_root = temp_repo();
+        let store = FeedbackStore::open(&repo_root).unwrap();
+
+        let good_glob = "**/auth/**/*.rs".to_string();
+        let bad_glob = "**/db/**/*.rs".to_string();
+
+        // Seed strong signal for auth glob
+        for i in 0..3 {
+            let event_id = store
+                .record_query_event(&QueryEvent {
+                    query_text: "auth db".to_string(),
+                    predicted_globs: Some(vec![good_glob.clone(), bad_glob.clone()]),
+                    files_indexed: 1,
+                    handles_returned: 1,
+                    total_tokens: 50,
+                })
+                .unwrap();
+
+            let handle_id = format!("hgood{i}");
+            store
+                .record_query_handles(
+                    event_id,
+                    &[QueryHandle {
+                        handle_id: handle_id.clone(),
+                        file_path: format!("src/auth/{i}.rs"),
+                        node_type: NodeType::Function,
+                        token_count: 50,
+                        first_match_glob: Some(good_glob.clone()),
+                    }],
+                )
+                .unwrap();
+            store
+                .record_expand_event(&ExpandEvent {
+                    query_event_id: Some(event_id),
+                    handle_id,
+                    file_path: format!("src/auth/{i}.rs"),
+                    node_type: NodeType::Function,
+                    token_count: 50,
+                    auto_expanded: false,
+                })
+                .unwrap();
+        }
+
+        // Seed non-expanded signal for db glob
+        for i in 0..3 {
+            let event_id = store
+                .record_query_event(&QueryEvent {
+                    query_text: "auth db".to_string(),
+                    predicted_globs: Some(vec![good_glob.clone(), bad_glob.clone()]),
+                    files_indexed: 1,
+                    handles_returned: 1,
+                    total_tokens: 50,
+                })
+                .unwrap();
+
+            store
+                .record_query_handles(
+                    event_id,
+                    &[QueryHandle {
+                        handle_id: format!("hbad{i}"),
+                        file_path: format!("src/db/{i}.rs"),
+                        node_type: NodeType::Function,
+                        token_count: 50,
+                        first_match_glob: Some(bad_glob.clone()),
+                    }],
+                )
+                .unwrap();
+        }
+
+        let reranked = predict_globs_with_feedback("auth db", &["rs".to_string()], &store);
+
+        let good_pos = reranked
+            .iter()
+            .position(|g| g == &good_glob)
+            .unwrap_or(usize::MAX);
+        let bad_pos = reranked
+            .iter()
+            .position(|g| g == &bad_glob)
+            .unwrap_or(usize::MAX);
+        assert!(good_pos < bad_pos);
     }
 }

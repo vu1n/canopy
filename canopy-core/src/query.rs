@@ -1,11 +1,13 @@
 //! Query DSL parser and executor
 
+use crate::document::NodeType;
 use crate::error::CanopyError;
 use crate::handle::{Handle, RefHandle};
 use crate::index::RepoIndex;
 use crate::parse::estimate_tokens;
+use crate::scoring::{select_for_expansion, HandleScorer};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Query AST
 #[derive(Debug, Clone)]
@@ -271,6 +273,7 @@ impl QueryParams {
         QueryOptions {
             limit: self.limit,
             expand_budget: self.expand_budget,
+            node_type_priors: None,
         }
     }
 }
@@ -290,6 +293,12 @@ pub struct QueryResult {
     /// Message when expand_budget is exceeded
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expand_note: Option<String>,
+    /// Number of handles with `content` populated
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expanded_count: usize,
+    /// Total token count of expanded handles
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub expanded_tokens: usize,
 }
 
 /// Parse a query string into a Query AST
@@ -313,6 +322,8 @@ pub struct QueryOptions {
     pub limit: Option<usize>,
     /// Auto-expand results if total tokens fit within budget (default: 5000)
     pub expand_budget: Option<usize>,
+    /// Learned node type priors for scoring partial auto-expansion
+    pub node_type_priors: Option<HashMap<NodeType, f64>>,
 }
 
 impl QueryOptions {
@@ -327,6 +338,11 @@ impl QueryOptions {
 
     pub fn with_expand_budget(mut self, budget: usize) -> Self {
         self.expand_budget = Some(budget);
+        self
+    }
+
+    pub fn with_node_type_priors(mut self, priors: HashMap<NodeType, f64>) -> Self {
+        self.node_type_priors = Some(priors);
         self
     }
 }
@@ -346,6 +362,7 @@ pub fn execute_query(
         QueryOptions {
             limit: limit_override,
             expand_budget: None,
+            node_type_priors: None,
         },
     )
 }
@@ -375,6 +392,8 @@ pub fn execute_query_with_options(
             total_matches,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         });
     }
 
@@ -385,6 +404,9 @@ pub fn execute_query_with_options(
 
     let mut handles: Vec<Handle> = handles.into_iter().take(effective_limit).collect();
     let total_tokens: usize = handles.iter().map(|h| h.token_count).sum();
+
+    let mut expanded_count = 0usize;
+    let mut expanded_tokens = 0usize;
 
     // Auto-expand if budget allows
     let expand_budget = options.expand_budget.unwrap_or(0);
@@ -400,15 +422,56 @@ pub fn execute_query_with_options(
                         handle.content = Some(content.clone());
                     }
                 }
+                (expanded_count, expanded_tokens) = expanded_stats(&handles);
                 (true, None)
             } else {
                 (false, Some("Failed to expand handles".to_string()))
             }
         } else {
-            (false, Some(format!(
-                "Results ({} tokens) exceed expand_budget ({}). Use canopy_expand to retrieve specific handles.",
-                total_tokens, expand_budget
-            )))
+            let query_text = extract_query_terms(query).join(" ");
+            let scorer = HandleScorer::new(&query_text)
+                .with_node_type_priors(options.node_type_priors.clone());
+            let selected = select_for_expansion(&handles, expand_budget, &scorer);
+
+            if selected.is_empty() {
+                (
+                    false,
+                    Some(format!(
+                        "Expanded 0/{} handles (0/{} tokens). Use canopy_expand for remaining.",
+                        handles.len(),
+                        total_tokens
+                    )),
+                )
+            } else {
+                let handle_ids: Vec<String> = selected
+                    .iter()
+                    .map(|idx| handles[*idx].id.to_string())
+                    .collect();
+
+                if let Ok(contents) = index.expand(&handle_ids) {
+                    let content_map: std::collections::HashMap<String, String> =
+                        contents.into_iter().collect();
+                    for idx in selected {
+                        let id = handles[idx].id.to_string();
+                        if let Some(content) = content_map.get(&id) {
+                            handles[idx].content = Some(content.clone());
+                        }
+                    }
+                    (expanded_count, expanded_tokens) = expanded_stats(&handles);
+                    (
+                        false,
+                        Some(format!(
+                            "Expanded {}/{} handles ({}/{} tokens). Use canopy_expand for remaining.",
+                            expanded_count,
+                            handles.len(),
+                            expanded_tokens,
+                            total_tokens
+                        )),
+                    )
+                } else {
+                    (false, Some("Failed to expand ranked handles".to_string()))
+                }
+            }
         }
     } else {
         (false, None)
@@ -422,7 +485,67 @@ pub fn execute_query_with_options(
         total_matches,
         auto_expanded,
         expand_note,
+        expanded_count,
+        expanded_tokens,
     })
+}
+
+fn is_zero(v: &usize) -> bool {
+    *v == 0
+}
+
+fn expanded_stats(handles: &[Handle]) -> (usize, usize) {
+    let expanded_count = handles.iter().filter(|h| h.content.is_some()).count();
+    let expanded_tokens = handles
+        .iter()
+        .filter(|h| h.content.is_some())
+        .map(|h| h.token_count)
+        .sum();
+    (expanded_count, expanded_tokens)
+}
+
+fn extract_query_terms(query: &Query) -> Vec<String> {
+    let mut terms = Vec::new();
+    collect_query_terms(query, &mut terms);
+
+    let mut seen = HashSet::new();
+    terms.retain(|term| seen.insert(term.clone()));
+    terms
+}
+
+fn collect_query_terms(query: &Query, terms: &mut Vec<String>) {
+    match query {
+        Query::Section(s)
+        | Query::Grep(s)
+        | Query::File(s)
+        | Query::Code(s)
+        | Query::Children(s)
+        | Query::Definition(s)
+        | Query::References(s) => add_terms(s, terms),
+        Query::ChildrenNamed(parent, symbol) => {
+            add_terms(parent, terms);
+            add_terms(symbol, terms);
+        }
+        Query::InFile(glob, subquery) => {
+            add_terms(glob, terms);
+            collect_query_terms(subquery, terms);
+        }
+        Query::Union(queries) | Query::Intersect(queries) => {
+            for q in queries {
+                collect_query_terms(q, terms);
+            }
+        }
+        Query::Limit(_, q) => collect_query_terms(q, terms),
+    }
+}
+
+fn add_terms(text: &str, terms: &mut Vec<String>) {
+    terms.extend(
+        text.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string),
+    );
 }
 
 fn execute_query_internal(
@@ -740,6 +863,19 @@ impl<'a> QueryParser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RepoIndex;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo() -> std::path::PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("canopy-query-test-{ts}"));
+        fs::create_dir_all(root.join("src")).unwrap();
+        root
+    }
 
     #[test]
     fn test_parse_section() {
@@ -931,5 +1067,67 @@ mod tests {
         assert!(
             matches!(err, CanopyError::QueryParse { message, .. } if message.contains("Empty patterns"))
         );
+    }
+
+    #[test]
+    fn test_partial_auto_expand_reports_counts() {
+        let repo = temp_repo();
+        fs::write(
+            repo.join("src/lib.rs"),
+            r#"
+fn target_small() {
+    // hardentest
+    println!("hardentest");
+}
+
+fn target_large() {
+    // hardentest
+    let mut acc = 0;
+    for i in 0..400 {
+        acc += i;
+        if i % 3 == 0 {
+            println!("hardentest {}", i);
+        }
+    }
+    println!("{}", acc);
+}
+"#,
+        )
+        .unwrap();
+
+        RepoIndex::init(&repo).unwrap();
+        let mut index = RepoIndex::open(&repo).unwrap();
+        index.index("**/*.rs").unwrap();
+
+        let baseline = index
+            .query_params(QueryParams::pattern("hardentest"))
+            .unwrap();
+        assert!(
+            baseline.handles.len() >= 2,
+            "expected at least two handles, got {}",
+            baseline.handles.len()
+        );
+
+        let min_tokens = baseline
+            .handles
+            .iter()
+            .map(|h| h.token_count)
+            .min()
+            .unwrap();
+        let budget = min_tokens.max(1);
+
+        let partial = index
+            .query_params(QueryParams::pattern("hardentest").with_expand_budget(budget))
+            .unwrap();
+
+        assert!(!partial.auto_expanded);
+        assert!(partial.expanded_count >= 1);
+        assert!(partial.expanded_count < partial.handles.len());
+        assert!(partial.expanded_tokens <= budget);
+        assert!(partial
+            .expand_note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Expanded"));
     }
 }

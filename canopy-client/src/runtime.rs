@@ -4,16 +4,21 @@
 
 use crate::dirty;
 use crate::merge;
-use crate::predict::{extract_extensions_from_glob, predict_globs};
+use crate::predict::{extract_extensions_from_glob, predict_globs, predict_globs_with_feedback};
 use crate::service_client::{is_error_code, ReindexResponse, ServiceClient, ServiceStatus};
 use canopy_core::{
-    HandleSource, IndexStats, QueryOptions, QueryParams, QueryResult, RepoIndex, RepoShard,
+    feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle},
+    HandleSource, IndexStats, NodeType, QueryOptions, QueryParams, QueryResult, RepoIndex,
+    RepoShard,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::time::Instant;
 
 const PROVENANCE_CAP: usize = 10_000;
+const RECENT_QUERY_EVENT_CAP: usize = 10_000;
 const ENSURE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// Indexing policy for standalone mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,12 +51,21 @@ pub struct HandleProvenance {
     pub source: HandleSource,
     pub generation: Option<u64>,
     pub repo_id: Option<String>,
+    pub file_path: String,
+    pub node_type: NodeType,
+    pub token_count: usize,
 }
 
 /// Outcome of an expand operation — supports partial success
 pub struct ExpandOutcome {
     pub contents: Vec<(String, String)>,
     pub failed_ids: Vec<String>,
+}
+
+struct PendingPredictiveContext {
+    predicted_globs: Vec<String>,
+    files_indexed: usize,
+    file_to_glob: HashMap<String, String>,
 }
 
 pub struct ClientRuntime {
@@ -62,6 +76,16 @@ pub struct ClientRuntime {
     provenance_order: VecDeque<(String, String)>,
     /// Track last-known generation per repo to detect changes
     repo_generations: HashMap<String, u64>,
+    /// Repo-local feedback DB handles (lazy-opened)
+    feedback_stores: HashMap<String, FeedbackStore>,
+    /// Best-effort mapping: (canonical_repo_path, handle_id) -> latest query_event_id
+    recent_handle_query_events: HashMap<(String, String), i64>,
+    /// Insertion order for recent_handle_query_events cap eviction
+    recent_handle_query_order: VecDeque<(String, String)>,
+    /// Predictive context staged between predictive_index_for_query() and query()
+    pending_predictive: HashMap<String, PendingPredictiveContext>,
+    /// Cached node type priors per repo
+    node_type_priors_cache: HashMap<String, (Instant, HashMap<NodeType, f64>)>,
 }
 
 impl ClientRuntime {
@@ -78,6 +102,11 @@ impl ClientRuntime {
             handle_provenance: HashMap::new(),
             provenance_order: VecDeque::new(),
             repo_generations: HashMap::new(),
+            feedback_stores: HashMap::new(),
+            recent_handle_query_events: HashMap::new(),
+            recent_handle_query_order: VecDeque::new(),
+            pending_predictive: HashMap::new(),
+            node_type_priors_cache: HashMap::new(),
         }
     }
 
@@ -94,18 +123,22 @@ impl ClientRuntime {
         repo_path: &Path,
         input: QueryInput,
     ) -> canopy_core::Result<QueryResult> {
-        if self.service.is_some() {
+        let query_text = Self::query_input_text(&input);
+
+        let result = if self.service.is_some() {
             // DSL queries bypass service mode
             if let QueryInput::Dsl(ref dsl, ref opts) = input {
                 eprintln!("Warning: DSL query bypasses service mode, using local index");
                 let index = self.open_local_index(repo_path)?;
-                let result = index.query_with_options(
-                    dsl,
-                    QueryOptions {
-                        limit: opts.limit,
-                        expand_budget: opts.expand_budget,
-                    },
-                )?;
+                let mut options = QueryOptions {
+                    limit: opts.limit,
+                    expand_budget: opts.expand_budget,
+                    node_type_priors: opts.node_type_priors.clone(),
+                };
+                if options.node_type_priors.is_none() {
+                    options.node_type_priors = self.load_node_type_priors(repo_path);
+                }
+                let result = index.query_with_options(dsl, options)?;
                 self.record_provenance_for_result(
                     repo_path,
                     &result,
@@ -113,13 +146,16 @@ impl ClientRuntime {
                     None,
                     None,
                 );
-                return Ok(result);
+                result
+            } else {
+                self.query_service(repo_path, input)?
             }
-
-            self.query_service(repo_path, input)
         } else {
-            self.query_standalone(repo_path, input)
-        }
+            self.query_standalone(repo_path, input)?
+        };
+
+        self.record_feedback_for_query(repo_path, &query_text, &result);
+        Ok(result)
     }
 
     /// Expand — pre-split by provenance, per-handle error tolerance.
@@ -270,6 +306,8 @@ impl ClientRuntime {
             failed_ids.push(id);
         }
 
+        self.record_feedback_for_expand(repo_path, &contents);
+
         if contents.is_empty() && !failed_ids.is_empty() {
             return Err(canopy_core::CanopyError::HandleNotFound(
                 failed_ids.join(", "),
@@ -333,6 +371,257 @@ impl ClientRuntime {
                 message: "No service URL configured".to_string(),
                 hint: "Pass --service-url or set CANOPY_SERVICE_URL".to_string(),
             })
+    }
+
+    fn query_input_text(input: &QueryInput) -> String {
+        match input {
+            QueryInput::Dsl(dsl, _) => dsl.clone(),
+            QueryInput::Params(params) => Self::query_params_text(params),
+        }
+    }
+
+    fn query_params_text(params: &QueryParams) -> String {
+        let mut parts = Vec::new();
+        if let Some(s) = &params.pattern {
+            parts.push(s.clone());
+        }
+        if let Some(ss) = &params.patterns {
+            parts.extend(ss.clone());
+        }
+        if let Some(s) = &params.symbol {
+            parts.push(s.clone());
+        }
+        if let Some(s) = &params.section {
+            parts.push(s.clone());
+        }
+        if let Some(s) = &params.parent {
+            parts.push(s.clone());
+        }
+        if let Some(s) = &params.glob {
+            parts.push(s.clone());
+        }
+        parts.join(" ")
+    }
+
+    fn feedback_store_for_repo(&mut self, repo_path: &Path) -> Option<&FeedbackStore> {
+        let canonical = canonical_path(repo_path);
+        if !self.feedback_stores.contains_key(&canonical) {
+            match FeedbackStore::open(repo_path) {
+                Ok(store) => {
+                    self.feedback_stores.insert(canonical.clone(), store);
+                }
+                Err(err) => {
+                    eprintln!("[canopy] feedback disabled: failed to open store: {}", err);
+                    return None;
+                }
+            }
+        }
+        self.feedback_stores.get(&canonical)
+    }
+
+    fn load_node_type_priors(&mut self, repo_path: &Path) -> Option<HashMap<NodeType, f64>> {
+        let canonical = canonical_path(repo_path);
+        if let Some((loaded_at, priors)) = self.node_type_priors_cache.get(&canonical) {
+            if loaded_at.elapsed() < NODE_TYPE_PRIOR_CACHE_TTL {
+                return Some(priors.clone());
+            }
+        }
+
+        let store = self.feedback_store_for_repo(repo_path)?;
+        match store.get_node_type_priors() {
+            Ok(priors) if !priors.is_empty() => {
+                self.node_type_priors_cache
+                    .insert(canonical, (Instant::now(), priors.clone()));
+                Some(priors)
+            }
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!(
+                    "[canopy] feedback: failed to load node type priors: {}",
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    fn remember_recent_query_event(&mut self, repo: &str, handle_id: &str, query_event_id: i64) {
+        let key = (repo.to_string(), handle_id.to_string());
+        if self.recent_handle_query_events.contains_key(&key) {
+            self.recent_handle_query_events.insert(key, query_event_id);
+        } else {
+            self.recent_handle_query_events
+                .insert(key.clone(), query_event_id);
+            self.recent_handle_query_order.push_back(key);
+        }
+
+        while self.recent_handle_query_events.len() > RECENT_QUERY_EVENT_CAP {
+            if let Some(oldest) = self.recent_handle_query_order.pop_front() {
+                self.recent_handle_query_events.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn record_feedback_for_query(
+        &mut self,
+        repo_path: &Path,
+        query_text: &str,
+        result: &QueryResult,
+    ) {
+        let canonical = canonical_path(repo_path);
+        let pending = self.pending_predictive.remove(&canonical);
+
+        let predicted_globs = pending
+            .as_ref()
+            .and_then(|ctx| (!ctx.predicted_globs.is_empty()).then(|| ctx.predicted_globs.clone()));
+        let files_indexed = pending.as_ref().map(|ctx| ctx.files_indexed).unwrap_or(0);
+
+        let query_event = QueryEvent {
+            query_text: query_text.to_string(),
+            predicted_globs,
+            files_indexed,
+            handles_returned: result.handles.len(),
+            total_tokens: result.total_tokens,
+        };
+
+        let query_handles: Vec<QueryHandle> = result
+            .handles
+            .iter()
+            .map(|handle| QueryHandle {
+                handle_id: handle.id.to_string(),
+                file_path: handle.file_path.clone(),
+                node_type: handle.node_type,
+                token_count: handle.token_count,
+                first_match_glob: pending
+                    .as_ref()
+                    .and_then(|ctx| ctx.file_to_glob.get(&handle.file_path).cloned()),
+            })
+            .collect();
+
+        let query_event_id: i64;
+        {
+            let Some(store) = self.feedback_store_for_repo(repo_path) else {
+                return;
+            };
+
+            match store.record_query_event(&query_event) {
+                Ok(id) => query_event_id = id,
+                Err(err) => {
+                    eprintln!("[canopy] feedback: failed to record query event: {}", err);
+                    return;
+                }
+            }
+
+            if let Err(err) = store.record_query_handles(query_event_id, &query_handles) {
+                eprintln!("[canopy] feedback: failed to record query handles: {}", err);
+            }
+
+            for handle in result.handles.iter().filter(|h| h.content.is_some()) {
+                let event = ExpandEvent {
+                    query_event_id: Some(query_event_id),
+                    handle_id: handle.id.to_string(),
+                    file_path: handle.file_path.clone(),
+                    node_type: handle.node_type,
+                    token_count: handle.token_count,
+                    auto_expanded: true,
+                };
+                if let Err(err) = store.record_expand_event(&event) {
+                    eprintln!(
+                        "[canopy] feedback: failed to record auto-expand event: {}",
+                        err
+                    );
+                }
+            }
+        }
+
+        for handle in &result.handles {
+            self.remember_recent_query_event(&canonical, &handle.id.to_string(), query_event_id);
+        }
+    }
+
+    fn record_feedback_for_expand(&mut self, repo_path: &Path, contents: &[(String, String)]) {
+        if contents.is_empty() {
+            return;
+        }
+
+        let canonical = canonical_path(repo_path);
+        let mut local_metadata: HashMap<String, (String, NodeType, usize)> = HashMap::new();
+        let missing_handle_ids: Vec<String> = contents
+            .iter()
+            .map(|(handle_id, _)| handle_id.clone())
+            .filter(|handle_id| {
+                !self
+                    .handle_provenance
+                    .contains_key(&(canonical.clone(), handle_id.clone()))
+            })
+            .collect();
+
+        if !missing_handle_ids.is_empty() {
+            match self.expand_local_details(repo_path, &missing_handle_ids) {
+                Ok(details) => {
+                    for (handle_id, file_path, node_type, token_count, _content) in details {
+                        local_metadata.insert(handle_id, (file_path, node_type, token_count));
+                    }
+                }
+                Err(_) => {
+                    for handle_id in &missing_handle_ids {
+                        if let Ok(mut details) =
+                            self.expand_local_details(repo_path, std::slice::from_ref(handle_id))
+                        {
+                            if let Some((id, file_path, node_type, token_count, _content)) =
+                                details.pop()
+                            {
+                                local_metadata.insert(id, (file_path, node_type, token_count));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut events = Vec::new();
+        for (handle_id, content) in contents {
+            let key = (canonical.clone(), handle_id.clone());
+            let (file_path, node_type, token_count) = if let Some(prov) =
+                self.handle_provenance.get(&key)
+            {
+                (prov.file_path.clone(), prov.node_type, prov.token_count)
+            } else if let Some((file_path, node_type, token_count)) = local_metadata.get(handle_id)
+            {
+                (file_path.clone(), *node_type, *token_count)
+            } else {
+                (
+                    "<unknown>".to_string(),
+                    NodeType::Chunk,
+                    canopy_core::parse::estimate_tokens(content),
+                )
+            };
+
+            let query_event_id = self.recent_handle_query_events.get(&key).copied();
+            events.push(ExpandEvent {
+                query_event_id,
+                handle_id: handle_id.clone(),
+                file_path,
+                node_type,
+                token_count,
+                auto_expanded: false,
+            });
+        }
+
+        if events.is_empty() {
+            return;
+        }
+
+        let Some(store) = self.feedback_store_for_repo(repo_path) else {
+            return;
+        };
+        for event in events {
+            if let Err(err) = store.record_expand_event(&event) {
+                eprintln!("[canopy] feedback: failed to record expand event: {}", err);
+            }
+        }
     }
 
     fn query_service(
@@ -407,7 +696,12 @@ impl ClientRuntime {
         let local_result = if !dirty_state.is_clean() {
             if let Some(params) = local_params {
                 let index = self.open_local_index(repo_path)?;
-                Some(index.query_params(params)?)
+                let query = params.to_query()?;
+                let mut options = params.to_options();
+                options.node_type_priors = self.load_node_type_priors(repo_path);
+                Some(canopy_core::query::execute_query_with_options(
+                    &query, &index, options,
+                )?)
             } else {
                 None
             }
@@ -460,10 +754,21 @@ impl ClientRuntime {
         // - MCP calls predictive_index_for_query() before runtime.query()
         // - QueryOnly and Predictive policies just query what's already indexed
         let index = self.open_local_index(repo_path)?;
+        let priors = self.load_node_type_priors(repo_path);
 
         let result = match input {
-            QueryInput::Params(params) => index.query_params(params)?,
-            QueryInput::Dsl(dsl, opts) => index.query_with_options(&dsl, opts)?,
+            QueryInput::Params(params) => {
+                let query = params.to_query()?;
+                let mut options = params.to_options();
+                options.node_type_priors = priors.clone();
+                canopy_core::query::execute_query_with_options(&query, &index, options)?
+            }
+            QueryInput::Dsl(dsl, mut opts) => {
+                if opts.node_type_priors.is_none() {
+                    opts.node_type_priors = priors;
+                }
+                index.query_with_options(&dsl, opts)?
+            }
         };
 
         self.record_provenance_for_result(repo_path, &result, HandleSource::Local, None, None);
@@ -472,12 +777,15 @@ impl ClientRuntime {
 
     /// Predictive index with specific query text (used by MCP tool_query)
     pub fn predictive_index_for_query(
-        &self,
+        &mut self,
+        repo_path: &Path,
         index: &mut RepoIndex,
         query_text: &str,
     ) -> canopy_core::Result<()> {
         let default_glob = index.config().default_glob().to_string();
         let status = index.status()?;
+        let canonical = canonical_path(repo_path);
+        self.pending_predictive.remove(&canonical);
 
         const LARGE_REPO_THRESHOLD: usize = 1000;
         const MAX_PREDICTIVE_FILES: usize = 500;
@@ -493,7 +801,11 @@ impl ClientRuntime {
             index.index(&default_glob)?;
         } else if is_large_repo {
             let extensions = extract_extensions_from_glob(&default_glob);
-            let predicted_globs = predict_globs(query_text, &extensions);
+            let predicted_globs = if let Some(feedback) = self.feedback_store_for_repo(repo_path) {
+                predict_globs_with_feedback(query_text, &extensions, feedback)
+            } else {
+                predict_globs(query_text, &extensions)
+            };
 
             eprintln!(
                 "[canopy] Large repo, predictive indexing for: {:?}",
@@ -501,7 +813,14 @@ impl ClientRuntime {
             );
 
             let mut total_indexed = 0;
+            let mut file_to_glob: HashMap<String, String> = HashMap::new();
             for glob in &predicted_globs {
+                if let Ok(files) = index.walk_files(glob) {
+                    for file in files {
+                        let path = file.to_string_lossy().to_string();
+                        file_to_glob.entry(path).or_insert_with(|| glob.clone());
+                    }
+                }
                 if total_indexed >= MAX_PREDICTIVE_FILES {
                     break;
                 }
@@ -521,6 +840,15 @@ impl ClientRuntime {
                 let _ = index.index("**/index.*");
                 let _ = index.index("**/app.*");
             }
+
+            self.pending_predictive.insert(
+                canonical,
+                PendingPredictiveContext {
+                    predicted_globs,
+                    files_indexed: total_indexed,
+                    file_to_glob,
+                },
+            );
         }
 
         Ok(())
@@ -543,6 +871,15 @@ impl ClientRuntime {
         index.expand(handle_ids)
     }
 
+    fn expand_local_details(
+        &self,
+        repo_path: &Path,
+        handle_ids: &[String],
+    ) -> canopy_core::Result<Vec<(String, String, NodeType, usize, String)>> {
+        let index = self.open_local_index(repo_path)?;
+        index.expand_with_details(handle_ids)
+    }
+
     fn record_provenance_for_result(
         &mut self,
         repo_path: &Path,
@@ -559,6 +896,9 @@ impl ClientRuntime {
                 source: source.clone(),
                 generation: generation.or(handle.generation),
                 repo_id: repo_id.clone(),
+                file_path: handle.file_path.clone(),
+                node_type: handle.node_type,
+                token_count: handle.token_count,
             };
 
             // On update, skip re-enqueue — just update HashMap in-place
@@ -599,6 +939,19 @@ fn canonical_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo() -> std::path::PathBuf {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("canopy-runtime-test-{ts}"));
+        fs::create_dir_all(&root).unwrap();
+        RepoIndex::init(&root).unwrap();
+        root
+    }
 
     #[test]
     fn test_standalone_no_service() {
@@ -656,6 +1009,9 @@ mod tests {
                     source: HandleSource::Local,
                     generation: None,
                     repo_id: None,
+                    file_path: "src/test.rs".to_string(),
+                    node_type: NodeType::Function,
+                    token_count: 10,
                 },
             );
             rt.provenance_order.push_back(key);
@@ -670,9 +1026,25 @@ mod tests {
             total_matches: 0,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         };
         rt.record_provenance_for_result(path, &result, HandleSource::Local, None, None);
 
         assert!(rt.handle_provenance.len() <= PROVENANCE_CAP);
+    }
+
+    #[test]
+    fn test_expand_feedback_records_without_provenance() {
+        let repo = temp_repo();
+        let mut rt = ClientRuntime::new(None, StandalonePolicy::QueryOnly);
+        let handle_id = "h000000000000000000000000".to_string();
+        let contents = vec![(handle_id, "fn hello_world() {}".to_string())];
+
+        rt.record_feedback_for_expand(&repo, &contents);
+
+        let store = FeedbackStore::open(&repo).unwrap();
+        let metrics = store.compute_metrics(1.0).unwrap();
+        assert!(metrics.avg_tokens_per_expand > 0.0);
     }
 }

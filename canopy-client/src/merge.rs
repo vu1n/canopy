@@ -31,6 +31,15 @@ pub fn merge_results(
 
     let total_tokens: usize = merged_handles.iter().map(|h| h.token_count).sum();
     let total_matches = merged_handles.len();
+    let expanded_count = merged_handles
+        .iter()
+        .filter(|h| h.content.is_some())
+        .count();
+    let expanded_tokens: usize = merged_handles
+        .iter()
+        .filter(|h| h.content.is_some())
+        .map(|h| h.token_count)
+        .sum();
 
     QueryResult {
         handles: merged_handles,
@@ -38,8 +47,10 @@ pub fn merge_results(
         total_tokens,
         truncated: local.truncated || service.truncated,
         total_matches,
-        auto_expanded: local.auto_expanded || service.auto_expanded,
+        auto_expanded: expanded_count > 0 && expanded_count == total_matches,
         expand_note: local.expand_note.or(service.expand_note),
+        expanded_count,
+        expanded_tokens,
     }
 }
 
@@ -108,6 +119,8 @@ mod tests {
             total_matches: 0,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         };
         let service = QueryResult {
             handles: vec![],
@@ -117,6 +130,8 @@ mod tests {
             total_matches: 0,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         };
         let dirty = HashSet::new();
         let result = merge_results(local, service, &dirty);
@@ -133,6 +148,8 @@ mod tests {
             total_matches: 1,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         };
         let service = QueryResult {
             handles: vec![
@@ -145,6 +162,8 @@ mod tests {
             total_matches: 2,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         };
         let mut dirty = HashSet::new();
         dirty.insert("src/dirty.rs".to_string());
@@ -165,6 +184,8 @@ mod tests {
             total_matches: 0,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         };
         let service = QueryResult {
             handles: vec![
@@ -177,6 +198,8 @@ mod tests {
             total_matches: 2,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         };
         let dirty = HashSet::new();
         let result = merge_results(local, service, &dirty);

@@ -1,13 +1,18 @@
-use canopy_core::{CanopyError, QueryResult, RepoIndex, RepoShard};
+use canopy_core::{
+    feedback::FeedbackStore, CanopyError, NodeType, QueryResult, RepoIndex, RepoShard,
+};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 pub type SharedState = Arc<AppState>;
 pub const QUERY_CACHE_MAX_ENTRIES: usize = 128;
+pub const RECENT_QUERY_EVENT_CAP: usize = 20_000;
+pub const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
 pub struct ServiceMetrics {
     pub query_count: AtomicU64,
@@ -120,6 +125,10 @@ pub struct AppState {
     pub metrics: ServiceMetrics,
     indexes: RwLock<HashMap<String, Arc<CachedIndex>>>,
     query_caches: RwLock<HashMap<String, RepoQueryCache>>,
+    feedback_stores: RwLock<HashMap<String, Arc<Mutex<FeedbackStore>>>>,
+    node_type_priors_cache: RwLock<HashMap<String, (Instant, HashMap<NodeType, f64>)>>,
+    recent_handle_query_events: RwLock<HashMap<(String, String), i64>>,
+    recent_handle_query_order: RwLock<VecDeque<(String, String)>>,
 }
 
 impl AppState {
@@ -129,6 +138,10 @@ impl AppState {
             metrics: ServiceMetrics::new(),
             indexes: RwLock::new(HashMap::new()),
             query_caches: RwLock::new(HashMap::new()),
+            feedback_stores: RwLock::new(HashMap::new()),
+            node_type_priors_cache: RwLock::new(HashMap::new()),
+            recent_handle_query_events: RwLock::new(HashMap::new()),
+            recent_handle_query_order: RwLock::new(VecDeque::new()),
         }
     }
 
@@ -211,6 +224,141 @@ impl AppState {
     pub async fn invalidate_repo(&self, repo_id: &str) {
         self.indexes.write().await.remove(repo_id);
         self.query_caches.write().await.remove(repo_id);
+        self.feedback_stores.write().await.remove(repo_id);
+        self.node_type_priors_cache.write().await.remove(repo_id);
+        self.recent_handle_query_events
+            .write()
+            .await
+            .retain(|(r, _), _| r != repo_id);
+        self.recent_handle_query_order
+            .write()
+            .await
+            .retain(|(r, _)| r != repo_id);
+    }
+
+    pub async fn feedback_store_for_repo(
+        &self,
+        repo_id: &str,
+        repo_root: &str,
+    ) -> Option<Arc<Mutex<FeedbackStore>>> {
+        {
+            let stores = self.feedback_stores.read().await;
+            if let Some(store) = stores.get(repo_id) {
+                return Some(Arc::clone(store));
+            }
+        }
+
+        let opened = match FeedbackStore::open(Path::new(repo_root)) {
+            Ok(store) => Arc::new(Mutex::new(store)),
+            Err(err) => {
+                eprintln!(
+                    "[canopy-service] feedback disabled for repo {}: {}",
+                    repo_id, err
+                );
+                return None;
+            }
+        };
+
+        let mut stores = self.feedback_stores.write().await;
+        if let Some(existing) = stores.get(repo_id) {
+            return Some(Arc::clone(existing));
+        }
+        stores.insert(repo_id.to_string(), Arc::clone(&opened));
+        Some(opened)
+    }
+
+    pub async fn load_node_type_priors(
+        &self,
+        repo_id: &str,
+        repo_root: &str,
+    ) -> Option<HashMap<NodeType, f64>> {
+        {
+            let cache = self.node_type_priors_cache.read().await;
+            if let Some((loaded_at, priors)) = cache.get(repo_id) {
+                if loaded_at.elapsed() < NODE_TYPE_PRIOR_CACHE_TTL {
+                    return Some(priors.clone());
+                }
+            }
+        }
+
+        let store = self.feedback_store_for_repo(repo_id, repo_root).await?;
+        let priors = {
+            let Ok(store_guard) = store.lock() else {
+                eprintln!(
+                    "[canopy-service] feedback lock poisoned while loading priors for {}",
+                    repo_id
+                );
+                return None;
+            };
+            match store_guard.get_node_type_priors() {
+                Ok(priors) => priors,
+                Err(err) => {
+                    eprintln!(
+                        "[canopy-service] failed to load node type priors for {}: {}",
+                        repo_id, err
+                    );
+                    return None;
+                }
+            }
+        };
+
+        if priors.is_empty() {
+            return None;
+        }
+
+        self.node_type_priors_cache
+            .write()
+            .await
+            .insert(repo_id.to_string(), (Instant::now(), priors.clone()));
+        Some(priors)
+    }
+
+    pub async fn invalidate_node_type_priors_cache(&self, repo_id: &str) {
+        self.node_type_priors_cache.write().await.remove(repo_id);
+    }
+
+    pub async fn remember_query_event_for_handles(
+        &self,
+        repo_id: &str,
+        handle_ids: &[String],
+        query_event_id: i64,
+    ) {
+        let mut map = self.recent_handle_query_events.write().await;
+        let mut order = self.recent_handle_query_order.write().await;
+
+        for handle_id in handle_ids {
+            let key = (repo_id.to_string(), handle_id.clone());
+            if map.contains_key(&key) {
+                map.insert(key, query_event_id);
+            } else {
+                map.insert(key.clone(), query_event_id);
+                order.push_back(key);
+            }
+        }
+
+        while map.len() > RECENT_QUERY_EVENT_CAP {
+            if let Some(oldest) = order.pop_front() {
+                map.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub async fn recent_query_events_for_handles(
+        &self,
+        repo_id: &str,
+        handle_ids: &[String],
+    ) -> HashMap<String, i64> {
+        let map = self.recent_handle_query_events.read().await;
+        let mut out = HashMap::new();
+        for handle_id in handle_ids {
+            let key = (repo_id.to_string(), handle_id.clone());
+            if let Some(query_event_id) = map.get(&key).copied() {
+                out.insert(handle_id.clone(), query_event_id);
+            }
+        }
+        out
     }
 }
 
@@ -227,6 +375,8 @@ mod tests {
             total_matches,
             auto_expanded: false,
             expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
         }
     }
 
