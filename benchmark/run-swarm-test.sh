@@ -6,7 +6,8 @@ set -e
 
 REPO="${1:?Usage: $0 /path/to/repo}"
 AGENTS="${AGENTS:-5}"
-MODE="${MODE:-}"  # "" = all (baseline + canopy + canopy-service), "baseline", "canopy", "canopy-service"
+MODE="${MODE:-}"  # "" = all (baseline + canopy + canopy-service), "baseline", "canopy", "canopy-service", "compare"
+COMPARE_MODES="${COMPARE_MODES:-baseline canopy-service}"  # used when MODE=compare
 MODEL="${MODEL:-}"
 MAX_TURNS="${MAX_TURNS:-15}"
 DATE=$(date +%Y%m%d-%H%M%S)
@@ -37,6 +38,9 @@ echo "Agents:      $AGENTS"
 echo "Max turns:   $MAX_TURNS"
 echo "Mode:        ${MODE:-all}"
 echo "Model:       ${MODEL:-default}"
+if [ "${MODE:-}" = "compare" ]; then
+  echo "Compare:     $COMPARE_MODES"
+fi
 echo "Output:      $OUTPUT_DIR"
 echo "=============================================="
 echo ""
@@ -140,6 +144,12 @@ fetch_service_metrics() {
 
   if curl -sf "$service_url/metrics" > "$metrics_file" 2>/dev/null; then
     echo "  Service metrics saved to $metrics_file"
+    local queries expands
+    queries=$(jq -r '.performance.queries // 0' "$metrics_file" 2>/dev/null || echo "0")
+    expands=$(jq -r '.performance.expands // 0' "$metrics_file" 2>/dev/null || echo "0")
+    if [ "${queries:-0}" -eq 0 ] && [ "${expands:-0}" -eq 0 ]; then
+      echo "  WARNING: canopy-service recorded 0 /query and 0 /expand calls (service likely not used by agents)"
+    fi
   fi
 }
 
@@ -150,6 +160,7 @@ run_agent() {
   local mode_dir="$OUTPUT_DIR/$mode"
   local json_file="$mode_dir/agent-${agent_num}.json"
   local md_file="$mode_dir/agent-${agent_num}.md"
+  local stderr_file="$mode_dir/agent-${agent_num}.stderr.log"
 
   mkdir -p "$mode_dir"
 
@@ -158,7 +169,6 @@ run_agent() {
     --dangerously-skip-permissions
     -p "$task"
     --output-format json
-    --cwd "$REPO"
     --max-turns "$MAX_TURNS"
   )
 
@@ -176,14 +186,27 @@ MCPEOF
   elif [ "$mode" = "canopy-service" ]; then
     local mcp_config
     mcp_config=$(cat << MCPEOF
-{"mcpServers":{"canopy":{"command":"$PROJECT_ROOT/target/release/canopy-mcp","args":["--root","$REPO"],"env":{"CANOPY_SERVICE_URL":"http://127.0.0.1:$SERVICE_PORT"}}}}
+{"mcpServers":{"canopy":{"command":"$PROJECT_ROOT/target/release/canopy-mcp","args":["--root","$REPO","--service-url","http://127.0.0.1:$SERVICE_PORT"]}}}
 MCPEOF
     )
     cmd_args+=(--mcp-config "$mcp_config")
   fi
 
-  # Run agent, capture output
-  "${cmd_args[@]}" 2>/dev/null > "$json_file" || true
+  # Run agent from repo root; capture stderr for debugging instead of dropping it.
+  local cmd_status=0
+  if (cd "$REPO" && "${cmd_args[@]}") > "$json_file" 2> "$stderr_file"; then
+    cmd_status=0
+  else
+    cmd_status=$?
+  fi
+
+  # Ensure downstream jq parsing has valid JSON even on command failure.
+  if [ ! -s "$json_file" ]; then
+    jq -n \
+      --arg msg "Agent command failed or produced no JSON output. See $(basename "$stderr_file")." \
+      '{result:$msg,duration_ms:0,num_turns:0,usage:{input_tokens:0,cache_read_input_tokens:0,cache_creation_input_tokens:0,output_tokens:0},total_cost_usd:0}' \
+      > "$json_file"
+  fi
 
   # Extract metrics from JSON (default to 0 for missing/empty values)
   jq_num() { local v; v=$(jq -r "$1" "$2" 2>/dev/null); echo "${v:-0}"; }
@@ -199,7 +222,10 @@ MCPEOF
   [ -z "$result" ] && result="No result"
   local result_lines=$(echo "$result" | wc -l | tr -d ' ')
   local duration_s=$(echo "scale=2; $duration_ms / 1000" | bc 2>/dev/null || echo "0")
+  # "Reported tokens" match API billing-style totals (exclude cache reads).
+  # "Effective tokens" include cache reads to show total context consumed.
   local total_tokens=$((input_tokens + cache_create + output_tokens))
+  local effective_tokens=$((input_tokens + cache_create + cache_read + output_tokens))
   local compacted=0
   if [ "$num_turns" -ge "$MAX_TURNS" ] 2>/dev/null; then
     compacted=1
@@ -222,16 +248,22 @@ $result
 - **Input tokens:** $input_tokens (+ $cache_create cache creation)
 - **Cache read:** $cache_read
 - **Output tokens:** $output_tokens
-- **Total tokens:** $total_tokens
+- **Reported tokens (input + cache_create + output):** $total_tokens
+- **Effective tokens (reported + cache_read):** $effective_tokens
 - **Cost:** \$${cost}
 - **Result lines:** $result_lines
 - **Compacted:** $compacted
 HEREDOC
 
   # Append to metrics.jsonl
-  echo "{\"mode\":\"$mode\",\"agent\":$agent_num,\"task\":$(echo "$task" | jq -R .),\"duration_ms\":$duration_ms,\"duration_s\":$duration_s,\"num_turns\":$num_turns,\"input_tokens\":$input_tokens,\"cache_read\":$cache_read,\"cache_create\":$cache_create,\"output_tokens\":$output_tokens,\"total_tokens\":$total_tokens,\"cost\":$cost,\"result_lines\":$result_lines,\"compacted\":$compacted}" >> "$OUTPUT_DIR/metrics.jsonl"
+  echo "{\"mode\":\"$mode\",\"agent\":$agent_num,\"task\":$(echo "$task" | jq -R .),\"duration_ms\":$duration_ms,\"duration_s\":$duration_s,\"num_turns\":$num_turns,\"input_tokens\":$input_tokens,\"cache_read\":$cache_read,\"cache_create\":$cache_create,\"output_tokens\":$output_tokens,\"total_tokens\":$total_tokens,\"effective_tokens\":$effective_tokens,\"cost\":$cost,\"result_lines\":$result_lines,\"compacted\":$compacted}" >> "$OUTPUT_DIR/metrics.jsonl"
 
-  echo "  Agent $agent_num done: ${duration_s}s, ${total_tokens} tokens, \$$cost"
+  echo "  Agent $agent_num done: ${duration_s}s, ${total_tokens} reported tokens (${effective_tokens} effective), \$$cost"
+
+  if [ "$cmd_status" -ne 0 ]; then
+    echo "  Agent $agent_num command failed (exit $cmd_status). See $stderr_file" >&2
+    return "$cmd_status"
+  fi
 }
 
 run_mode() {
@@ -303,8 +335,8 @@ HEADER
 
 ## Per-Agent Results
 
-| Mode | Agent | Task | Duration | Turns | Tokens | Cost | Lines |
-|------|-------|------|----------|-------|--------|------|-------|
+| Mode | Agent | Task | Duration | Turns | Reported Tokens | Effective Tokens | Cost | Lines |
+|------|-------|------|----------|-------|-----------------|------------------|------|-------|
 EOF
 
   if [ -f "$OUTPUT_DIR/metrics.jsonl" ]; then
@@ -315,9 +347,10 @@ EOF
       local duration=$(echo "$line" | jq -r '.duration_s')
       local turns=$(echo "$line" | jq -r '.num_turns')
       local tokens=$(echo "$line" | jq -r '.total_tokens')
+      local effective_tokens=$(echo "$line" | jq -r '.effective_tokens // (.input_tokens + .cache_create + .cache_read + .output_tokens)')
       local cost=$(echo "$line" | jq -r '.cost' | xargs printf "%.4f" 2>/dev/null || echo "0")
       local lines=$(echo "$line" | jq -r '.result_lines')
-      echo "| $mode | $agent | ${task}... | ${duration}s | $turns | $tokens | \$$cost | $lines |" >> "$summary_file"
+      echo "| $mode | $agent | ${task}... | ${duration}s | $turns | $tokens | $effective_tokens | \$$cost | $lines |" >> "$summary_file"
     done < "$OUTPUT_DIR/metrics.jsonl"
   fi
 
@@ -341,6 +374,122 @@ DIVIDER
     # Sum helper: reads lines of numbers, outputs their sum via awk
     sum_lines() { awk '{s+=$1} END {print s+0}'; }
 
+    metric_for_mode() {
+      local mode="$1"
+      local key="$2"
+      case "$key" in
+        total_reported_tokens)
+          jq -r "select(.mode==\"$mode\") | .total_tokens" "$OUTPUT_DIR/metrics.jsonl" | sum_lines
+          ;;
+        total_effective_tokens)
+          jq -r "select(.mode==\"$mode\") | (.effective_tokens // (.input_tokens + .cache_create + .cache_read + .output_tokens))" "$OUTPUT_DIR/metrics.jsonl" | sum_lines
+          ;;
+        total_cost)
+          jq -r "select(.mode==\"$mode\") | .cost" "$OUTPUT_DIR/metrics.jsonl" | sum_lines
+          ;;
+        max_duration)
+          jq -r "select(.mode==\"$mode\") | .duration_s" "$OUTPUT_DIR/metrics.jsonl" | sort -n | tail -1
+          ;;
+        avg_effective_tokens)
+          local total_tokens
+          local agent_count
+          total_tokens=$(jq -r "select(.mode==\"$mode\") | (.effective_tokens // (.input_tokens + .cache_create + .cache_read + .output_tokens))" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
+          agent_count=$(jq -r "select(.mode==\"$mode\") | .agent" "$OUTPUT_DIR/metrics.jsonl" | wc -l | tr -d ' ')
+          echo $(( total_tokens / (agent_count > 0 ? agent_count : 1) ))
+          ;;
+        total_cache_read)
+          jq -r "select(.mode==\"$mode\") | .cache_read" "$OUTPUT_DIR/metrics.jsonl" | sum_lines
+          ;;
+        total_lines)
+          jq -r "select(.mode==\"$mode\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" | sum_lines
+          ;;
+        compactions)
+          jq -r "select(.mode==\"$mode\") | .compacted" "$OUTPUT_DIR/metrics.jsonl" | sum_lines
+          ;;
+        quality_success_rate)
+          jq -r "select(.mode==\"$mode\") | [.result_lines, .compacted] | @tsv" "$OUTPUT_DIR/metrics.jsonl" \
+            | awk '{total+=1; if ($1>1 && $2==0) ok+=1} END { if (total>0) printf "%.1f", (ok*100.0/total); else print "0.0" }'
+          ;;
+        quality_avg_lines)
+          jq -r "select(.mode==\"$mode\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" \
+            | awk '{s+=$1; n+=1} END { if (n>0) printf "%.1f", (s/n); else print "0.0" }'
+          ;;
+        quality_avg_turns)
+          jq -r "select(.mode==\"$mode\") | .num_turns" "$OUTPUT_DIR/metrics.jsonl" \
+            | awk '{s+=$1; n+=1} END { if (n>0) printf "%.1f", (s/n); else print "0.0" }'
+          ;;
+        quality_null_results)
+          jq -r "select(.mode==\"$mode\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" \
+            | awk '{if ($1<=1) c+=1} END {print c+0}'
+          ;;
+        strict_grounded_rate)
+          local total=0
+          local grounded=0
+          for f in "$OUTPUT_DIR/$mode"/agent-*.json; do
+            [ -f "$f" ] || continue
+            total=$((total + 1))
+            local result
+            result=$(jq -r '.result // ""' "$f")
+            local refs
+            refs=$(printf "%s" "$result" | rg -o '[A-Za-z0-9_./-]+\.(ts|tsx|js|jsx|rs|py|go|md|json|toml|ya?ml|sql|sh)' | wc -l | tr -d ' ')
+            if [ "$refs" -ge 3 ]; then
+              grounded=$((grounded + 1))
+            fi
+          done
+          awk -v ok="$grounded" -v t="$total" 'BEGIN { if (t>0) printf "%.1f", (ok*100.0/t); else print "0.0" }'
+          ;;
+        strict_avg_file_refs)
+          local total=0
+          local refs_sum=0
+          for f in "$OUTPUT_DIR/$mode"/agent-*.json; do
+            [ -f "$f" ] || continue
+            total=$((total + 1))
+            local result
+            result=$(jq -r '.result // ""' "$f")
+            local refs
+            refs=$(printf "%s" "$result" | rg -o '[A-Za-z0-9_./-]+\.(ts|tsx|js|jsx|rs|py|go|md|json|toml|ya?ml|sql|sh)' | wc -l | tr -d ' ')
+            refs_sum=$((refs_sum + refs))
+          done
+          awk -v s="$refs_sum" -v t="$total" 'BEGIN { if (t>0) printf "%.1f", (s/t); else print "0.0" }'
+          ;;
+        strict_structured_rate)
+          local total=0
+          local structured=0
+          for f in "$OUTPUT_DIR/$mode"/agent-*.json; do
+            [ -f "$f" ] || continue
+            total=$((total + 1))
+            local result
+            result=$(jq -r '.result // ""' "$f")
+            local headings bullets fences
+            headings=$(printf "%s\n" "$result" | rg -n '^\s{0,3}#{1,6}\s' | wc -l | tr -d ' ')
+            bullets=$(printf "%s\n" "$result" | rg -n '^\s{0,3}[-*]\s' | wc -l | tr -d ' ')
+            fences=$(printf "%s" "$result" | rg -o '```' | wc -l | tr -d ' ')
+            if [ "$headings" -ge 3 ] && { [ "$bullets" -ge 5 ] || [ "$fences" -ge 1 ]; }; then
+              structured=$((structured + 1))
+            fi
+          done
+          awk -v ok="$structured" -v t="$total" 'BEGIN { if (t>0) printf "%.1f", (ok*100.0/t); else print "0.0" }'
+          ;;
+        service_queries)
+          if [ "$mode" = "canopy-service" ] && [ -f "$OUTPUT_DIR/canopy-service/service-metrics.json" ]; then
+            jq -r '.performance.queries // 0' "$OUTPUT_DIR/canopy-service/service-metrics.json"
+          else
+            echo "-"
+          fi
+          ;;
+        service_expands)
+          if [ "$mode" = "canopy-service" ] && [ -f "$OUTPUT_DIR/canopy-service/service-metrics.json" ]; then
+            jq -r '.performance.expands // 0' "$OUTPUT_DIR/canopy-service/service-metrics.json"
+          else
+            echo "-"
+          fi
+          ;;
+        *)
+          echo "0"
+          ;;
+      esac
+    }
+
     # Build header row dynamically
     local header="| Metric |"
     local separator="|--------|"
@@ -351,38 +500,85 @@ DIVIDER
     echo "$header" >> "$summary_file"
     echo "$separator" >> "$summary_file"
 
-    # Calculate aggregates per mode
-    declare -A mode_total_tokens mode_total_cost mode_max_duration mode_avg_tokens mode_total_lines mode_compactions
-    for m in "${modes_ran[@]}"; do
-      mode_total_tokens[$m]=$(jq -r "select(.mode==\"$m\") | .total_tokens" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
-      mode_total_cost[$m]=$(jq -r "select(.mode==\"$m\") | .cost" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
-      mode_max_duration[$m]=$(jq -r "select(.mode==\"$m\") | .duration_s" "$OUTPUT_DIR/metrics.jsonl" | sort -n | tail -1)
-      local agent_count=$(jq -r "select(.mode==\"$m\") | .agent" "$OUTPUT_DIR/metrics.jsonl" | wc -l | tr -d ' ')
-      mode_avg_tokens[$m]=$(( ${mode_total_tokens[$m]} / (agent_count > 0 ? agent_count : 1) ))
-      mode_total_lines[$m]=$(jq -r "select(.mode==\"$m\") | .result_lines" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
-      mode_compactions[$m]=$(jq -r "select(.mode==\"$m\") | .compacted" "$OUTPUT_DIR/metrics.jsonl" | sum_lines)
-    done
-
-    # Build rows dynamically
-    for metric in "Max agent time:max_duration:s" "Total tokens:total_tokens:" "Total cost:total_cost:\$" "Avg tokens/agent:avg_tokens:" "Total output lines:total_lines:" "Compactions:compactions:"; do
-      local label=$(echo "$metric" | cut -d: -f1)
-      local key=$(echo "$metric" | cut -d: -f2)
-      local prefix=$(echo "$metric" | cut -d: -f3)
-      local suffix=""
-      if [ "$key" = "max_duration" ]; then suffix="s"; fi
+    # Build aggregate rows dynamically (Bash 3 compatible: no associative arrays)
+    for metric in \
+      "Max agent time:max_duration::s" \
+      "Total reported tokens:total_reported_tokens::" \
+      "Total effective tokens (includes cache read):total_effective_tokens::" \
+      "Total cache-read tokens:total_cache_read::" \
+      "Total cost:total_cost:\$:" \
+      "Avg effective tokens/agent:avg_effective_tokens::" \
+      "Total output lines:total_lines::" \
+      "Compactions:compactions::"; do
+      local label key prefix suffix
+      IFS=':' read -r label key prefix suffix <<< "$metric"
 
       local row="| $label |"
       for m in "${modes_ran[@]}"; do
-        local val=""
-        case "$key" in
-          total_tokens) val="${mode_total_tokens[$m]}" ;;
-          total_cost) val="${mode_total_cost[$m]}" ;;
-          max_duration) val="${mode_max_duration[$m]}" ;;
-          avg_tokens) val="${mode_avg_tokens[$m]}" ;;
-          total_lines) val="${mode_total_lines[$m]}" ;;
-          compactions) val="${mode_compactions[$m]}" ;;
-        esac
+        local val
+        val=$(metric_for_mode "$m" "$key")
         row="$row ${prefix}${val}${suffix} |"
+      done
+      echo "$row" >> "$summary_file"
+    done
+
+    cat >> "$summary_file" << 'QUALITY'
+
+---
+
+## Output Quality (Heuristic)
+
+QUALITY
+
+    echo "$header" >> "$summary_file"
+    echo "$separator" >> "$summary_file"
+
+    for metric in \
+      "Success rate (non-empty, not compacted):quality_success_rate:%" \
+      "Avg output lines:quality_avg_lines:" \
+      "Avg turns used:quality_avg_turns:" \
+      "Null/empty results:quality_null_results:"; do
+      local label=$(echo "$metric" | cut -d: -f1)
+      local key=$(echo "$metric" | cut -d: -f2)
+      local suffix=$(echo "$metric" | cut -d: -f3)
+      local row="| $label |"
+      for m in "${modes_ran[@]}"; do
+        local val
+        val=$(metric_for_mode "$m" "$key")
+        row="$row ${val}${suffix} |"
+      done
+      echo "$row" >> "$summary_file"
+    done
+
+    cat >> "$summary_file" << 'QUALITY_STRICT'
+
+---
+
+## Output Quality (Strict Heuristics)
+
+Definitions:
+- Grounded output: at least 3 file-path references (e.g. `foo/bar.ts`)
+- Structured output: at least 3 headings and at least 5 bullets or 1 code fence
+
+QUALITY_STRICT
+
+    echo "$header" >> "$summary_file"
+    echo "$separator" >> "$summary_file"
+
+    for metric in \
+      "Grounded outputs:strict_grounded_rate:%" \
+      "Avg file refs/output:strict_avg_file_refs:" \
+      "Structured outputs:strict_structured_rate:%" \
+      "Service /query calls:service_queries:" \
+      "Service /expand calls:service_expands:"; do
+      local label=$(echo "$metric" | cut -d: -f1)
+      local key=$(echo "$metric" | cut -d: -f2)
+      local suffix=$(echo "$metric" | cut -d: -f3)
+      local row="| $label |"
+      for m in "${modes_ran[@]}"; do
+        local val
+        val=$(metric_for_mode "$m" "$key")
+        row="$row ${val}${suffix} |"
       done
       echo "$row" >> "$summary_file"
     done
@@ -398,17 +594,42 @@ DIVIDER
   echo "Results saved to: $OUTPUT_DIR"
 }
 
+resolve_modes() {
+  local resolved=()
+  case "${MODE:-}" in
+    "")
+      resolved=("baseline" "canopy" "canopy-service")
+      ;;
+    "baseline"|"canopy"|"canopy-service")
+      resolved=("$MODE")
+      ;;
+    "compare")
+      # shellcheck disable=SC2206
+      resolved=($COMPARE_MODES)
+      ;;
+    *)
+      echo "ERROR: Unknown MODE '$MODE'. Expected: baseline|canopy|canopy-service|compare (or empty)." >&2
+      exit 2
+      ;;
+  esac
+
+  for m in "${resolved[@]}"; do
+    case "$m" in
+      "baseline"|"canopy"|"canopy-service") ;;
+      *)
+        echo "ERROR: Invalid mode '$m' in mode list." >&2
+        exit 2
+        ;;
+    esac
+  done
+
+  echo "${resolved[@]}"
+}
+
 # Main execution
-if [ -z "$MODE" ] || [ "$MODE" = "baseline" ]; then
-  run_mode "baseline"
-fi
-
-if [ -z "$MODE" ] || [ "$MODE" = "canopy" ]; then
-  run_mode "canopy"
-fi
-
-if [ -z "$MODE" ] || [ "$MODE" = "canopy-service" ]; then
-  run_mode "canopy-service"
-fi
+read -r -a MODES_TO_RUN <<< "$(resolve_modes)"
+for mode in "${MODES_TO_RUN[@]}"; do
+  run_mode "$mode"
+done
 
 generate_summary

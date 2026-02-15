@@ -14,7 +14,9 @@ fn main() {
     let mut stdout = std::io::stdout();
     let reader = BufReader::new(stdin.lock());
 
-    let mut server = McpServer::new();
+    // Parse --service-url from CLI args (falls back to CANOPY_SERVICE_URL env var)
+    let service_url = parse_service_url();
+    let mut server = McpServer::with_service_url(service_url);
 
     for line in reader.lines() {
         let line = match line {
@@ -63,9 +65,22 @@ struct JsonRpcError {
     message: String,
 }
 
+/// Parse --service-url from CLI args, falling back to CANOPY_SERVICE_URL env var
+fn parse_service_url() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--service-url" {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(val) = args[i].strip_prefix("--service-url=") {
+            return Some(val.to_string());
+        }
+    }
+    std::env::var("CANOPY_SERVICE_URL").ok()
+}
+
 impl McpServer {
-    fn new() -> Self {
-        let service_url = std::env::var("CANOPY_SERVICE_URL").ok();
+    fn with_service_url(service_url: Option<String>) -> Self {
         Self {
             runtime: ClientRuntime::new(service_url.as_deref(), StandalonePolicy::Predictive),
         }
