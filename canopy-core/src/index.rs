@@ -5,17 +5,21 @@ use crate::document::RefType;
 use crate::document::{NodeType, ParsedFile};
 use crate::error::CanopyError;
 use crate::handle::{generate_preview, Handle, HandleId, HandleSource, RefHandle};
-use crate::parse::{estimate_tokens, parse_file};
+use crate::parse::{estimate_tokens, file_mtime, parse_file_with_hash, warm_bpe};
 use crate::query::{
     execute_query, execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult,
 };
 use ignore::WalkBuilder;
+use rayon::prelude::*;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// File discovery backend
@@ -72,6 +76,20 @@ pub struct IndexStatus {
     pub last_indexed: Option<String>,
 }
 
+/// Symbol cache pair: (name_lower -> entries, file_path -> set of name_lower keys)
+type SymbolCachePair = (
+    std::collections::HashMap<String, Vec<SymbolCacheEntry>>,
+    HashMap<String, HashSet<String>>,
+);
+
+/// Cached file metadata for batch skip checks during indexing
+struct FileMetaCache {
+    mtime: i64,
+    hash: [u8; 32],
+    indexed_at: i64,
+    tokens: usize,
+}
+
 /// Expanded handle tuple: (handle_id, file_path, node_type, token_count, content).
 pub type ExpandedHandleDetail = (String, String, NodeType, usize, String);
 type ExpandedHandleDbRow = (String, i64, i64, i64, i64, Vec<u8>);
@@ -97,6 +115,8 @@ pub struct RepoIndex {
     config: Config,
     /// Symbol cache: name_lower -> entries (preloaded at open for O(1) lookups)
     symbol_cache: std::collections::HashMap<String, Vec<SymbolCacheEntry>>,
+    /// Reverse index: file_path -> set of symbol name_lower keys in symbol_cache
+    symbol_cache_by_file: HashMap<String, HashSet<String>>,
 }
 
 impl RepoIndex {
@@ -147,23 +167,23 @@ impl RepoIndex {
         Self::init_schema(&conn)?;
 
         // Load symbol cache for O(1) lookups
-        let symbol_cache = Self::load_symbol_cache(&conn)?;
+        let (symbol_cache, symbol_cache_by_file) = Self::load_symbol_cache(&conn)?;
 
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
             conn,
             config,
             symbol_cache,
+            symbol_cache_by_file,
         })
     }
 
     /// Load symbol cache from database (preload for fast lookups)
-    fn load_symbol_cache(
-        conn: &Connection,
-    ) -> crate::Result<std::collections::HashMap<String, Vec<SymbolCacheEntry>>> {
-        use std::collections::HashMap;
-
-        let mut cache: HashMap<String, Vec<SymbolCacheEntry>> = HashMap::new();
+    /// Returns (name_lower -> entries, file_path -> set of name_lower keys)
+    fn load_symbol_cache(conn: &Connection) -> crate::Result<SymbolCachePair> {
+        let mut cache: std::collections::HashMap<String, Vec<SymbolCacheEntry>> =
+            std::collections::HashMap::new();
+        let mut by_file: HashMap<String, HashSet<String>> = HashMap::new();
 
         // Only load code symbols (function, class, struct, method)
         let mut stmt = conn.prepare(
@@ -212,10 +232,14 @@ impl RepoIndex {
         )?;
 
         for (name, entry) in rows.flatten() {
+            by_file
+                .entry(entry.file_path.clone())
+                .or_default()
+                .insert(name.clone());
             cache.entry(name).or_default().push(entry);
         }
 
-        Ok(cache)
+        Ok((cache, by_file))
     }
 
     /// Initialize database schema
@@ -343,58 +367,344 @@ impl RepoIndex {
         &self.config
     }
 
+    /// Threshold: batches with <= this many files use sequential indexing
+    const SEQUENTIAL_THRESHOLD: usize = 64;
+    /// Number of parsed files per DB transaction in pipeline mode
+    const BATCH_SIZE: usize = 500;
+
     /// Index files matching glob pattern
     pub fn index(&mut self, glob: &str) -> crate::Result<IndexStats> {
-        let mut files_indexed = 0;
-        let mut files_skipped = 0;
-        let mut total_tokens = 0;
-
         // Walk files respecting .gitignore
         let files = self.walk_files(glob)?;
 
-        for file_path in files {
-            let relative_path = file_path
-                .strip_prefix(&self.repo_root)
-                .unwrap_or(&file_path)
-                .to_string_lossy()
-                .to_string();
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let ttl_secs = self.config.ttl_duration().as_secs() as i64;
 
-            // Check if we need to reindex
-            if !self.needs_reindex(&file_path, &relative_path)? {
-                files_skipped += 1;
+        // ── Decide path before loading metadata ──
+        // Build candidate list with relative paths
+        let candidates: Vec<(PathBuf, String)> = files
+            .iter()
+            .map(|file_path| {
+                let relative_path = file_path
+                    .strip_prefix(&self.repo_root)
+                    .unwrap_or(file_path)
+                    .to_string_lossy()
+                    .to_string();
+                (file_path.clone(), relative_path)
+            })
+            .collect();
 
-                // Add to total tokens from existing entry
-                if let Some(tokens) = self.get_file_tokens(&relative_path)? {
-                    total_tokens += tokens;
-                }
-                continue;
-            }
-
-            // Read and parse file
-            let source = match fs::read_to_string(&file_path) {
-                Ok(s) => s,
-                Err(_) => continue, // Skip binary/unreadable files
-            };
-
-            let parsed = parse_file(&file_path, &source, &self.config);
-
-            // Index the file
-            self.index_parsed_file(&relative_path, &parsed)?;
-
-            files_indexed += 1;
-            total_tokens += parsed.total_tokens;
+        // For small batches, use per-file queries instead of full table scan
+        if candidates.len() <= Self::SEQUENTIAL_THRESHOLD {
+            return self.index_sequential(&candidates, now_secs, ttl_secs);
         }
 
-        // Get index size
+        // ── Pipeline path: batch-load metadata (amortized over large set) ──
+        let existing = self.batch_load_metadata()?;
+
+        // Eagerly init BPE encoder before parallel work
+        warm_bpe();
+
+        // Partition: mtime+TTL fast-skip vs needs-reindex
+        let mut files_skipped = 0usize;
+        let mut skipped_tokens = 0usize;
+        let mut to_index: Vec<(PathBuf, String)> = Vec::new();
+
+        for (file_path, relative_path) in &candidates {
+            if let Some(meta) = existing.get(relative_path) {
+                let current_mtime = fs::metadata(file_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
+                if current_mtime == meta.mtime && (now_secs - meta.indexed_at) < ttl_secs {
+                    files_skipped += 1;
+                    skipped_tokens += meta.tokens;
+                    continue;
+                }
+            }
+
+            to_index.push((file_path.clone(), relative_path.clone()));
+        }
+
+        // ── Pipeline path (large batch) ──
+        let (tx_ch, rx_ch) = crossbeam_channel::bounded::<(String, ParsedFile)>(64);
+
+        // Clone immutable data for rayon workers
+        let config = self.config.clone();
+        let existing_ref = &existing;
+
+        let hash_skipped_count = AtomicUsize::new(0);
+        let hash_skipped_tokens = AtomicUsize::new(0);
+        let hash_skipped_count_ref = &hash_skipped_count;
+        let hash_skipped_tokens_ref = &hash_skipped_tokens;
+
+        // Cancellation flag: set by writer on DB error so producers stop early
+        let cancelled = AtomicBool::new(false);
+        let cancelled_ref = &cancelled;
+
+        let mut files_indexed = 0usize;
+        let mut indexed_tokens = 0usize;
+
+        // Use std::thread::scope so we can share references to `existing` and atomics
+        let pipeline_result: crate::Result<()> = std::thread::scope(|s| {
+            // Producer thread: runs rayon par_iter internally
+            let producer_sender = tx_ch.clone();
+            s.spawn(move || {
+                to_index.par_iter().for_each_with(
+                    producer_sender,
+                    |sender, (file_path, relative_path)| {
+                        // Check cancellation before doing expensive work
+                        if cancelled_ref.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        // Capture mtime before read to avoid TOCTOU race
+                        let mtime = file_mtime(file_path);
+
+                        let source = match fs::read_to_string(file_path) {
+                            Ok(s) => s,
+                            Err(_) => return,
+                        };
+
+                        // Hash-based skip
+                        let mut hasher = Sha256::new();
+                        hasher.update(source.as_bytes());
+                        let hash: [u8; 32] = hasher.finalize().into();
+
+                        if let Some(meta) = existing_ref.get(relative_path.as_str()) {
+                            if meta.hash == hash {
+                                hash_skipped_count_ref.fetch_add(1, Ordering::Relaxed);
+                                hash_skipped_tokens_ref.fetch_add(meta.tokens, Ordering::Relaxed);
+                                return;
+                            }
+                        }
+
+                        // Check cancellation again before parsing
+                        if cancelled_ref.load(Ordering::Relaxed) {
+                            return;
+                        }
+
+                        let parsed = parse_file_with_hash(file_path, &source, &config, hash, mtime);
+                        if sender.send((relative_path.clone(), parsed)).is_err() {
+                            // Writer disconnected — signal other workers to stop
+                            cancelled_ref.store(true, Ordering::Relaxed);
+                        }
+                    },
+                );
+                // producer_sender dropped here → receiver sees disconnect
+            });
+
+            // Drop our copy so only the producer thread's sender keeps the channel alive
+            drop(tx_ch);
+
+            // Writer: calling thread (owns &mut self)
+            let preview_bytes = self.config.indexing.preview_bytes;
+            let mut batch: Vec<(String, ParsedFile)> = Vec::with_capacity(Self::BATCH_SIZE);
+
+            for item in rx_ch.iter() {
+                batch.push(item);
+                if batch.len() >= Self::BATCH_SIZE {
+                    let result = Self::flush_batch(
+                        &mut self.conn,
+                        &mut self.symbol_cache,
+                        &mut self.symbol_cache_by_file,
+                        &mut batch,
+                        preview_bytes,
+                        &mut files_indexed,
+                        &mut indexed_tokens,
+                    );
+                    if let Err(e) = result {
+                        // Signal producers to stop, drain channel to unblock them
+                        cancelled.store(true, Ordering::Relaxed);
+                        drop(rx_ch);
+                        return Err(e);
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                Self::flush_batch(
+                    &mut self.conn,
+                    &mut self.symbol_cache,
+                    &mut self.symbol_cache_by_file,
+                    &mut batch,
+                    preview_bytes,
+                    &mut files_indexed,
+                    &mut indexed_tokens,
+                )?;
+            }
+
+            Ok(())
+        });
+
+        pipeline_result?;
+
+        // Incorporate hash-skipped counts
+        files_skipped += hash_skipped_count.load(Ordering::Relaxed);
+        skipped_tokens += hash_skipped_tokens.load(Ordering::Relaxed);
+
         let db_path = self.repo_root.join(".canopy").join("index.db");
         let index_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
         Ok(IndexStats {
             files_indexed,
             files_skipped,
-            total_tokens,
+            total_tokens: indexed_tokens + skipped_tokens,
             index_size_bytes,
         })
+    }
+
+    /// Sequential index path for small batches (≤ SEQUENTIAL_THRESHOLD files).
+    /// Uses per-file DB queries instead of batch_load_metadata to avoid full table scan.
+    fn index_sequential(
+        &mut self,
+        candidates: &[(PathBuf, String)],
+        now_secs: i64,
+        ttl_secs: i64,
+    ) -> crate::Result<IndexStats> {
+        warm_bpe();
+
+        let mut files_indexed = 0usize;
+        let mut files_skipped = 0usize;
+        let mut indexed_tokens = 0usize;
+        let mut skipped_tokens = 0usize;
+
+        for (file_path, relative_path) in candidates {
+            // Per-file metadata lookup (cheap for small batches)
+            let row: Option<(i64, Vec<u8>, i64, i64)> = self
+                .conn
+                .query_row(
+                    "SELECT mtime, content_hash, indexed_at, token_count FROM files WHERE path = ?",
+                    params![relative_path],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()?;
+
+            if let Some((db_mtime, _db_hash, indexed_at, db_tokens)) = &row {
+                // Fast path: mtime unchanged + TTL valid
+                let current_mtime = fs::metadata(file_path)
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
+                if current_mtime == *db_mtime && (now_secs - indexed_at) < ttl_secs {
+                    files_skipped += 1;
+                    skipped_tokens += *db_tokens as usize;
+                    continue;
+                }
+            }
+
+            // Capture mtime before read to avoid TOCTOU race
+            let mtime = file_mtime(file_path);
+
+            let source = match fs::read_to_string(file_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Hash-based skip
+            let mut hasher = Sha256::new();
+            hasher.update(source.as_bytes());
+            let hash: [u8; 32] = hasher.finalize().into();
+
+            if let Some((_db_mtime, db_hash, _indexed_at, db_tokens)) = &row {
+                if db_hash.as_slice() == hash.as_slice() {
+                    files_skipped += 1;
+                    skipped_tokens += *db_tokens as usize;
+                    continue;
+                }
+            }
+
+            let parsed = parse_file_with_hash(file_path, &source, &self.config, hash, mtime);
+            self.index_parsed_file(relative_path, &parsed)?;
+            files_indexed += 1;
+            indexed_tokens += parsed.total_tokens;
+        }
+
+        let db_path = self.repo_root.join(".canopy").join("index.db");
+        let index_size_bytes = fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+        Ok(IndexStats {
+            files_indexed,
+            files_skipped,
+            total_tokens: indexed_tokens + skipped_tokens,
+            index_size_bytes,
+        })
+    }
+
+    /// Batch-load file metadata from DB for fast skip checks
+    fn batch_load_metadata(&self) -> crate::Result<HashMap<String, FileMetaCache>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime, content_hash, indexed_at, token_count FROM files")?;
+
+        let rows = stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
+            let mtime: i64 = row.get(1)?;
+            let hash_blob: Vec<u8> = row.get(2)?;
+            let indexed_at: i64 = row.get(3)?;
+            let tokens: i64 = row.get(4)?;
+
+            let mut hash = [0u8; 32];
+            if hash_blob.len() == 32 {
+                hash.copy_from_slice(&hash_blob);
+            }
+
+            Ok((
+                path,
+                FileMetaCache {
+                    mtime,
+                    hash,
+                    indexed_at,
+                    tokens: tokens as usize,
+                },
+            ))
+        })?;
+
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, meta) = row?;
+            map.insert(path, meta);
+        }
+        Ok(map)
+    }
+
+    /// Flush a batch of parsed files in a single transaction
+    fn flush_batch(
+        conn: &mut Connection,
+        symbol_cache: &mut std::collections::HashMap<String, Vec<SymbolCacheEntry>>,
+        symbol_cache_by_file: &mut HashMap<String, HashSet<String>>,
+        batch: &mut Vec<(String, ParsedFile)>,
+        preview_bytes: usize,
+        files_indexed: &mut usize,
+        indexed_tokens: &mut usize,
+    ) -> crate::Result<()> {
+        let mut all_new_entries: Vec<(String, Vec<(String, SymbolCacheEntry)>)> = Vec::new();
+
+        let tx = conn.transaction()?;
+        for (relative_path, parsed) in batch.drain(..) {
+            let entries =
+                Self::index_parsed_file_in_tx(&tx, &relative_path, &parsed, preview_bytes)?;
+            *files_indexed += 1;
+            *indexed_tokens += parsed.total_tokens;
+            all_new_entries.push((relative_path, entries));
+        }
+        tx.commit()?;
+
+        // Apply cache only after successful commit
+        for (relative_path, entries) in all_new_entries {
+            Self::remove_file_from_symbol_cache(symbol_cache, symbol_cache_by_file, &relative_path);
+            Self::add_to_symbol_cache(symbol_cache, symbol_cache_by_file, entries);
+        }
+
+        Ok(())
     }
 
     /// Walk files matching glob, respecting .gitignore
@@ -542,86 +852,73 @@ impl RepoIndex {
         Ok(files)
     }
 
-    /// Check if file needs reindexing
-    fn needs_reindex(&self, file_path: &Path, relative_path: &str) -> crate::Result<bool> {
-        // Get file metadata
-        let metadata = match fs::metadata(file_path) {
-            Ok(m) => m,
-            Err(_) => return Ok(true), // File doesn't exist or can't be read
-        };
-
-        let current_mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // Check database entry
-        let row: Option<(i64, Vec<u8>, i64)> = self
-            .conn
-            .query_row(
-                "SELECT mtime, content_hash, indexed_at FROM files WHERE path = ?",
-                params![relative_path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-
-        let Some((db_mtime, db_hash, indexed_at)) = row else {
-            return Ok(true); // Not in database
-        };
-
-        // Fast path: mtime unchanged
-        if db_mtime == current_mtime {
-            // Check TTL
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64;
-            let ttl_secs = self.config.ttl_duration().as_secs() as i64;
-
-            if now - indexed_at < ttl_secs {
-                return Ok(false); // Cache still valid
+    /// Remove a file's entries from the symbol cache using the reverse index (O(symbols in file))
+    fn remove_file_from_symbol_cache(
+        symbol_cache: &mut std::collections::HashMap<String, Vec<SymbolCacheEntry>>,
+        symbol_cache_by_file: &mut HashMap<String, HashSet<String>>,
+        file_path: &str,
+    ) {
+        if let Some(names) = symbol_cache_by_file.remove(file_path) {
+            for name in &names {
+                if let Some(entries) = symbol_cache.get_mut(name) {
+                    entries.retain(|e| e.file_path != file_path);
+                    if entries.is_empty() {
+                        symbol_cache.remove(name);
+                    }
+                }
             }
         }
-
-        // Compute content hash
-        let content = fs::read_to_string(file_path)?;
-        let mut hasher = Sha256::new();
-        hasher.update(content.as_bytes());
-        let current_hash: [u8; 32] = hasher.finalize().into();
-
-        // Compare hashes
-        Ok(db_hash != current_hash.as_slice())
     }
 
-    /// Get token count for a file
-    fn get_file_tokens(&self, relative_path: &str) -> crate::Result<Option<usize>> {
-        let result: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT token_count FROM files WHERE path = ?",
-                params![relative_path],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        Ok(result.map(|t| t as usize))
+    /// Add new symbol cache entries and update the reverse index
+    fn add_to_symbol_cache(
+        symbol_cache: &mut std::collections::HashMap<String, Vec<SymbolCacheEntry>>,
+        symbol_cache_by_file: &mut HashMap<String, HashSet<String>>,
+        entries: Vec<(String, SymbolCacheEntry)>,
+    ) {
+        for (name_lower, entry) in entries {
+            symbol_cache_by_file
+                .entry(entry.file_path.clone())
+                .or_default()
+                .insert(name_lower.clone());
+            symbol_cache.entry(name_lower).or_default().push(entry);
+        }
     }
 
-    /// Index a parsed file
+    /// Index a parsed file (single-file path with its own transaction)
     fn index_parsed_file(&mut self, relative_path: &str, parsed: &ParsedFile) -> crate::Result<()> {
+        let preview_bytes = self.config.indexing.preview_bytes;
         let tx = self.conn.transaction()?;
+        let entries = Self::index_parsed_file_in_tx(&tx, relative_path, parsed, preview_bytes)?;
+        tx.commit()?;
 
-        // Delete existing entry (and remove from cache)
+        Self::remove_file_from_symbol_cache(
+            &mut self.symbol_cache,
+            &mut self.symbol_cache_by_file,
+            relative_path,
+        );
+        Self::add_to_symbol_cache(
+            &mut self.symbol_cache,
+            &mut self.symbol_cache_by_file,
+            entries,
+        );
+
+        Ok(())
+    }
+
+    /// Index a parsed file within an existing transaction.
+    /// Returns symbol cache entries to be applied after commit.
+    fn index_parsed_file_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        relative_path: &str,
+        parsed: &ParsedFile,
+        preview_bytes: usize,
+    ) -> crate::Result<Vec<(String, SymbolCacheEntry)>> {
+        // Delete existing entry
         tx.execute("DELETE FROM files WHERE path = ?", params![relative_path])?;
 
-        let mtime = fs::metadata(&parsed.path)
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+        // Use mtime captured at read time (avoids TOCTOU race)
+        let mtime = parsed.mtime;
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -656,13 +953,9 @@ impl RepoIndex {
             let name_lower = name.as_ref().map(|n| n.to_lowercase());
 
             // Generate preview at index time
-            let preview = generate_preview(
-                &parsed.source,
-                &node.span,
-                self.config.indexing.preview_bytes,
-            );
+            let preview = generate_preview(&parsed.source, &node.span, preview_bytes);
 
-            // Parent fields populated in Step 2 (for now, null)
+            // Parent fields
             let parent_name: Option<&str> = node.parent_name.as_deref();
             let parent_name_lower = parent_name.map(|p| p.to_lowercase());
             let parent_handle_id = match (node.parent_node_type, node.parent_span.as_ref()) {
@@ -756,7 +1049,6 @@ impl RepoIndex {
             .nodes
             .iter()
             .filter_map(|node| {
-                // Get the node ID from the database (assumes nodes were inserted in order)
                 let handle_id = HandleId::new(relative_path, node.node_type, &node.span);
                 let node_id: Option<i64> = tx
                     .query_row(
@@ -776,11 +1068,7 @@ impl RepoIndex {
             // Find the smallest enclosing node for this reference
             let source_node_id = find_smallest_enclosing_node(&reference.span, &node_spans);
 
-            let preview = reference_preview(
-                &parsed.source,
-                &reference.span,
-                self.config.indexing.preview_bytes * 2,
-            );
+            let preview = reference_preview(&parsed.source, &reference.span, preview_bytes * 2);
 
             tx.execute(
                 "INSERT INTO refs (file_id, name, name_lower, qualifier, ref_type,
@@ -802,14 +1090,7 @@ impl RepoIndex {
             )?;
         }
 
-        tx.commit()?;
-
-        // Update symbol cache with newly indexed symbols
-        for (name_lower, entry) in new_cache_entries {
-            self.symbol_cache.entry(name_lower).or_default().push(entry);
-        }
-
-        Ok(())
+        Ok(new_cache_entries)
     }
 
     /// Query indexed content
@@ -1014,11 +1295,13 @@ impl RepoIndex {
                 )?;
 
                 // Remove invalidated entries from symbol cache
-                for (_, entries) in self.symbol_cache.iter_mut() {
-                    entries.retain(|e| !deleted_paths.contains(&e.file_path));
+                for path in &deleted_paths {
+                    Self::remove_file_from_symbol_cache(
+                        &mut self.symbol_cache,
+                        &mut self.symbol_cache_by_file,
+                        path,
+                    );
                 }
-                // Remove empty entries
-                self.symbol_cache.retain(|_, v| !v.is_empty());
 
                 Ok(count)
             }
@@ -1037,6 +1320,7 @@ impl RepoIndex {
 
                 // Clear symbol cache
                 self.symbol_cache.clear();
+                self.symbol_cache_by_file.clear();
 
                 Ok(count as usize)
             }
@@ -2081,6 +2365,157 @@ fn escape_fts5_query(query: &str) -> String {
         format!("\"{}\"", query.replace('"', "\"\""))
     } else {
         query.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Create a test repo with N Rust files and return the temp dir
+    fn setup_repo(n: usize) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        for i in 0..n {
+            let path = src.join(format!("file_{}.rs", i));
+            let mut f = fs::File::create(&path).unwrap();
+            writeln!(
+                f,
+                "fn func_{i}() {{ println!(\"hello from {i}\"); }}\nstruct Struct{i} {{ x: i32 }}",
+            )
+            .unwrap();
+        }
+
+        RepoIndex::init(dir.path()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_sequential_path_indexes_small_batch() {
+        let dir = setup_repo(5); // well below SEQUENTIAL_THRESHOLD (64)
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        let stats = index.index("**/*.rs").unwrap();
+
+        assert_eq!(stats.files_indexed, 5);
+        assert_eq!(stats.files_skipped, 0);
+        assert!(stats.total_tokens > 0);
+
+        // Reindex should skip all
+        let stats2 = index.index("**/*.rs").unwrap();
+        assert_eq!(stats2.files_indexed, 0);
+        assert_eq!(stats2.files_skipped, 5);
+    }
+
+    #[test]
+    fn test_pipeline_path_indexes_large_batch() {
+        // Create > SEQUENTIAL_THRESHOLD files to force pipeline path
+        let dir = setup_repo(80);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        let stats = index.index("**/*.rs").unwrap();
+
+        assert_eq!(stats.files_indexed, 80);
+        assert_eq!(stats.files_skipped, 0);
+        assert!(stats.total_tokens > 0);
+
+        // Reindex should skip all via mtime+TTL fast path
+        let stats2 = index.index("**/*.rs").unwrap();
+        assert_eq!(stats2.files_indexed, 0);
+        assert_eq!(stats2.files_skipped, 80);
+
+        // Verify symbols are queryable
+        let results = index.search_code("func_0", 10).unwrap();
+        assert!(
+            !results.is_empty(),
+            "should find func_0 after pipeline index"
+        );
+    }
+
+    #[test]
+    fn test_symbol_cache_by_file_consistency() {
+        let dir = setup_repo(3);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        index.index("**/*.rs").unwrap();
+
+        // Verify reverse index tracks all files
+        assert!(
+            !index.symbol_cache_by_file.is_empty(),
+            "symbol_cache_by_file should be populated"
+        );
+
+        // Every file in reverse index should have matching entries in forward cache
+        for (file_path, names) in &index.symbol_cache_by_file {
+            for name in names {
+                let entries = index
+                    .symbol_cache
+                    .get(name)
+                    .expect("forward cache missing key");
+                assert!(
+                    entries.iter().any(|e| &e.file_path == file_path),
+                    "forward cache for '{}' should contain entry for '{}'",
+                    name,
+                    file_path
+                );
+            }
+        }
+
+        // Invalidate one file and check consistency
+        index.invalidate(Some("src/file_0.rs")).unwrap();
+
+        // Reverse index should no longer have file_0
+        assert!(
+            !index.symbol_cache_by_file.contains_key("src/file_0.rs"),
+            "reverse index should not contain invalidated file"
+        );
+
+        // Forward cache should not contain entries for file_0
+        for entries in index.symbol_cache.values() {
+            assert!(
+                !entries.iter().any(|e| e.file_path == "src/file_0.rs"),
+                "forward cache should not contain invalidated file entries"
+            );
+        }
+    }
+
+    #[test]
+    fn test_mtime_captured_at_read_time() {
+        let dir = setup_repo(1);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        index.index("**/*.rs").unwrap();
+
+        // Read the stored mtime from DB
+        let stored_mtime: i64 = index
+            .conn
+            .query_row("SELECT mtime FROM files LIMIT 1", [], |row| row.get(0))
+            .unwrap();
+
+        // mtime should be non-zero and reasonable (within last few seconds)
+        assert!(stored_mtime > 0, "mtime should be non-zero");
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            (now - stored_mtime).abs() < 60,
+            "mtime should be within last minute, got delta={}",
+            now - stored_mtime
+        );
+    }
+
+    #[test]
+    fn test_invalidate_all_clears_reverse_index() {
+        let dir = setup_repo(5);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        index.index("**/*.rs").unwrap();
+        assert!(!index.symbol_cache_by_file.is_empty());
+
+        index.invalidate(None).unwrap();
+        assert!(index.symbol_cache.is_empty());
+        assert!(index.symbol_cache_by_file.is_empty());
     }
 }
 

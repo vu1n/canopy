@@ -252,4 +252,7 @@ pub struct ParsedFile {
     pub nodes: Vec<DocumentNode>,
     pub refs: Vec<Reference>,
     pub total_tokens: usize,
+    /// File mtime captured at read time (seconds since UNIX epoch).
+    /// Used to avoid TOCTOU race between parse and DB write.
+    pub mtime: i64,
 }

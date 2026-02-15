@@ -5,6 +5,23 @@ use crate::document::{DocumentNode, NodeMetadata, NodeType, ParsedFile, RefType,
 use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::sync::OnceLock;
+use std::time::UNIX_EPOCH;
+use tiktoken_rs::CoreBPE;
+
+/// Cached BPE encoder — initialized once, never panics.
+/// `None` means `cl100k_base()` failed; callers fall back to `len/4`.
+static BPE_CACHE: OnceLock<Option<CoreBPE>> = OnceLock::new();
+
+fn get_bpe() -> &'static Option<CoreBPE> {
+    BPE_CACHE.get_or_init(|| tiktoken_rs::cl100k_base().ok())
+}
+
+/// Eagerly initialize the BPE encoder (e.g. before a batch index).
+/// Safe to call multiple times; never panics.
+pub fn warm_bpe() {
+    let _ = get_bpe();
+}
 
 /// Detect file type from extension
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,12 +62,27 @@ impl FileType {
 
 /// Parse a file and extract nodes
 pub fn parse_file(path: &Path, source: &str, config: &Config) -> ParsedFile {
-    let file_type = FileType::from_path(path);
-
     // Compute content hash
     let mut hasher = Sha256::new();
     hasher.update(source.as_bytes());
     let content_hash: [u8; 32] = hasher.finalize().into();
+
+    // Capture mtime at call time
+    let mtime = file_mtime(path);
+
+    parse_file_with_hash(path, source, config, content_hash, mtime)
+}
+
+/// Parse a file with a precomputed content hash and mtime
+/// (avoids double-hashing and TOCTOU mtime race in pipeline)
+pub fn parse_file_with_hash(
+    path: &Path,
+    source: &str,
+    config: &Config,
+    content_hash: [u8; 32],
+    mtime: i64,
+) -> ParsedFile {
+    let file_type = FileType::from_path(path);
 
     let (nodes, refs) = if file_type.is_markdown() {
         (parse_markdown(source), Vec::new())
@@ -81,7 +113,18 @@ pub fn parse_file(path: &Path, source: &str, config: &Config) -> ParsedFile {
         nodes,
         refs,
         total_tokens,
+        mtime,
     }
+}
+
+/// Get file mtime as seconds since UNIX epoch (0 on error)
+pub fn file_mtime(path: &Path) -> i64 {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Parse markdown file using pulldown-cmark
@@ -1006,15 +1049,12 @@ fn span_to_line_range(source: &str, span: &Span) -> (usize, usize) {
     (start_line, end_line)
 }
 
-/// Estimate token count using tiktoken-rs
+/// Estimate token count using tiktoken-rs (cached BPE encoder)
 pub fn estimate_tokens(text: &str) -> usize {
-    // Use cl100k_base encoding (GPT-4/Claude compatible)
-    tiktoken_rs::cl100k_base()
-        .map(|bpe| bpe.encode_with_special_tokens(text).len())
-        .unwrap_or_else(|_| {
-            // Fallback: rough estimate of 4 chars per token
-            text.len() / 4
-        })
+    match get_bpe() {
+        Some(bpe) => bpe.encode_with_special_tokens(text).len(),
+        None => text.len() / 4, // Fallback: rough estimate of 4 chars per token
+    }
 }
 
 #[cfg(test)]

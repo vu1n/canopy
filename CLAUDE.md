@@ -56,13 +56,39 @@ For large repos (>1000 files), we don't do full upfront indexing. Instead:
 4. Execute query on partial index
 
 ### Symbol Cache
-In-memory HashMap preloaded at index open for O(1) symbol lookups. Updated incrementally during indexing.
+In-memory HashMap preloaded at index open for O(1) symbol lookups. Updated incrementally during indexing. A reverse index (`symbol_cache_by_file: HashMap<file_path, HashSet<name_lower>>`) enables O(symbols-in-file) cache eviction instead of full-cache scans.
+
+### Indexing Pipeline
+Two-path architecture based on batch size (threshold: 64 files):
+
+**Sequential path** (≤64 files — dirty reindex, small globs):
+- Per-file DB metadata lookup (indexed `WHERE path = ?`)
+- No rayon/channel overhead
+- Used by `canopy-client` dirty overlay for single-file reindexes
+
+**Pipeline path** (>64 files — full index, large globs):
+1. `batch_load_metadata()` — single `SELECT` into `HashMap` for O(1) skip checks
+2. `warm_bpe()` — eagerly init cached BPE tokenizer (avoids per-file `cl100k_base()` calls)
+3. Partition files: mtime+TTL fast-skip vs needs-reindex
+4. Rayon `par_iter` workers: read → capture mtime → hash → skip if unchanged → parse → send via bounded channel (cap 64)
+5. Calling thread (DB writer): receives parsed files → batches of 500 → single transaction per batch → apply symbol cache after commit
+6. Cancellation: `AtomicBool` flag checked by workers before expensive ops; set on send failure or DB error
+
+Key invariants:
+- `&mut self` stays on calling thread (writer) — no borrow conflicts with rayon workers
+- mtime captured **before** `read_to_string` to avoid TOCTOU race (stale hash + new mtime)
+- Symbol cache applied per-batch after successful `tx.commit()` — DB and cache stay consistent at batch granularity
+- Hash-based skip uses `AtomicUsize` counters, folded into final stats
+
+### BPE Token Cache
+`OnceLock<Option<CoreBPE>>` in `parse.rs` — initialized once via `warm_bpe()`, never panics. If `cl100k_base()` fails, caches `None` and `estimate_tokens()` falls back to `len/4`. Eliminates ~120K redundant BPE vocab loads on large repos.
 
 ### SQLite Optimizations
 - WAL mode for concurrent access
 - mmap (256MB) for memory-mapped reads
 - FTS5 for full-text search
 - Symbol FTS for fuzzy symbol matching
+- Batched transactions (500 files/tx) in pipeline path to reduce fsync overhead
 
 ### Service Architecture (v3)
 
@@ -156,11 +182,17 @@ AGENTS=2 MODE=canopy-service ./benchmark/run-swarm-test.sh /path/to/repo
 - Use `cargo fmt` before committing
 - Avoid over-engineering; keep changes focused
 - Update tests for new functionality
-- Symbol cache should be updated during `index_parsed_file()` and cleared in `invalidate()`
+- Symbol cache updates go through `add_to_symbol_cache()` / `remove_file_from_symbol_cache()` helpers to maintain forward+reverse index consistency
+- `index_parsed_file_in_tx()` is the shared DB insertion logic; `index_parsed_file()` wraps it with its own transaction for the sequential path
+- `ParsedFile.mtime` must be captured before `read_to_string`, not at DB write time
 
 ## Performance Notes
 
 - Symbol cache gives O(1) lookups vs O(log n) B-tree
+- Reverse symbol index (`symbol_cache_by_file`) gives O(symbols-in-file) eviction vs O(total-cache)
 - mmap pragma provides ~10-20% read speedup on warm index
 - Predictive indexing reduces first-query time from 10+ min to <30s on 7600-file repos
+- BPE cache eliminates per-call `cl100k_base()` init (~120K calls on large repos)
+- Pipeline indexing: rayon parallel parse + batched transactions (500/tx) for large repos
+- Sequential fast path avoids full-table metadata scan for small/dirty reindexes
 - Multi-agent scenarios: each agent has its own cache, falls back to DB on cache miss
