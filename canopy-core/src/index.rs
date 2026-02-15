@@ -72,6 +72,10 @@ pub struct IndexStatus {
     pub last_indexed: Option<String>,
 }
 
+/// Expanded handle tuple: (handle_id, file_path, node_type, token_count, content).
+pub type ExpandedHandleDetail = (String, String, NodeType, usize, String);
+type ExpandedHandleDbRow = (String, i64, i64, i64, i64, Vec<u8>);
+
 /// Cached symbol entry for O(1) lookups
 #[derive(Clone)]
 struct SymbolCacheEntry {
@@ -866,14 +870,14 @@ impl RepoIndex {
     pub fn expand_with_details(
         &self,
         handle_ids: &[String],
-    ) -> crate::Result<Vec<(String, String, NodeType, usize, String)>> {
+    ) -> crate::Result<Vec<ExpandedHandleDetail>> {
         let mut results = Vec::new();
 
         for handle_id_str in handle_ids {
             let handle_id: HandleId = handle_id_str.parse()?;
 
             // Get node info
-            let row: Option<(String, i64, i64, i64, i64, Vec<u8>)> = self
+            let row: Option<ExpandedHandleDbRow> = self
                 .conn
                 .query_row(
                     "SELECT f.path, n.start_byte, n.end_byte, n.node_type, n.token_count, f.content_hash

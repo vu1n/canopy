@@ -6,6 +6,7 @@ use crate::dirty;
 use crate::merge;
 use crate::predict::{extract_extensions_from_glob, predict_globs, predict_globs_with_feedback};
 use crate::service_client::{is_error_code, ReindexResponse, ServiceClient, ServiceStatus};
+use canopy_core::index::ExpandedHandleDetail;
 use canopy_core::{
     feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle},
     HandleSource, IndexStats, NodeType, QueryOptions, QueryParams, QueryResult, RepoIndex,
@@ -875,7 +876,7 @@ impl ClientRuntime {
         &self,
         repo_path: &Path,
         handle_ids: &[String],
-    ) -> canopy_core::Result<Vec<(String, String, NodeType, usize, String)>> {
+    ) -> canopy_core::Result<Vec<ExpandedHandleDetail>> {
         let index = self.open_local_index(repo_path)?;
         index.expand_with_details(handle_ids)
     }

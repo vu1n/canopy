@@ -13,6 +13,8 @@ pub type SharedState = Arc<AppState>;
 pub const QUERY_CACHE_MAX_ENTRIES: usize = 128;
 pub const RECENT_QUERY_EVENT_CAP: usize = 20_000;
 pub const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+type NodeTypePriors = HashMap<NodeType, f64>;
+type NodeTypePriorsCacheEntry = (Instant, NodeTypePriors);
 
 pub struct ServiceMetrics {
     pub query_count: AtomicU64,
@@ -126,7 +128,7 @@ pub struct AppState {
     indexes: RwLock<HashMap<String, Arc<CachedIndex>>>,
     query_caches: RwLock<HashMap<String, RepoQueryCache>>,
     feedback_stores: RwLock<HashMap<String, Arc<Mutex<FeedbackStore>>>>,
-    node_type_priors_cache: RwLock<HashMap<String, (Instant, HashMap<NodeType, f64>)>>,
+    node_type_priors_cache: RwLock<HashMap<String, NodeTypePriorsCacheEntry>>,
     recent_handle_query_events: RwLock<HashMap<(String, String), i64>>,
     recent_handle_query_order: RwLock<VecDeque<(String, String)>>,
 }
@@ -271,7 +273,7 @@ impl AppState {
         &self,
         repo_id: &str,
         repo_root: &str,
-    ) -> Option<HashMap<NodeType, f64>> {
+    ) -> Option<NodeTypePriors> {
         {
             let cache = self.node_type_priors_cache.read().await;
             if let Some((loaded_at, priors)) = cache.get(repo_id) {

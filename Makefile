@@ -1,7 +1,7 @@
 INSTALL_DIR ?= $(HOME)/.local/bin
 CLAUDE_SETTINGS := $(HOME)/.claude/settings.json
 
-.PHONY: build build-release test install install-service setup-claude fmt lint clean
+.PHONY: build build-release test install install-service setup-claude fmt lint lint-ci install-hooks clean
 
 build:
 	cargo build
@@ -44,6 +44,15 @@ fmt:
 
 lint:
 	cargo clippy --all-targets
+
+lint-ci:
+	cargo fmt --all -- --check
+	cargo clippy --all -- -D warnings
+
+install-hooks:
+	git config core.hooksPath .githooks
+	chmod +x .githooks/pre-push
+	@echo "Installed git hooks from .githooks/"
 
 clean:
 	cargo clean

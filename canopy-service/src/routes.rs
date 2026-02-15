@@ -4,8 +4,8 @@ use axum::extract::State;
 use axum::Json;
 use canopy_core::feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle};
 use canopy_core::{
-    query::execute_query_with_options, Generation, HandleSource, QueryParams, QueryResult,
-    RepoIndex, RepoShard, ShardStatus,
+    index::ExpandedHandleDetail, query::execute_query_with_options, Generation, HandleSource,
+    QueryParams, QueryResult, RepoIndex, RepoShard, ShardStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,9 +61,7 @@ fn try_record_feedback_query(
     params: &QueryParams,
     result: &QueryResult,
 ) -> Option<i64> {
-    let Some(feedback_store) = feedback_store else {
-        return None;
-    };
+    let feedback_store = feedback_store?;
     let Ok(store) = feedback_store.lock() else {
         eprintln!("[canopy-service] feedback lock poisoned while recording query");
         return None;
@@ -110,7 +108,7 @@ fn try_record_feedback_query(
 
 fn try_record_feedback_expand(
     feedback_store: Option<&std::sync::Arc<std::sync::Mutex<FeedbackStore>>>,
-    rows: &[(String, String, canopy_core::NodeType, usize, String)],
+    rows: &[ExpandedHandleDetail],
     recent_query_event_ids: &HashMap<String, i64>,
 ) -> bool {
     let Some(feedback_store) = feedback_store else {
