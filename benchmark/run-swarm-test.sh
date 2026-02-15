@@ -153,6 +153,45 @@ fetch_service_metrics() {
   fi
 }
 
+fetch_local_feedback_metrics() {
+  local mode="$1"
+  local db_file="$REPO/.canopy/feedback.db"
+  local out_file="$OUTPUT_DIR/$mode/local-feedback-metrics.json"
+
+  if [ ! -f "$db_file" ]; then
+    return 0
+  fi
+
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    echo "  WARNING: sqlite3 not found; skipping local feedback metrics for $mode"
+    return 0
+  fi
+
+  local queries expands auto_expands manual_expands
+  queries=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM query_events;" 2>/dev/null || echo "0")
+  expands=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM expand_events;" 2>/dev/null || echo "0")
+  auto_expands=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM expand_events WHERE auto_expanded=1;" 2>/dev/null || echo "0")
+  manual_expands=$(sqlite3 "$db_file" "SELECT COUNT(*) FROM expand_events WHERE auto_expanded=0;" 2>/dev/null || echo "0")
+
+  jq -n \
+    --arg mode "$mode" \
+    --arg db "$db_file" \
+    --argjson queries "${queries:-0}" \
+    --argjson expands "${expands:-0}" \
+    --argjson auto_expands "${auto_expands:-0}" \
+    --argjson manual_expands "${manual_expands:-0}" \
+    '{
+      mode: $mode,
+      db_path: $db,
+      query_events: $queries,
+      expand_events: $expands,
+      auto_expand_events: $auto_expands,
+      manual_expand_events: $manual_expands
+    }' > "$out_file"
+
+  echo "  Local feedback metrics saved to $out_file"
+}
+
 run_agent() {
   local mode=$1
   local agent_num=$2
@@ -164,10 +203,18 @@ run_agent() {
 
   mkdir -p "$mode_dir"
 
+  # For canopy modes, prepend instruction to use canopy MCP tools
+  local effective_task="$task"
+  if [ "$mode" = "canopy" ] || [ "$mode" = "canopy-service" ]; then
+    effective_task="You have access to canopy MCP tools for exploring this codebase. You MUST use the canopy MCP tools (mcp__canopy__canopy_query, mcp__canopy__canopy_expand, mcp__canopy__canopy_status) instead of Read/Grep/Glob/Bash to explore code. Start by querying canopy with relevant patterns or symbols, then expand the handles you need. Do NOT use Read, Grep, Glob, or Bash to search the codebase.
+
+Task: $task"
+  fi
+
   local cmd_args=(
     claude
     --dangerously-skip-permissions
-    -p "$task"
+    -p "$effective_task"
     --output-format json
     --max-turns "$MAX_TURNS"
   )
@@ -305,6 +352,9 @@ run_mode() {
 
   local end_time=$(date +%s)
   local wall_time=$((end_time - start_time))
+
+  # Snapshot local canopy feedback metrics before next mode clears .canopy.
+  fetch_local_feedback_metrics "$mode"
 
   # Fetch service metrics before stopping
   if [ "$mode" = "canopy-service" ]; then
@@ -484,6 +534,20 @@ DIVIDER
             echo "-"
           fi
           ;;
+        local_query_events)
+          if [ -f "$OUTPUT_DIR/$mode/local-feedback-metrics.json" ]; then
+            jq -r '.query_events // 0' "$OUTPUT_DIR/$mode/local-feedback-metrics.json"
+          else
+            echo "-"
+          fi
+          ;;
+        local_expand_events)
+          if [ -f "$OUTPUT_DIR/$mode/local-feedback-metrics.json" ]; then
+            jq -r '.expand_events // 0' "$OUTPUT_DIR/$mode/local-feedback-metrics.json"
+          else
+            echo "-"
+          fi
+          ;;
         *)
           echo "0"
           ;;
@@ -569,6 +633,8 @@ QUALITY_STRICT
       "Grounded outputs:strict_grounded_rate:%" \
       "Avg file refs/output:strict_avg_file_refs:" \
       "Structured outputs:strict_structured_rate:%" \
+      "Local query events:local_query_events:" \
+      "Local expand events:local_expand_events:" \
       "Service /query calls:service_queries:" \
       "Service /expand calls:service_expands:"; do
       local label=$(echo "$metric" | cut -d: -f1)
