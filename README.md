@@ -76,9 +76,163 @@ Is repo >1000 files?
 
 ---
 
-## Performance
+## Performance & Methodology
 
-See [Benchmarking](#benchmarking) below for how to run your own measurements.
+We are not publishing definitive benchmark numbers yet. This section documents the optimization methods and how we measure them.
+
+### Token-Efficiency Methods
+
+1. **Handle-first retrieval**
+   `canopy_query` returns compact handles and previews first; full content is fetched only via `canopy_expand`.
+2. **Predictive lazy indexing**
+   Query intent predicts likely globs so indexing is targeted before search, instead of indexing the entire repo up front.
+3. **Feedback-reranked retrieval**
+   Query/expand feedback is stored in `.canopy/feedback.db` and reused for reranking:
+   - glob ranking (`glob_hit_rate_at_k`)
+   - node-type priors (`handle_expand_accept_rate`-driven)
+4. **Retrieve -> Local overlay -> Merge execution loop**
+   In service mode, results are retrieved from service, then merged with dirty local changes to keep answers fresh without full reindex.
+5. **Worst-case budget policy**
+   The system is tuned to reduce worst-case token blowups, not just average-case wins:
+   - bounded expansion (`expand_budget`)
+   - bounded result set (`limit`)
+   - explicit tracking of compaction pressure (`max_turns` in swarm tests)
+
+### Theory: Budgeted Retrieval as a Control Loop
+
+Canopy treats code understanding as a budgeted sequential retrieval problem:
+
+1. Start with a broad but cheap probe (`canopy_query`) to get compact evidence (handles + previews).
+2. Rank candidate handles by expected usefulness per token.
+3. Expand only the top candidates while budget remains.
+4. Re-evaluate uncertainty; either iterate or stop.
+
+Informal objective:
+- maximize answer utility (grounding, completeness, correctness)
+- minimize token cost and tail-risk of runaway context growth
+
+In practice, this means:
+- **coarse-to-fine retrieval** instead of full-file ingestion
+- **budget-aware stopping** when marginal utility drops
+- **feedback-driven ranking** from observed expand behavior
+
+One useful mental model for handle ranking is:
+
+```
+score(handle) =
+  w_text * lexical_relevance +
+  w_type * node_type_prior +
+  w_feedback * historical_expand_acceptance
+```
+
+where the ranker prefers higher expected utility per token, not just raw relevance.
+
+### Retrieval/Ranking Diagram
+
+```text
+User Question
+    |
+    v
+Predictive Scope Selection
+  (keywords -> likely globs / symbols)
+    |
+    v
+Initial Query (cheap)
+  -> candidate handles + previews + token estimates
+    |
+    v
+Handle Ranking
+  (text relevance + type priors + feedback priors)
+    |
+    v
+Budget Gate
+  - expand top-k within budget
+  - keep strict limit / expand_budget
+    |
+    +--> unresolved + budget left? ---- yes ----> re-query / re-rank / expand
+    |                                           (iterate)
+    |
+    no
+    |
+    v
+Synthesize Answer
+  (grounded in expanded evidence)
+```
+
+### Service Mode Merge Diagram
+
+```text
+                     +------------------------------+
+                     |        canopy-service        |
+                     |  pre-indexed repo snapshots  |
+                     +---------------+--------------+
+                                     |
+                                     v
+User Question -> canopy-mcp -> Service Query/Expand (generation-tagged handles)
+                                     |
+                                     v
+                           Service Candidate Set
+                                     |
+                                     v
+                    Dirty-File Detector (local working tree)
+                                     |
+                     +---------------+---------------+
+                     |                               |
+               clean |                               | dirty
+                     v                               v
+               use service                    local incremental index
+                result as-is                  on dirty subset only
+                     |                               |
+                     +---------------+---------------+
+                                     |
+                                     v
+                       Local/Service Result Merge
+                       (dedupe + freshness preference)
+                                     |
+                                     v
+                           Grounded Final Answer
+```
+
+### Feedback Learning Loop Diagram
+
+```text
+Query Issued
+    |
+    v
+Handles Returned
+    |
+    v
+Which handles were expanded?
+    |
+    v
+Write events to .canopy/feedback.db
+  - query_events
+  - query_handles
+  - expand_events
+    |
+    v
+Compute derived signals
+  - glob_hit_rate_at_k
+  - handle_expand_accept_rate
+  - node-type priors
+    |
+    v
+Apply priors during future ranking
+    |
+    v
+Better next-query ordering under same token budget
+```
+
+### What We Get From These Methods
+
+1. **Lower context bloat by default**
+   The default path is query -> shortlist -> selective expand, not bulk file reads.
+2. **Better worst-case stability**
+   Budget caps and compaction-aware evaluation make runaway contexts easier to detect and control.
+3. **Better grounding signals**
+   Feedback loops and strict quality checks favor answers with concrete file references and structure.
+
+Use `canopy feedback-stats` to inspect local feedback metrics.
 
 ---
 
@@ -115,7 +269,7 @@ Query: "How does authentication work?"
 ### Token Economy
 
 Traditional approach:
-```
+``` 
 Agent reads file1.ts (500 tokens)
 Agent reads file2.ts (800 tokens)
 Agent reads file3.ts (600 tokens)
@@ -126,7 +280,7 @@ Canopy approach:
 ```
 Agent queries "auth" → 10 handles with previews (200 tokens)
 Agent expands 2 relevant handles (400 tokens)
-Total: 600 tokens (68% reduction)
+Total: 600 tokens (illustrative example)
 ```
 
 ---
@@ -309,6 +463,8 @@ Features:
 
 ## Benchmarking
 
+No canonical benchmark claims are published yet. The scripts below are for reproducible local evaluation.
+
 ### Swarm Benchmark (multi-agent)
 
 Simulates N concurrent agents exploring a codebase — measures token economy, speed, and quality across parallel workloads.
@@ -322,9 +478,37 @@ AGENTS=3 MODE=canopy MAX_TURNS=15 ./benchmark/run-swarm-test.sh /path/to/repo
 
 # Baseline only
 AGENTS=5 MODE=baseline ./benchmark/run-swarm-test.sh /path/to/repo
+
+# Explicit mode comparison
+MODE=compare COMPARE_MODES="baseline canopy canopy-service" \
+AGENTS=4 MAX_TURNS=5 INDEX_TIMEOUT=1200 \
+./benchmark/run-swarm-test.sh /path/to/repo
 ```
 
 Each agent gets a different task (round-robin) to simulate real multi-agent workloads. Results include per-agent metrics and an aggregate comparison table in `benchmark/results/swarm-{date}/summary.md`.
+
+### Measurement Protocol (Methods, Not Claims)
+
+1. **Keep setup controlled**
+   Same repo, same model, same tasks, same `MAX_TURNS`, same agent count across modes.
+2. **Compare three modes**
+   - `baseline`: no canopy MCP
+   - `canopy`: local canopy MCP
+   - `canopy-service`: canopy MCP backed by `canopy-service`
+3. **Track both token views**
+   - **Reported tokens**: `input + cache_create + output`
+   - **Effective tokens**: `reported + cache_read`
+4. **Track worst-case behavior**
+   - max agent time
+   - compactions (`num_turns >= MAX_TURNS`)
+5. **Track answer quality and grounding heuristics**
+   - success rate (non-empty, not compacted)
+   - grounded outputs (file-path references)
+   - structured outputs (headings + bullets/fences)
+6. **Verify retrieval path usage**
+   - local feedback events: `query_events`, `expand_events`
+   - service metrics: `/query` and `/expand` call counts
+   - if service query/expand are `0`, the run did not exercise service retrieval
 
 ### Single-Agent A/B Test
 
