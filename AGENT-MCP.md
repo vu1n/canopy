@@ -101,11 +101,12 @@ Build compact, ranked evidence without snippets or full content.
 | Same search params as `canopy_query` | — | — | — | `pattern`, `patterns`, `symbol`, `section`, `parent`, `kind`, `glob`, `match`, `query` |
 | `max_handles` | integer | no | 8 | Max ranked handles in pack |
 | `max_per_file` | integer | no | 2 | Max selected handles per file |
+| `plan` | boolean | no | auto (low-confidence only) | Override server-side recursive planning (service mode only) |
 
 Response includes:
 - `handles` with id/path/line-range/token-count/score (no snippets)
 - `files` grouped by file path
-- `expand_suggestion` with best handles to expand first
+- `expand_suggestion` with best handles to expand first (recently expanded handles are de-prioritized)
 - `guidance` with explicit control signals:
   - `stop_querying` (bool): whether to stop retrieval loops
   - `recommended_action`: `refine_query` or `expand_then_answer`
@@ -304,6 +305,9 @@ All errors return structured JSON:
 | Agent with HTTP client, no MCP | HTTP service |
 | Multiple agents sharing one index | HTTP service (shared state, generation tracking) |
 | Single agent, local repo | MCP tools (simpler, auto-indexes) |
+
+Feedback note:
+- In service mode, expand feedback is recorded on the service side to avoid duplicate client/server expand-event accounting.
 
 ---
 

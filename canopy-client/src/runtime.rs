@@ -13,11 +13,12 @@ use canopy_core::{
     EvidencePack, HandleSource, IndexStats, MatchMode, NodeType, QueryOptions, QueryParams,
     QueryResult, RepoIndex, RepoShard,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::time::Instant;
 
 const PROVENANCE_CAP: usize = 10_000;
+const RECENT_EXPANDED_CAP: usize = 10_000;
 const RECENT_QUERY_EVENT_CAP: usize = 10_000;
 const ENSURE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -84,6 +85,10 @@ pub struct ClientRuntime {
     recent_handle_query_events: HashMap<(String, String), i64>,
     /// Insertion order for recent_handle_query_events cap eviction
     recent_handle_query_order: VecDeque<(String, String)>,
+    /// Session-local memory: handles already expanded in this runtime
+    recently_expanded: HashSet<(String, String)>,
+    /// Insertion order for recently_expanded cap eviction
+    recently_expanded_order: VecDeque<(String, String)>,
     /// Predictive context staged between predictive_index_for_query() and query()
     pending_predictive: HashMap<String, PendingPredictiveContext>,
     /// Cached node type priors per repo
@@ -107,6 +112,8 @@ impl ClientRuntime {
             feedback_stores: HashMap::new(),
             recent_handle_query_events: HashMap::new(),
             recent_handle_query_order: VecDeque::new(),
+            recently_expanded: HashSet::new(),
+            recently_expanded_order: VecDeque::new(),
             pending_predictive: HashMap::new(),
             node_type_priors_cache: HashMap::new(),
         }
@@ -169,6 +176,7 @@ impl ClientRuntime {
         input: QueryInput,
         max_handles: usize,
         max_per_file: usize,
+        plan: Option<bool>,
     ) -> canopy_core::Result<EvidencePack> {
         let max_handles = max_handles.clamp(1, 64);
         let max_per_file = max_per_file.clamp(1, 8);
@@ -189,11 +197,12 @@ impl ClientRuntime {
                     Err(e) => return Err(e),
                 };
 
-                let (pack, used_repo_id) = match service.evidence_pack(
+                let (mut pack, used_repo_id) = match service.evidence_pack(
                     &active_repo_id,
                     params.clone(),
                     Some(max_handles),
                     Some(max_per_file),
+                    plan,
                 ) {
                     Ok(pack) => (pack, active_repo_id.clone()),
                     Err(e) if is_error_code(&e, "repo_not_found") => {
@@ -204,12 +213,14 @@ impl ClientRuntime {
                             params,
                             Some(max_handles),
                             Some(max_per_file),
+                            plan,
                         )?;
                         (pack, new_id)
                     }
                     Err(e) => return Err(e),
                 };
 
+                self.rewrite_expand_suggestions(repo_path, &mut pack);
                 self.record_provenance_for_evidence_pack(repo_path, &pack, Some(used_repo_id));
                 return Ok(pack);
             }
@@ -222,6 +233,7 @@ impl ClientRuntime {
         let query_text = Self::query_input_text(&input);
         let result = self.query(repo_path, input)?;
         let mut pack = build_evidence_pack(&result, &query_text, max_handles, max_per_file);
+        self.rewrite_expand_suggestions(repo_path, &mut pack);
         self.record_provenance_for_evidence_pack(repo_path, &pack, None);
 
         if pack.selected_count == 0 {
@@ -235,6 +247,8 @@ impl ClientRuntime {
                     max_per_file,
                 );
                 if fallback_pack.selected_count > 0 {
+                    let mut fallback_pack = fallback_pack;
+                    self.rewrite_expand_suggestions(repo_path, &mut fallback_pack);
                     self.record_provenance_for_evidence_pack(repo_path, &fallback_pack, None);
                     pack = fallback_pack;
                 }
@@ -257,13 +271,19 @@ impl ClientRuntime {
         let canonical = canonical_path(repo_path);
         let mut contents: Vec<(String, String)> = Vec::new();
         let mut failed_ids: Vec<String> = Vec::new();
+        let mut seen_ids = HashSet::new();
+        let unique_handle_ids: Vec<String> = handle_ids
+            .iter()
+            .filter(|id| seen_ids.insert((*id).clone()))
+            .cloned()
+            .collect();
 
         // Partition handles by provenance
         let mut local_ids: Vec<String> = Vec::new();
         let mut service_ids: Vec<(String, Option<u64>, Option<String>)> = Vec::new(); // (id, gen, repo_id)
         let mut unknown_ids: Vec<String> = Vec::new();
 
-        for id in handle_ids {
+        for id in &unique_handle_ids {
             let key = (canonical.clone(), id.clone());
             if let Some(prov) = self.handle_provenance.get(&key) {
                 match prov.source {
@@ -391,7 +411,24 @@ impl ClientRuntime {
             failed_ids.push(id);
         }
 
-        self.record_feedback_for_expand(repo_path, &contents);
+        self.record_recently_expanded(repo_path, &contents);
+        if self.service.is_some() {
+            // Service mode already records expand feedback server-side.
+            // Only record local-handle expansions here to avoid double counting.
+            let local_contents: Vec<(String, String)> = contents
+                .iter()
+                .filter_map(|(id, content)| {
+                    let key = (canonical.clone(), id.clone());
+                    self.handle_provenance
+                        .get(&key)
+                        .filter(|prov| matches!(prov.source, HandleSource::Local))
+                        .map(|_| (id.clone(), content.clone()))
+                })
+                .collect();
+            self.record_feedback_for_expand(repo_path, &local_contents);
+        } else {
+            self.record_feedback_for_expand(repo_path, &contents);
+        }
 
         if contents.is_empty() && !failed_ids.is_empty() {
             return Err(canopy_core::CanopyError::HandleNotFound(
@@ -1075,6 +1112,65 @@ impl ClientRuntime {
         while self.handle_provenance.len() > PROVENANCE_CAP {
             if let Some(oldest) = self.provenance_order.pop_front() {
                 self.handle_provenance.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn rewrite_expand_suggestions(&self, repo_path: &Path, pack: &mut EvidencePack) {
+        if pack.expand_suggestion.is_empty() {
+            return;
+        }
+
+        let canonical = canonical_path(repo_path);
+        let mut fresh = Vec::new();
+        let mut repeated = Vec::new();
+        for id in &pack.expand_suggestion {
+            let key = (canonical.clone(), id.clone());
+            if self.recently_expanded.contains(&key) {
+                repeated.push(id.clone());
+            } else {
+                fresh.push(id.clone());
+            }
+        }
+
+        if fresh.is_empty() {
+            for handle in &pack.handles {
+                if fresh.len() >= pack.expand_suggestion.len() {
+                    break;
+                }
+                let key = (canonical.clone(), handle.id.clone());
+                if self.recently_expanded.contains(&key) {
+                    continue;
+                }
+                if !fresh.iter().any(|id| id == &handle.id) {
+                    fresh.push(handle.id.clone());
+                }
+            }
+        }
+
+        if !fresh.is_empty() {
+            fresh.extend(repeated);
+            fresh.truncate(pack.expand_suggestion.len());
+            pack.expand_suggestion = fresh;
+        }
+    }
+
+    fn record_recently_expanded(&mut self, repo_path: &Path, contents: &[(String, String)]) {
+        if contents.is_empty() {
+            return;
+        }
+        let canonical = canonical_path(repo_path);
+        for (handle_id, _) in contents {
+            let key = (canonical.clone(), handle_id.clone());
+            if self.recently_expanded.insert(key.clone()) {
+                self.recently_expanded_order.push_back(key);
+            }
+        }
+        while self.recently_expanded.len() > RECENT_EXPANDED_CAP {
+            if let Some(oldest) = self.recently_expanded_order.pop_front() {
+                self.recently_expanded.remove(&oldest);
             } else {
                 break;
             }

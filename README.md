@@ -82,7 +82,13 @@ Canopy treats repository understanding as a budgeted retrieval loop: broad cheap
    - node-type priors (`handle_expand_accept_rate`)
 4. Retrieve -> local overlay -> merge (service mode)
    Service results are merged with local dirty-file overlays to keep answers fresh without full reindex.
-5. Worst-case budget policy
+5. Guidance-driven evidence packs
+   `canopy_evidence_pack` returns ranked handles plus `guidance` signals to stop querying and switch to expansion/synthesis.
+6. Low-confidence recursive planning (service mode)
+   Service-side planning is enabled by default only when evidence confidence is low; otherwise it stays single-step.
+7. Expand churn suppression
+   Recently expanded handles are de-prioritized in future `expand_suggestion` lists to avoid repeated expansions.
+8. Worst-case budget policy
    Retrieval is constrained by `expand_budget`, `limit`, and turn budget (`MAX_TURNS` in swarm tests).
 
 ### Theory: Budgeted Retrieval Control Loop
@@ -396,6 +402,11 @@ AGENTS=4 MAX_TURNS=5 INDEX_TIMEOUT=1200 \
 ```
 
 Detailed protocol, metric definitions, and troubleshooting live in `docs/benchmarking.md`.
+
+Token metric interpretation:
+- Reported tokens: tokens billed in the run summary.
+- Effective tokens: reported tokens plus cache-read tokens (proxy for total context consumed by the agent loop).
+- Cache-read tokens can dominate long loops, so reported-only views may hide retrieval churn.
 
 Design principles, anti-drift guardrails, and divergence logging live in `docs/design-anchors.md`.
 

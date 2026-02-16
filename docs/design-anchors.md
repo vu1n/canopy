@@ -1,6 +1,6 @@
 # Canopy Design Anchors (Living Document)
 
-Reviewed: 2026-02-15
+Reviewed: 2026-02-16
 Owner: Canopy maintainers
 Status: Active working reference
 
@@ -153,6 +153,35 @@ Use this template:
 
 3. Weak automatic convergence:
 - Current behavior can continue exploring past useful evidence collection.
+
+## Current Implementation Mapping (2026-02-16)
+
+Recent behavior aligned to these anchors:
+
+1. Compact MCP transport:
+- MCP responses use compact JSON serialization to reduce response-token overhead.
+
+2. Safer defaults and clamps:
+- MCP query default limit is 16.
+- Service normalizes query limits and clamps to a bounded range to control retrieval fan-out.
+- Query auto-expand defaults to disabled (`expand_budget=0`) unless explicitly requested.
+
+3. Guidance-first retrieval:
+- `canopy_evidence_pack` returns ranked handles plus explicit `guidance` (`stop_querying`, `recommended_action`, `next_step`).
+- Guidance action now aligns with state: low-confidence partial evidence recommends `refine_query`; stop-ready evidence recommends `expand_then_answer`.
+
+4. Bounded server planning:
+- Service-side recursive planning is optional (`plan=true`) and auto-enabled only on low-confidence evidence.
+- High-confidence packs stay single-step by default.
+
+5. Expansion dedupe and anti-churn:
+- Query results expose `expanded_handle_ids` so already-expanded handles can be skipped.
+- Client and service both keep short-memory sets of recently expanded handles and de-prioritize them in future `expand_suggestion` lists.
+- Expand inputs are deduped before expansion execution.
+
+6. Feedback ownership clarity:
+- In service mode, expand feedback is recorded server-side; client avoids double-counting service expansions.
+- This keeps acceptance-rate and tokens-per-expand metrics interpretable during tuning.
 
 ## Near-Term Direction
 

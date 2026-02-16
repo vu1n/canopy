@@ -5,8 +5,8 @@ use axum::Json;
 use canopy_core::feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle};
 use canopy_core::{
     build_evidence_pack, index::ExpandedHandleDetail, query::execute_query_with_options,
-    EvidencePack, Generation, Handle, HandleSource, MatchMode, NodeType, QueryKind, QueryParams,
-    QueryResult, RepoIndex, RepoShard, ShardStatus,
+    EvidenceConfidence, EvidencePack, Generation, Handle, HandleSource, MatchMode, NodeType,
+    QueryKind, QueryParams, QueryResult, RepoIndex, RepoShard, ShardStatus,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -15,8 +15,10 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 const EVIDENCE_PLAN_MAX_STEPS: usize = 3;
-const EVIDENCE_PLAN_SYMBOLS_PER_STEP: usize = 2;
+const EVIDENCE_PLAN_SYMBOLS_PER_STEP: usize = 1;
 const EVIDENCE_PLAN_MIN_NEW_HANDLES: usize = 2;
+const SERVICE_DEFAULT_QUERY_LIMIT: usize = 16;
+const SERVICE_MAX_QUERY_LIMIT: usize = 50;
 
 fn timestamp() -> String {
     let now = std::time::SystemTime::now()
@@ -178,6 +180,54 @@ fn symbol_followup_params(base: &QueryParams, symbol: String) -> QueryParams {
     params.limit = Some(base.limit.unwrap_or(16).min(12));
     params.glob = base.glob.clone();
     params
+}
+
+fn normalize_query_params(mut params: QueryParams, force_preview_only: bool) -> QueryParams {
+    let limit = params
+        .limit
+        .unwrap_or(SERVICE_DEFAULT_QUERY_LIMIT)
+        .clamp(1, SERVICE_MAX_QUERY_LIMIT);
+    params.limit = Some(limit);
+    if force_preview_only {
+        params.expand_budget = Some(0);
+    }
+    params
+}
+
+fn reorder_expand_suggestions(pack: &mut EvidencePack, recent_expanded: &HashSet<String>) {
+    if pack.expand_suggestion.is_empty() || recent_expanded.is_empty() {
+        return;
+    }
+
+    let mut fresh = Vec::new();
+    let mut repeated = Vec::new();
+    for id in &pack.expand_suggestion {
+        if recent_expanded.contains(id) {
+            repeated.push(id.clone());
+        } else {
+            fresh.push(id.clone());
+        }
+    }
+
+    if fresh.is_empty() {
+        for handle in &pack.handles {
+            if fresh.len() >= pack.expand_suggestion.len() {
+                break;
+            }
+            if recent_expanded.contains(&handle.id) {
+                continue;
+            }
+            if !fresh.iter().any(|id| id == &handle.id) {
+                fresh.push(handle.id.clone());
+            }
+        }
+    }
+
+    if !fresh.is_empty() {
+        fresh.extend(repeated);
+        fresh.truncate(pack.expand_suggestion.len());
+        pack.expand_suggestion = fresh;
+    }
 }
 
 fn try_record_feedback_query(
@@ -354,7 +404,7 @@ pub async fn query(
     let generation = shard.generation.value();
     drop(shards);
 
-    let params = req.params;
+    let params = normalize_query_params(req.params, false);
     let params_for_feedback = params.clone();
     let cache_key = serde_json::to_string(&params).map_err(AppError::internal)?;
     let feedback_store = state.feedback_store_for_repo(&repo_id, &repo_root).await;
@@ -481,6 +531,8 @@ pub struct EvidencePackRequest {
     pub max_handles: Option<usize>,
     #[serde(default)]
     pub max_per_file: Option<usize>,
+    #[serde(default)]
+    pub plan: Option<bool>,
 }
 
 pub async fn evidence_pack(
@@ -506,10 +558,10 @@ pub async fn evidence_pack(
     let generation = shard.generation.value();
     drop(shards);
 
-    let params = req.params;
-    // Deprecated in higher-level workflows: evidence pack is pointer-first.
-    let mut seed_params = params.clone();
-    seed_params.expand_budget = Some(0);
+    let seed_params = normalize_query_params(req.params, true);
+    let plan_override = req.plan;
+    let mut planning_enabled = matches!(plan_override, Some(true));
+    let mut auto_plan_decided = plan_override.is_some();
     let query_text = query_params_text(&seed_params);
     let max_handles = req.max_handles.unwrap_or(8).clamp(1, 64);
     let max_per_file = req.max_per_file.unwrap_or(2).clamp(1, 8);
@@ -530,7 +582,12 @@ pub async fn evidence_pack(
     let mut plan_steps = 0usize;
 
     while let Some(current_params) = pending.pop_front() {
-        if plan_steps >= EVIDENCE_PLAN_MAX_STEPS {
+        let max_steps = if planning_enabled {
+            EVIDENCE_PLAN_MAX_STEPS
+        } else {
+            2
+        };
+        if plan_steps >= max_steps {
             break;
         }
         let key = serde_json::to_string(&current_params).map_err(AppError::internal)?;
@@ -567,19 +624,63 @@ pub async fn evidence_pack(
             }
         }
 
-        if new_handle_count < EVIDENCE_PLAN_MIN_NEW_HANDLES {
-            continue;
+        let expanded_handle_ids: Vec<String> = aggregate_handles
+            .iter()
+            .filter(|h| h.content.is_some())
+            .map(|h| h.id.to_string())
+            .collect();
+        let provisional = QueryResult {
+            handles: aggregate_handles.clone(),
+            ref_handles: None,
+            total_tokens: aggregate_tokens,
+            truncated: aggregate_truncated,
+            total_matches,
+            auto_expanded: false,
+            expand_note: None,
+            expanded_count: expanded_handle_ids.len(),
+            expanded_tokens: aggregate_handles
+                .iter()
+                .filter(|h| h.content.is_some())
+                .map(|h| h.token_count)
+                .sum(),
+            expanded_handle_ids,
+        };
+        let provisional_pack =
+            build_evidence_pack(&provisional, &query_text, max_handles, max_per_file);
+
+        if !auto_plan_decided {
+            planning_enabled = provisional_pack.guidance.confidence_band == EvidenceConfidence::Low
+                && !provisional_pack.guidance.stop_querying;
+            auto_plan_decided = true;
         }
 
         if let Some(fallback) = pattern_fallback_params(&current_params) {
             let fallback_key = serde_json::to_string(&fallback).map_err(AppError::internal)?;
-            if !seen_param_keys.contains(&fallback_key) {
+            let allow_fallback = if planning_enabled {
+                true
+            } else {
+                plan_steps == 1 && aggregate_handles.is_empty()
+            };
+            if allow_fallback && !seen_param_keys.contains(&fallback_key) {
                 pending.push_back(fallback);
             }
         }
 
+        if !planning_enabled {
+            continue;
+        }
+
+        if new_handle_count < EVIDENCE_PLAN_MIN_NEW_HANDLES {
+            continue;
+        }
+        if provisional_pack.guidance.stop_querying
+            && provisional_pack.selected_count >= max_handles.min(4)
+        {
+            break;
+        }
+
         let symbol_candidates = extract_symbol_candidates_from_handles(
-            &aggregate_handles,
+            &provisional.handles,
             &query_text,
             EVIDENCE_PLAN_SYMBOLS_PER_STEP,
         );
@@ -627,7 +728,12 @@ pub async fn evidence_pack(
         state.invalidate_node_type_priors_cache(&repo_id).await;
     }
 
-    let pack = build_evidence_pack(&result, &query_text, max_handles, max_per_file);
+    let mut pack = build_evidence_pack(&result, &query_text, max_handles, max_per_file);
+    let suggested_ids = pack.expand_suggestion.clone();
+    let recent_expanded = state
+        .recent_expanded_handle_ids(&repo_id, &suggested_ids)
+        .await;
+    reorder_expand_suggestions(&mut pack, &recent_expanded);
 
     let duration_ms = start.elapsed().as_millis();
     state
@@ -642,11 +748,12 @@ pub async fn evidence_pack(
         "miss"
     };
     eprintln!(
-        "[{}] POST /evidence_pack repo={} duration_ms={} cache={} steps={} selected={}",
+        "[{}] POST /evidence_pack repo={} duration_ms={} cache={} plan={} steps={} selected={}",
         timestamp(),
         repo_label,
         duration_ms,
         cache_state,
+        planning_enabled,
         plan_steps,
         pack.selected_count
     );
@@ -751,6 +858,9 @@ pub async fn expand(
         .iter()
         .map(|(id, _path, _node_type, _token_count, _content)| id.clone())
         .collect();
+    state
+        .remember_expanded_handles(&repo_id, &expanded_ids)
+        .await;
     let recent_query_event_ids = state
         .recent_query_events_for_handles(&repo_id, &expanded_ids)
         .await;

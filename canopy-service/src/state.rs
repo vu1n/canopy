@@ -1,7 +1,7 @@
 use canopy_core::{
     feedback::FeedbackStore, CanopyError, NodeType, QueryResult, RepoIndex, RepoShard,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +12,7 @@ use tokio::sync::RwLock;
 pub type SharedState = Arc<AppState>;
 pub const QUERY_CACHE_MAX_ENTRIES: usize = 128;
 pub const RECENT_QUERY_EVENT_CAP: usize = 20_000;
+pub const RECENT_EXPANDED_HANDLE_CAP: usize = 20_000;
 pub const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 type NodeTypePriors = HashMap<NodeType, f64>;
 type NodeTypePriorsCacheEntry = (Instant, NodeTypePriors);
@@ -131,6 +132,8 @@ pub struct AppState {
     node_type_priors_cache: RwLock<HashMap<String, NodeTypePriorsCacheEntry>>,
     recent_handle_query_events: RwLock<HashMap<(String, String), i64>>,
     recent_handle_query_order: RwLock<VecDeque<(String, String)>>,
+    recent_expanded_handles: RwLock<HashSet<(String, String)>>,
+    recent_expanded_order: RwLock<VecDeque<(String, String)>>,
 }
 
 impl AppState {
@@ -144,6 +147,8 @@ impl AppState {
             node_type_priors_cache: RwLock::new(HashMap::new()),
             recent_handle_query_events: RwLock::new(HashMap::new()),
             recent_handle_query_order: RwLock::new(VecDeque::new()),
+            recent_expanded_handles: RwLock::new(HashSet::new()),
+            recent_expanded_order: RwLock::new(VecDeque::new()),
         }
     }
 
@@ -233,6 +238,14 @@ impl AppState {
             .await
             .retain(|(r, _), _| r != repo_id);
         self.recent_handle_query_order
+            .write()
+            .await
+            .retain(|(r, _)| r != repo_id);
+        self.recent_expanded_handles
+            .write()
+            .await
+            .retain(|(r, _)| r != repo_id);
+        self.recent_expanded_order
             .write()
             .await
             .retain(|(r, _)| r != repo_id);
@@ -358,6 +371,50 @@ impl AppState {
             let key = (repo_id.to_string(), handle_id.clone());
             if let Some(query_event_id) = map.get(&key).copied() {
                 out.insert(handle_id.clone(), query_event_id);
+            }
+        }
+        out
+    }
+
+    pub async fn remember_expanded_handles(&self, repo_id: &str, handle_ids: &[String]) {
+        if handle_ids.is_empty() {
+            return;
+        }
+
+        let mut handles = self.recent_expanded_handles.write().await;
+        let mut order = self.recent_expanded_order.write().await;
+
+        for handle_id in handle_ids {
+            let key = (repo_id.to_string(), handle_id.clone());
+            if handles.insert(key.clone()) {
+                order.push_back(key);
+            }
+        }
+
+        while handles.len() > RECENT_EXPANDED_HANDLE_CAP {
+            if let Some(oldest) = order.pop_front() {
+                handles.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub async fn recent_expanded_handle_ids(
+        &self,
+        repo_id: &str,
+        handle_ids: &[String],
+    ) -> HashSet<String> {
+        if handle_ids.is_empty() {
+            return HashSet::new();
+        }
+
+        let handles = self.recent_expanded_handles.read().await;
+        let mut out = HashSet::new();
+        for handle_id in handle_ids {
+            let key = (repo_id.to_string(), handle_id.clone());
+            if handles.contains(&key) {
+                out.insert(handle_id.clone());
             }
         }
         out

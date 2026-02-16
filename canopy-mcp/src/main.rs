@@ -302,6 +302,10 @@ impl McpServer {
                             "max_per_file": {
                                 "type": "integer",
                                 "description": "Maximum handles selected from a single file (default: 2)"
+                            },
+                            "plan": {
+                                "type": "boolean",
+                                "description": "Override server-side recursive evidence planning (default: auto: only when confidence is low)"
                             }
                         },
                         "required": []
@@ -486,10 +490,11 @@ impl McpServer {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or(2);
+        let plan = args.get("plan").and_then(|v| v.as_bool());
 
         let pack = self
             .runtime
-            .evidence_pack(&repo_root, input, max_handles, max_per_file)
+            .evidence_pack(&repo_root, input, max_handles, max_per_file, plan)
             .map_err(|e| (-32000, e.to_string()))?;
 
         Ok(json!({

@@ -595,7 +595,11 @@ fn build_evidence_guidance(
         confidence,
         confidence_band,
         stop_querying,
-        recommended_action: EvidenceAction::ExpandThenAnswer,
+        recommended_action: if stop_querying {
+            EvidenceAction::ExpandThenAnswer
+        } else {
+            EvidenceAction::RefineQuery
+        },
         suggested_expand_count,
         max_additional_queries,
         rationale,

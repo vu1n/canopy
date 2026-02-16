@@ -28,6 +28,8 @@ struct EvidencePackRequest {
     max_handles: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_per_file: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -252,6 +254,7 @@ impl ServiceClient {
         params: QueryParams,
         max_handles: Option<usize>,
         max_per_file: Option<usize>,
+        plan: Option<bool>,
     ) -> Result<EvidencePack, CanopyError> {
         let url = format!("{}/evidence_pack", self.base_url);
         let req = EvidencePackRequest {
@@ -259,6 +262,7 @@ impl ServiceClient {
             params,
             max_handles,
             max_per_file,
+            plan,
         };
         let resp =
             self.client

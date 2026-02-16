@@ -34,6 +34,12 @@ Key artifacts:
 - `canopy`: local canopy MCP (standalone mode)
 - `canopy-service`: canopy MCP backed by `canopy-service`
 
+## Methodology Notes
+
+- `canopy_evidence_pack` is the preferred discovery call in current prompts/instructions.
+- Service runs can show low `/query` usage while still being fully active through `/evidence_pack` + `/expand`.
+- Do not compare single runs in isolation. Run at least 3 repetitions and compare medians for latency/tokens.
+
 ## Metric Definitions
 
 ### Token Metrics
@@ -46,6 +52,10 @@ Key artifacts:
   - useful for total context-consumption analysis
 - Cache-read tokens:
   - tracked separately; high values can hide in reported-only views
+- Practical interpretation:
+  - lower reported tokens means lower direct model billing
+  - lower effective tokens means less total context churn in the loop
+  - both should be reviewed together
 
 ### Time and Cost
 
@@ -57,7 +67,7 @@ Key artifacts:
 
 - Compactions:
   - currently proxied as `num_turns >= MAX_TURNS`
-  - indicates turn-budget saturation and potential answer truncation risk
+  - indicates turn-budget saturation risk (not guaranteed answer failure by itself)
 
 ### Output Quality Heuristics
 
@@ -77,8 +87,27 @@ Strict heuristic section includes:
 Use both local and service counters:
 - Local query events / expand events from `.canopy/feedback.db`
 - Service `/query` and `/expand` call counts from `service-metrics.json`
+- Service stderr logs for `/evidence_pack` and `/expand` request activity
 
-If `canopy-service` shows `queries=0` and `expands=0`, the run did not exercise service retrieval even if service reindex happened.
+Notes:
+- `/evidence_pack` currently contributes to service query counters but also has dedicated log lines in run output.
+- In service mode, expand feedback is recorded server-side. Local feedback snapshots should not be treated as HTTP call counters.
+
+If `canopy-service` shows no `/evidence_pack`, `/query`, or `/expand` activity, the run did not exercise service retrieval even if service reindex happened.
+
+### Waste Indicators
+
+Inspect these together when tuning:
+- `handle_expand_accept_rate` (from feedback metrics)
+- `avg_tokens_per_expand` (from feedback metrics)
+- expands per task (`service-metrics.json` + local feedback snapshots)
+- effective tokens / reported tokens ratio
+
+Desired direction after retrieval tuning:
+- fewer expansions per task
+- smaller effective-token growth
+- stable or better grounding/structure quality
+- equal or lower wall-clock latency
 
 ## Reproducibility Protocol
 
@@ -88,7 +117,8 @@ If `canopy-service` shows `queries=0` and `expands=0`, the run did not exercise 
 3. Inspect both reported and effective token views.
 4. Check compactions and max-agent-time for worst-case behavior.
 5. Validate retrieval-path counters before interpreting canopy-service results.
-6. Prefer multiple runs and summarize medians, not single-run outliers.
+6. Validate `/evidence_pack` activity from logs when using current canopy-first prompts.
+7. Prefer multiple runs and summarize medians, not single-run outliers.
 
 ## Troubleshooting
 
