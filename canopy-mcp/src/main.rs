@@ -9,6 +9,9 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 
+const DEFAULT_MCP_QUERY_LIMIT: usize = 16;
+const DEFAULT_MCP_EXPAND_BUDGET: usize = 0;
+
 fn main() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -16,7 +19,8 @@ fn main() {
 
     // Parse --service-url from CLI args (falls back to CANOPY_SERVICE_URL env var)
     let service_url = parse_service_url();
-    let mut server = McpServer::with_service_url(service_url);
+    let default_repo_root = parse_root_path();
+    let mut server = McpServer::with_service_url(service_url, default_repo_root);
 
     for line in reader.lines() {
         let line = match line {
@@ -38,6 +42,7 @@ fn main() {
 
 struct McpServer {
     runtime: ClientRuntime,
+    default_repo_root: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -79,10 +84,27 @@ fn parse_service_url() -> Option<String> {
     std::env::var("CANOPY_SERVICE_URL").ok()
 }
 
+/// Parse --root from CLI args, falling back to CANOPY_ROOT env var
+fn parse_root_path() -> Option<PathBuf> {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--root" {
+            if let Some(path) = args.get(i + 1) {
+                return Some(PathBuf::from(path));
+            }
+        }
+        if let Some(val) = args[i].strip_prefix("--root=") {
+            return Some(PathBuf::from(val));
+        }
+    }
+    std::env::var("CANOPY_ROOT").ok().map(PathBuf::from)
+}
+
 impl McpServer {
-    fn with_service_url(service_url: Option<String>) -> Self {
+    fn with_service_url(service_url: Option<String>, default_repo_root: Option<PathBuf>) -> Self {
         Self {
             runtime: ClientRuntime::new(service_url.as_deref(), StandalonePolicy::Predictive),
+            default_repo_root,
         }
     }
 
@@ -153,25 +175,25 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path to index (e.g., '/path/to/repo')"
+                                "description": "Repository path to index (optional if --root or CANOPY_ROOT is set)"
                             },
                             "glob": {
                                 "type": "string",
                                 "description": "Glob pattern for files to index (e.g., '**/*.rs')"
                             }
                         },
-                        "required": ["path", "glob"]
+                        "required": ["glob"]
                     }
                 },
                 {
                     "name": "canopy_query",
-                    "description": "Query indexed content. Preferred: use individual params (pattern, symbol, section, glob). Fallback: use query param for s-expression DSL. Returns handles (or ref_handles when kind=reference) with optional auto-expansion.",
+                    "description": "Query indexed content. Use canopy tools as the primary code-search interface (instead of find/grep/rg) when available. Preferred: use individual params (pattern, symbol, section, glob). Fallback: use query param for s-expression DSL. Returns handles (or ref_handles when kind=reference) with optional auto-expansion.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path to query (e.g., '/path/to/repo')"
+                                "description": "Repository path to query (optional if --root or CANOPY_ROOT is set)"
                             },
                             "pattern": {
                                 "type": "string",
@@ -210,18 +232,79 @@ impl McpServer {
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": "Maximum number of results (default: 100)"
+                                "description": "Maximum number of results (default: 16)"
                             },
                             "expand_budget": {
                                 "type": "integer",
-                                "description": "Auto-expand results if total tokens fit within budget (default: 5000)"
+                                "description": "[Deprecated] Auto-expand results if total tokens fit within budget (default: 0, disabled)"
                             },
                             "query": {
                                 "type": "string",
                                 "description": "[Fallback] S-expression DSL query. Use params above instead. Examples: (grep \"TODO\"), (section \"auth\"), (in-file \"src/*.rs\" (grep \"error\"))"
                             }
                         },
-                        "required": ["path"]
+                        "required": []
+                    }
+                },
+                {
+                    "name": "canopy_evidence_pack",
+                    "description": "Build a compact, ranked evidence set for a task (no snippets). Preferred first step for discovery. Returns guidance.stop_querying/recommended_action/next_step so agents know when to stop querying and start writing.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Repository path to query (optional if --root or CANOPY_ROOT is set)"
+                            },
+                            "pattern": {
+                                "type": "string",
+                                "description": "Single text pattern to search (FTS5 search)"
+                            },
+                            "patterns": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Multiple text patterns to search"
+                            },
+                            "symbol": {
+                                "type": "string",
+                                "description": "Code symbol search (function, class, struct, method)"
+                            },
+                            "section": {
+                                "type": "string",
+                                "description": "Section heading search (markdown sections)"
+                            },
+                            "parent": {
+                                "type": "string",
+                                "description": "Filter by parent symbol (e.g., class name for methods)"
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["definition", "reference", "any"],
+                                "description": "Query kind: 'definition' for exact symbol match, 'reference' for usages, 'any' (default)"
+                            },
+                            "glob": {
+                                "type": "string",
+                                "description": "File glob filter (e.g., 'src/**/*.rs')"
+                            },
+                            "match": {
+                                "type": "string",
+                                "enum": ["any", "all"],
+                                "description": "Match mode for multi-pattern: 'any' (OR, default) or 'all' (AND)"
+                            },
+                            "query": {
+                                "type": "string",
+                                "description": "[Fallback] S-expression DSL query."
+                            },
+                            "max_handles": {
+                                "type": "integer",
+                                "description": "Maximum ranked handles in evidence pack (default: 8)"
+                            },
+                            "max_per_file": {
+                                "type": "integer",
+                                "description": "Maximum handles selected from a single file (default: 2)"
+                            }
+                        },
+                        "required": []
                     }
                 },
                 {
@@ -232,7 +315,7 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path (e.g., '/path/to/repo')"
+                                "description": "Repository path (optional if --root or CANOPY_ROOT is set)"
                             },
                             "handle_ids": {
                                 "type": "array",
@@ -240,7 +323,7 @@ impl McpServer {
                                 "description": "Handle IDs to expand (e.g., ['h1a2b3c4d5e6', 'h5d6e7f8a9b0'])"
                             }
                         },
-                        "required": ["path", "handle_ids"]
+                        "required": ["handle_ids"]
                     }
                 },
                 {
@@ -251,10 +334,10 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path (e.g., '/path/to/repo')"
+                                "description": "Repository path (optional if --root or CANOPY_ROOT is set)"
                             }
                         },
-                        "required": ["path"]
+                        "required": []
                     }
                 },
                 {
@@ -265,19 +348,19 @@ impl McpServer {
                         "properties": {
                             "path": {
                                 "type": "string",
-                                "description": "Repository path (e.g., '/path/to/repo')"
+                                "description": "Repository path (optional if --root or CANOPY_ROOT is set)"
                             },
                             "glob": {
                                 "type": "string",
                                 "description": "Glob pattern to invalidate (all files if omitted)"
                             }
                         },
-                        "required": ["path"]
+                        "required": []
                     }
                 },
                 {
                     "name": "canopy_agent_readme",
-                    "description": "Returns usage instructions for AI agents using canopy MCP tools. Call this if unfamiliar with canopy to learn the query workflow, available parameters, response formats, and best practices.",
+                    "description": "Returns optional usage instructions for canopy MCP tools.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {}
@@ -302,6 +385,7 @@ impl McpServer {
         match name {
             "canopy_index" => self.tool_index(&arguments),
             "canopy_query" => self.tool_query(&arguments),
+            "canopy_evidence_pack" => self.tool_evidence_pack(&arguments),
             "canopy_expand" => self.tool_expand(&arguments),
             "canopy_status" => self.tool_status(&arguments),
             "canopy_invalidate" => self.tool_invalidate(&arguments),
@@ -346,7 +430,7 @@ impl McpServer {
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(&result_json).unwrap()
+                "text": serde_json::to_string(&result_json).unwrap()
             }]
         }))
     }
@@ -374,7 +458,44 @@ impl McpServer {
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(&result).unwrap()
+                "text": serde_json::to_string(&result).unwrap()
+            }]
+        }))
+    }
+
+    fn tool_evidence_pack(&mut self, args: &Value) -> Result<Value, (i32, String)> {
+        let repo_root = self.get_repo_root(args)?;
+
+        // In standalone predictive mode, do predictive indexing before query.
+        if !self.runtime.is_service_mode() {
+            let query_text = extract_query_text(args);
+            let mut index = self.open_index_at(&repo_root)?;
+            self.runtime
+                .predictive_index_for_query(&repo_root, &mut index, &query_text)
+                .map_err(|e| (-32000, e.to_string()))?;
+        }
+
+        let input = build_query_input(args)?;
+        let max_handles = args
+            .get("max_handles")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(8);
+        let max_per_file = args
+            .get("max_per_file")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(2);
+
+        let pack = self
+            .runtime
+            .evidence_pack(&repo_root, input, max_handles, max_per_file)
+            .map_err(|e| (-32000, e.to_string()))?;
+
+        Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": serde_json::to_string(&pack).unwrap()
             }]
         }))
     }
@@ -456,7 +577,7 @@ impl McpServer {
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string_pretty(&result).unwrap()
+                "text": serde_json::to_string(&result).unwrap()
             }]
         }))
     }
@@ -498,10 +619,16 @@ impl McpServer {
 
     /// Get repo root from args (required parameter)
     fn get_repo_root(&self, args: &Value) -> Result<PathBuf, (i32, String)> {
-        args.get("path")
-            .and_then(|v| v.as_str())
-            .map(PathBuf::from)
-            .ok_or_else(|| (-32602, "Missing required 'path' parameter".to_string()))
+        if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+            return Ok(PathBuf::from(path));
+        }
+        if let Some(root) = &self.default_repo_root {
+            return Ok(root.clone());
+        }
+        Err((
+            -32602,
+            "Missing 'path' parameter and no default --root/CANOPY_ROOT configured".to_string(),
+        ))
     }
 }
 
@@ -512,7 +639,8 @@ fn build_query_input(args: &Value) -> Result<QueryInput, (i32, String)> {
         let limit = args
             .get("limit")
             .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
+            .map(|v| v as usize)
+            .or(Some(DEFAULT_MCP_QUERY_LIMIT));
         return Ok(QueryInput::Dsl(
             query_str.to_string(),
             canopy_core::QueryOptions {
@@ -569,16 +697,19 @@ fn build_query_input(args: &Value) -> Result<QueryInput, (i32, String)> {
         };
     }
 
-    if let Some(limit) = args.get("limit").and_then(|v| v.as_u64()) {
-        params.limit = Some(limit as usize);
-    }
+    params.limit = Some(
+        args.get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(DEFAULT_MCP_QUERY_LIMIT),
+    );
 
-    // Set expand_budget (default to 5000 if not specified)
+    // Set expand_budget (default disabled unless explicitly set)
     params.expand_budget = Some(
         args.get("expand_budget")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
-            .unwrap_or(5000),
+            .unwrap_or(DEFAULT_MCP_EXPAND_BUDGET),
     );
 
     // Validate that at least one search param is provided

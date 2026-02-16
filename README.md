@@ -240,8 +240,18 @@ canopy_query(patterns=["TODO", "FIXME"], match="any")
 | `section` | string | Markdown section heading |
 | `glob` | string | Filter by file glob |
 | `match` | `any` \| `all` | Multi-pattern mode |
-| `limit` | integer | Max results (default: 100) |
-| `expand_budget` | integer | Auto-expand if within budget (default: 5000) |
+| `limit` | integer | Max results (default: 16) |
+| `expand_budget` | integer | Deprecated auto-expand toggle (default: 0, disabled) |
+
+### `canopy_evidence_pack`
+Build a compact ranked evidence set (no snippets) to minimize context bloat before expanding.
+
+```text
+canopy_evidence_pack(pattern="authentication", max_handles=8, max_per_file=2)
+```
+
+Response includes `guidance.stop_querying`, `guidance.recommended_action`, and `guidance.next_step`
+so agents can transition from retrieval to synthesis without custom prompt rules.
 
 ### `canopy_expand`
 Expand handles to full content.
@@ -258,6 +268,9 @@ Force reindex of files.
 
 ### `canopy_agent_readme`
 Return usage guidance for agents/tool callers.
+
+This guidance is canopy-first: prefer canopy retrieval over ad-hoc `find`/`grep`/`rg`
+for discovery, then expand selectively for synthesis.
 
 ---
 
@@ -383,6 +396,8 @@ AGENTS=4 MAX_TURNS=5 INDEX_TIMEOUT=1200 \
 ```
 
 Detailed protocol, metric definitions, and troubleshooting live in `docs/benchmarking.md`.
+
+Design principles, anti-drift guardrails, and divergence logging live in `docs/design-anchors.md`.
 
 ---
 

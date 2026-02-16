@@ -4,6 +4,9 @@ use crate::document::NodeType;
 use crate::handle::Handle;
 use std::collections::HashMap;
 
+const NEARBY_LINE_GAP: usize = 2;
+const MAX_EXPANSIONS_PER_FILE: usize = 2;
+
 /// Scores handles for expansion relevance and cost-efficiency.
 pub struct HandleScorer {
     query_terms: Vec<String>,
@@ -90,16 +93,54 @@ pub fn select_for_expansion(
 
     let mut selected = Vec::new();
     let mut used_tokens = 0usize;
+    let mut file_expansion_counts: HashMap<&str, usize> = HashMap::new();
 
     for (idx, _score, handle_tokens) in ranked {
+        if is_near_duplicate_selection(idx, handles, &selected) {
+            continue;
+        }
+        let file_path = handles[idx].file_path.as_str();
+        if file_expansion_counts.get(file_path).copied().unwrap_or(0) >= MAX_EXPANSIONS_PER_FILE {
+            continue;
+        }
         if used_tokens + handle_tokens <= budget {
             selected.push(idx);
             used_tokens += handle_tokens;
+            *file_expansion_counts.entry(file_path).or_insert(0) += 1;
         }
     }
 
     selected.sort_unstable();
     selected
+}
+
+fn is_near_duplicate_selection(
+    candidate_idx: usize,
+    handles: &[Handle],
+    selected_indices: &[usize],
+) -> bool {
+    let candidate = &handles[candidate_idx];
+    let (candidate_start, candidate_end) = candidate.line_range;
+
+    selected_indices.iter().any(|selected_idx| {
+        let selected = &handles[*selected_idx];
+        if selected.file_path != candidate.file_path {
+            return false;
+        }
+
+        let (selected_start, selected_end) = selected.line_range;
+        if candidate_start <= selected_end && selected_start <= candidate_end {
+            return true;
+        }
+
+        if candidate_end < selected_start {
+            selected_start - candidate_end <= NEARBY_LINE_GAP
+        } else if selected_end < candidate_start {
+            candidate_start - selected_end <= NEARBY_LINE_GAP
+        } else {
+            false
+        }
+    })
 }
 
 fn split_terms(text: &str) -> Vec<String> {
@@ -158,6 +199,38 @@ mod tests {
         let selected = select_for_expansion(&handles, 200, &scorer);
         let used: usize = selected.iter().map(|i| handles[*i].token_count).sum();
         assert!(used <= 200);
+    }
+
+    #[test]
+    fn selection_skips_nearby_duplicate_ranges_in_same_file() {
+        let scorer = HandleScorer::new("auth");
+        let mut first = make_handle("src/auth/a.rs", "auth", NodeType::Function, 50);
+        first.line_range = (10, 12);
+        let mut nearby = make_handle("src/auth/a.rs", "auth", NodeType::Function, 50);
+        nearby.line_range = (13, 15);
+        let mut far = make_handle("src/auth/a.rs", "auth", NodeType::Function, 50);
+        far.line_range = (40, 45);
+
+        let handles = vec![first, nearby, far];
+        let selected = select_for_expansion(&handles, 200, &scorer);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn selection_limits_expansions_per_file() {
+        let scorer = HandleScorer::new("auth");
+        let handles = vec![
+            make_handle("src/auth/a.rs", "auth", NodeType::Function, 40),
+            make_handle("src/auth/a.rs", "auth", NodeType::Function, 40),
+            make_handle("src/auth/a.rs", "auth", NodeType::Function, 40),
+            make_handle("src/auth/b.rs", "auth", NodeType::Function, 40),
+        ];
+        let selected = select_for_expansion(&handles, 400, &scorer);
+        let selected_a: usize = selected
+            .iter()
+            .filter(|idx| handles[**idx].file_path == "src/auth/a.rs")
+            .count();
+        assert!(selected_a <= 2);
     }
 
     #[test]

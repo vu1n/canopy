@@ -8,9 +8,10 @@ use crate::predict::{extract_extensions_from_glob, predict_globs, predict_globs_
 use crate::service_client::{is_error_code, ReindexResponse, ServiceClient, ServiceStatus};
 use canopy_core::index::ExpandedHandleDetail;
 use canopy_core::{
+    build_evidence_pack,
     feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle},
-    HandleSource, IndexStats, NodeType, QueryOptions, QueryParams, QueryResult, RepoIndex,
-    RepoShard,
+    EvidencePack, HandleSource, IndexStats, MatchMode, NodeType, QueryOptions, QueryParams,
+    QueryResult, RepoIndex, RepoShard,
 };
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -157,6 +158,89 @@ impl ClientRuntime {
 
         self.record_feedback_for_query(repo_path, &query_text, &result);
         Ok(result)
+    }
+
+    /// Build a compact evidence pack for a task.
+    ///
+    /// Service mode with params uses server-side pack construction to reduce payload size.
+    pub fn evidence_pack(
+        &mut self,
+        repo_path: &Path,
+        input: QueryInput,
+        max_handles: usize,
+        max_per_file: usize,
+    ) -> canopy_core::Result<EvidencePack> {
+        let max_handles = max_handles.clamp(1, 64);
+        let max_per_file = max_per_file.clamp(1, 8);
+
+        if let Some(service) = self.service.as_mut() {
+            if let QueryInput::Params(params_in) = &input {
+                let mut params = params_in.clone();
+                params.expand_budget = Some(0);
+
+                let repo_id = service.resolve_repo_id(repo_path)?;
+                let active_repo_id = match service.ensure_ready(&repo_id, ENSURE_READY_TIMEOUT) {
+                    Ok(()) => repo_id,
+                    Err(e) if is_error_code(&e, "repo_not_found") => {
+                        let new_id = service.invalidate_and_resolve(repo_path)?;
+                        service.ensure_ready(&new_id, ENSURE_READY_TIMEOUT)?;
+                        new_id
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                let (pack, used_repo_id) = match service.evidence_pack(
+                    &active_repo_id,
+                    params.clone(),
+                    Some(max_handles),
+                    Some(max_per_file),
+                ) {
+                    Ok(pack) => (pack, active_repo_id.clone()),
+                    Err(e) if is_error_code(&e, "repo_not_found") => {
+                        let new_id = service.invalidate_and_resolve(repo_path)?;
+                        service.ensure_ready(&new_id, ENSURE_READY_TIMEOUT)?;
+                        let pack = service.evidence_pack(
+                            &new_id,
+                            params,
+                            Some(max_handles),
+                            Some(max_per_file),
+                        )?;
+                        (pack, new_id)
+                    }
+                    Err(e) => return Err(e),
+                };
+
+                self.record_provenance_for_evidence_pack(repo_path, &pack, Some(used_repo_id));
+                return Ok(pack);
+            }
+        }
+
+        let fallback_params = match &input {
+            QueryInput::Params(params) => Self::pattern_fallback_params(params),
+            QueryInput::Dsl(..) => None,
+        };
+        let query_text = Self::query_input_text(&input);
+        let result = self.query(repo_path, input)?;
+        let mut pack = build_evidence_pack(&result, &query_text, max_handles, max_per_file);
+        self.record_provenance_for_evidence_pack(repo_path, &pack, None);
+
+        if pack.selected_count == 0 {
+            if let Some(fallback) = fallback_params {
+                let fallback_text = Self::query_params_text(&fallback);
+                let fallback_result = self.query(repo_path, QueryInput::Params(fallback))?;
+                let fallback_pack = build_evidence_pack(
+                    &fallback_result,
+                    &fallback_text,
+                    max_handles,
+                    max_per_file,
+                );
+                if fallback_pack.selected_count > 0 {
+                    self.record_provenance_for_evidence_pack(repo_path, &fallback_pack, None);
+                    pack = fallback_pack;
+                }
+            }
+        }
+        Ok(pack)
     }
 
     /// Expand — pre-split by provenance, per-handle error tolerance.
@@ -402,6 +486,43 @@ impl ClientRuntime {
             parts.push(s.clone());
         }
         parts.join(" ")
+    }
+
+    fn split_terms(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for term in text
+            .to_lowercase()
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|s| !s.is_empty())
+        {
+            if seen.insert(term.to_string()) {
+                out.push(term.to_string());
+            }
+        }
+        out
+    }
+
+    fn pattern_fallback_params(params: &QueryParams) -> Option<QueryParams> {
+        if params.patterns.is_some()
+            || params.symbol.is_some()
+            || params.section.is_some()
+            || params.parent.is_some()
+        {
+            return None;
+        }
+
+        let pattern = params.pattern.as_ref()?;
+        let terms = Self::split_terms(pattern);
+        if terms.len() <= 1 {
+            return None;
+        }
+
+        let mut fallback = params.clone();
+        fallback.pattern = None;
+        fallback.patterns = Some(terms);
+        fallback.match_mode = MatchMode::Any;
+        Some(fallback)
     }
 
     fn feedback_store_for_repo(&mut self, repo_path: &Path) -> Option<&FeedbackStore> {
@@ -923,6 +1044,43 @@ impl ClientRuntime {
         }
     }
 
+    fn record_provenance_for_evidence_pack(
+        &mut self,
+        repo_path: &Path,
+        pack: &EvidencePack,
+        service_repo_id: Option<String>,
+    ) {
+        let canonical = canonical_path(repo_path);
+        for handle in &pack.handles {
+            let key = (canonical.clone(), handle.id.clone());
+            let repo_id = match handle.source {
+                HandleSource::Service => service_repo_id.clone(),
+                HandleSource::Local => None,
+            };
+            let prov = HandleProvenance {
+                source: handle.source.clone(),
+                generation: handle.generation,
+                repo_id,
+                file_path: handle.file_path.clone(),
+                node_type: handle.node_type,
+                token_count: handle.token_count,
+            };
+            if self.handle_provenance.contains_key(&key) {
+                self.handle_provenance.insert(key, prov);
+            } else {
+                self.handle_provenance.insert(key.clone(), prov);
+                self.provenance_order.push_back(key);
+            }
+        }
+        while self.handle_provenance.len() > PROVENANCE_CAP {
+            if let Some(oldest) = self.provenance_order.pop_front() {
+                self.handle_provenance.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
     fn invalidate_provenance_for_repo(&mut self, repo_id: &str) {
         // Remove all HashMap entries for this repo; stale VecDeque entries become tombstones
         self.handle_provenance
@@ -1029,6 +1187,7 @@ mod tests {
             expand_note: None,
             expanded_count: 0,
             expanded_tokens: 0,
+            expanded_handle_ids: vec![],
         };
         rt.record_provenance_for_result(path, &result, HandleSource::Local, None, None);
 

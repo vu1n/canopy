@@ -2,7 +2,7 @@
 
 use crate::document::NodeType;
 use crate::error::CanopyError;
-use crate::handle::{Handle, RefHandle};
+use crate::handle::{Handle, HandleSource, RefHandle};
 use crate::index::RepoIndex;
 use crate::parse::estimate_tokens;
 use crate::scoring::{select_for_expansion, HandleScorer};
@@ -299,6 +299,308 @@ pub struct QueryResult {
     /// Total token count of expanded handles
     #[serde(default, skip_serializing_if = "is_zero")]
     pub expanded_tokens: usize,
+    /// Handle IDs that already include `content` in this response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expanded_handle_ids: Vec<String>,
+}
+
+/// Compact evidence view derived from query results.
+///
+/// Intentionally excludes full snippets/content to keep context payloads small.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidencePack {
+    pub query_text: String,
+    pub total_matches: usize,
+    pub truncated: bool,
+    pub selected_count: usize,
+    pub selected_tokens: usize,
+    pub handles: Vec<EvidenceHandle>,
+    pub files: Vec<EvidenceFileSummary>,
+    /// Suggested first handles to expand for deeper context.
+    pub expand_suggestion: Vec<String>,
+    /// Action guidance so agents can stop exploring and start synthesis.
+    #[serde(default)]
+    pub guidance: EvidenceGuidance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceHandle {
+    pub id: String,
+    pub file_path: String,
+    pub node_type: NodeType,
+    pub line_range: (usize, usize),
+    pub token_count: usize,
+    pub source: HandleSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceFileSummary {
+    pub file_path: String,
+    pub handle_ids: Vec<String>,
+    pub total_tokens: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceAction {
+    RefineQuery,
+    ExpandThenAnswer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceConfidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceGuidance {
+    /// Heuristic confidence score in [0, 1].
+    pub confidence: f64,
+    pub confidence_band: EvidenceConfidence,
+    /// True when agents should stop issuing more queries for this task.
+    pub stop_querying: bool,
+    pub recommended_action: EvidenceAction,
+    /// Suggested number of handles to expand before writing final output.
+    pub suggested_expand_count: usize,
+    /// Additional evidence_pack calls recommended before synthesis.
+    pub max_additional_queries: usize,
+    /// Brief explanation for action selection.
+    pub rationale: String,
+    /// One-line instruction intended for direct agent consumption.
+    pub next_step: String,
+}
+
+impl Default for EvidenceGuidance {
+    fn default() -> Self {
+        Self {
+            confidence: 0.0,
+            confidence_band: EvidenceConfidence::Low,
+            stop_querying: false,
+            recommended_action: EvidenceAction::RefineQuery,
+            suggested_expand_count: 0,
+            max_additional_queries: 2,
+            rationale: "No evidence handles were selected for this query.".to_string(),
+            next_step:
+                "Refine the query with more specific symbols, paths, or terms before expanding."
+                    .to_string(),
+        }
+    }
+}
+
+/// Build a compact, ranked evidence pack from a query result.
+///
+/// This keeps model context small by returning metadata and handle IDs only.
+pub fn build_evidence_pack(
+    result: &QueryResult,
+    query_text: &str,
+    max_handles: usize,
+    max_per_file: usize,
+) -> EvidencePack {
+    if result.handles.is_empty() || max_handles == 0 || max_per_file == 0 {
+        let guidance = EvidenceGuidance::default();
+        return EvidencePack {
+            query_text: query_text.to_string(),
+            total_matches: result.total_matches,
+            truncated: result.truncated,
+            selected_count: 0,
+            selected_tokens: 0,
+            handles: Vec::new(),
+            files: Vec::new(),
+            expand_suggestion: Vec::new(),
+            guidance,
+        };
+    }
+
+    let scorer = HandleScorer::new(query_text);
+    let mut ranked: Vec<(usize, f64)> = result
+        .handles
+        .iter()
+        .enumerate()
+        .map(|(idx, h)| (idx, scorer.score(h)))
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.1.total_cmp(&a.1).then_with(|| {
+            result.handles[a.0]
+                .token_count
+                .cmp(&result.handles[b.0].token_count)
+        })
+    });
+
+    let mut file_counts: HashMap<&str, usize> = HashMap::new();
+    let mut selected: Vec<(usize, f64)> = Vec::new();
+    for (idx, score) in ranked {
+        if selected.len() >= max_handles {
+            break;
+        }
+        let file = result.handles[idx].file_path.as_str();
+        if file_counts.get(file).copied().unwrap_or(0) >= max_per_file {
+            continue;
+        }
+        selected.push((idx, score));
+        *file_counts.entry(file).or_insert(0) += 1;
+    }
+
+    let handles: Vec<EvidenceHandle> = selected
+        .iter()
+        .map(|(idx, score)| {
+            let h = &result.handles[*idx];
+            EvidenceHandle {
+                id: h.id.to_string(),
+                file_path: h.file_path.clone(),
+                node_type: h.node_type,
+                line_range: h.line_range,
+                token_count: h.token_count,
+                source: h.source.clone(),
+                commit_sha: h.commit_sha.clone(),
+                generation: h.generation,
+                score: *score,
+            }
+        })
+        .collect();
+
+    let selected_tokens = handles.iter().map(|h| h.token_count).sum();
+
+    let mut file_index: HashMap<String, usize> = HashMap::new();
+    let mut files: Vec<EvidenceFileSummary> = Vec::new();
+    for handle in &handles {
+        if let Some(idx) = file_index.get(&handle.file_path).copied() {
+            files[idx].handle_ids.push(handle.id.clone());
+            files[idx].total_tokens += handle.token_count;
+        } else {
+            let idx = files.len();
+            files.push(EvidenceFileSummary {
+                file_path: handle.file_path.clone(),
+                handle_ids: vec![handle.id.clone()],
+                total_tokens: handle.token_count,
+            });
+            file_index.insert(handle.file_path.clone(), idx);
+        }
+    }
+
+    let expand_suggestion = handles
+        .iter()
+        .take(6)
+        .map(|h| h.id.clone())
+        .collect::<Vec<_>>();
+    let guidance = build_evidence_guidance(
+        &selected,
+        handles.len(),
+        files.len(),
+        result.total_matches,
+        result.truncated,
+        max_handles.max(1),
+    );
+
+    EvidencePack {
+        query_text: query_text.to_string(),
+        total_matches: result.total_matches,
+        truncated: result.truncated,
+        selected_count: handles.len(),
+        selected_tokens,
+        handles,
+        files,
+        expand_suggestion,
+        guidance,
+    }
+}
+
+fn build_evidence_guidance(
+    selected: &[(usize, f64)],
+    selected_count: usize,
+    file_count: usize,
+    total_matches: usize,
+    truncated: bool,
+    max_handles: usize,
+) -> EvidenceGuidance {
+    if selected_count == 0 {
+        return EvidenceGuidance {
+            rationale: "No ranked evidence available for this query.".to_string(),
+            next_step:
+                "Refine query terms and rerun canopy_evidence_pack; do not expand empty handles."
+                    .to_string(),
+            ..Default::default()
+        };
+    }
+
+    let top_n = selected.len().min(3);
+    let avg_top_score = selected.iter().take(top_n).map(|(_, s)| *s).sum::<f64>() / top_n as f64;
+    let file_coverage = (file_count.min(3) as f64) / 3.0;
+    let fill_ratio = (selected_count as f64 / max_handles as f64).min(1.0);
+    let match_signal = if total_matches == 0 {
+        0.0
+    } else if total_matches < 3 {
+        0.4
+    } else {
+        1.0
+    };
+    let truncation_penalty = if truncated { 0.10 } else { 0.0 };
+    let confidence =
+        (0.55 * avg_top_score + 0.20 * file_coverage + 0.15 * fill_ratio + 0.10 * match_signal
+            - truncation_penalty)
+            .clamp(0.0, 1.0);
+
+    let confidence_band = if confidence < 0.35 {
+        EvidenceConfidence::Low
+    } else if confidence < 0.70 {
+        EvidenceConfidence::Medium
+    } else {
+        EvidenceConfidence::High
+    };
+
+    let stop_querying = confidence >= 0.55 || (selected_count >= 4 && file_count >= 2);
+    let suggested_expand_count = if confidence >= 0.75 {
+        selected_count.min(2)
+    } else if confidence >= 0.50 {
+        selected_count.min(3)
+    } else {
+        selected_count.min(4)
+    }
+    .max(1);
+
+    let (max_additional_queries, rationale, next_step) = if stop_querying {
+        (
+            0,
+            format!(
+                "Ranked evidence is sufficient ({} handles across {} files, {:.2} confidence).",
+                selected_count, file_count, confidence
+            ),
+            format!(
+                "Expand {} suggested handles, then write the final answer. Only re-query if expansions contradict the task.",
+                suggested_expand_count
+            ),
+        )
+    } else {
+        (
+            1,
+            format!(
+                "Evidence is partial ({} handles across {} files, {:.2} confidence).",
+                selected_count, file_count, confidence
+            ),
+            format!(
+                "Run at most one narrower canopy_evidence_pack query, then expand {} handles and write the answer.",
+                suggested_expand_count
+            ),
+        )
+    };
+
+    EvidenceGuidance {
+        confidence,
+        confidence_band,
+        stop_querying,
+        recommended_action: EvidenceAction::ExpandThenAnswer,
+        suggested_expand_count,
+        max_additional_queries,
+        rationale,
+        next_step,
+    }
 }
 
 /// Parse a query string into a Query AST
@@ -320,7 +622,7 @@ pub fn parse_query(input: &str) -> crate::Result<Query> {
 pub struct QueryOptions {
     /// Override default result limit
     pub limit: Option<usize>,
-    /// Auto-expand results if total tokens fit within budget (default: 5000)
+    /// Auto-expand results if total tokens fit within budget (default: disabled / 0)
     pub expand_budget: Option<usize>,
     /// Learned node type priors for scoring partial auto-expansion
     pub node_type_priors: Option<HashMap<NodeType, f64>>,
@@ -347,8 +649,8 @@ impl QueryOptions {
     }
 }
 
-/// Default expand budget when auto-expansion is enabled
-pub const DEFAULT_EXPAND_BUDGET: usize = 5000;
+/// Default expand budget for optional auto-expansion.
+pub const DEFAULT_EXPAND_BUDGET: usize = 0;
 
 /// Execute a query against the index
 pub fn execute_query(
@@ -394,10 +696,11 @@ pub fn execute_query_with_options(
             expand_note: None,
             expanded_count: 0,
             expanded_tokens: 0,
+            expanded_handle_ids: Vec::new(),
         });
     }
 
-    let handles = execute_query_internal(query, index, effective_limit * 2)?;
+    let handles = dedupe_handles(execute_query_internal(query, index, effective_limit * 2)?);
 
     let total_matches = handles.len();
     let truncated = handles.len() > effective_limit;
@@ -477,6 +780,8 @@ pub fn execute_query_with_options(
         (false, None)
     };
 
+    let expanded_handle_ids = expanded_handle_ids(&handles);
+
     Ok(QueryResult {
         handles,
         ref_handles: None,
@@ -487,7 +792,16 @@ pub fn execute_query_with_options(
         expand_note,
         expanded_count,
         expanded_tokens,
+        expanded_handle_ids,
     })
+}
+
+fn dedupe_handles(handles: Vec<Handle>) -> Vec<Handle> {
+    let mut seen = HashSet::new();
+    handles
+        .into_iter()
+        .filter(|h| seen.insert(h.id.to_string()))
+        .collect()
 }
 
 fn is_zero(v: &usize) -> bool {
@@ -502,6 +816,14 @@ fn expanded_stats(handles: &[Handle]) -> (usize, usize) {
         .map(|h| h.token_count)
         .sum();
     (expanded_count, expanded_tokens)
+}
+
+fn expanded_handle_ids(handles: &[Handle]) -> Vec<String> {
+    handles
+        .iter()
+        .filter(|h| h.content.is_some())
+        .map(|h| h.id.to_string())
+        .collect()
 }
 
 fn extract_query_terms(query: &Query) -> Vec<String> {
@@ -1067,6 +1389,84 @@ mod tests {
         assert!(
             matches!(err, CanopyError::QueryParse { message, .. } if message.contains("Empty patterns"))
         );
+    }
+
+    #[test]
+    fn test_evidence_pack_guidance_requests_refine_when_empty() {
+        let result = QueryResult {
+            handles: Vec::new(),
+            ref_handles: None,
+            total_tokens: 0,
+            truncated: false,
+            total_matches: 0,
+            auto_expanded: false,
+            expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
+            expanded_handle_ids: Vec::new(),
+        };
+
+        let pack = build_evidence_pack(&result, "auth middleware", 8, 2);
+        assert_eq!(
+            pack.guidance.recommended_action,
+            EvidenceAction::RefineQuery
+        );
+        assert!(!pack.guidance.stop_querying);
+        assert_eq!(pack.guidance.suggested_expand_count, 0);
+    }
+
+    #[test]
+    fn test_evidence_pack_guidance_stops_querying_when_signal_is_strong() {
+        let handles = vec![
+            Handle::new(
+                "src/auth/session.rs".to_string(),
+                NodeType::Function,
+                crate::Span { start: 0, end: 12 },
+                (10, 22),
+                80,
+                "authenticate_session user token".to_string(),
+            ),
+            Handle::new(
+                "src/auth/middleware.rs".to_string(),
+                NodeType::Function,
+                crate::Span { start: 30, end: 52 },
+                (40, 68),
+                90,
+                "auth middleware validate request".to_string(),
+            ),
+            Handle::new(
+                "src/http/router.rs".to_string(),
+                NodeType::Method,
+                crate::Span {
+                    start: 70,
+                    end: 104,
+                },
+                (120, 152),
+                95,
+                "register auth middleware chain".to_string(),
+            ),
+        ];
+        let result = QueryResult {
+            handles,
+            ref_handles: None,
+            total_tokens: 265,
+            truncated: false,
+            total_matches: 9,
+            auto_expanded: false,
+            expand_note: None,
+            expanded_count: 0,
+            expanded_tokens: 0,
+            expanded_handle_ids: Vec::new(),
+        };
+
+        let pack = build_evidence_pack(&result, "auth middleware", 8, 2);
+        assert_eq!(
+            pack.guidance.recommended_action,
+            EvidenceAction::ExpandThenAnswer
+        );
+        assert!(pack.guidance.stop_querying);
+        assert_eq!(pack.guidance.max_additional_queries, 0);
+        assert!(pack.guidance.confidence >= 0.55);
     }
 
     #[test]

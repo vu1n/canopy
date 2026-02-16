@@ -379,6 +379,7 @@ mod tests {
             expand_note: None,
             expanded_count: 0,
             expanded_tokens: 0,
+            expanded_handle_ids: Vec::new(),
         }
     }
 

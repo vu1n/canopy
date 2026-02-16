@@ -206,7 +206,7 @@ run_agent() {
   # Build effective prompt: canopy hint (if applicable) + task + output format
   local effective_task=""
   if [ "$mode" = "canopy" ] || [ "$mode" = "canopy-service" ]; then
-    effective_task="Use canopy tools to explore this codebase. Start with canopy_query to find relevant code, expand interesting handles with canopy_expand, then read specific files if needed for detail.
+    effective_task="Use canopy tools to explore this codebase. Start with canopy_evidence_pack to get compact ranked handles, then use canopy_expand only for the few handles needed to write the final answer.
 
 "
   fi

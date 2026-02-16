@@ -4,14 +4,19 @@ use axum::extract::State;
 use axum::Json;
 use canopy_core::feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle};
 use canopy_core::{
-    index::ExpandedHandleDetail, query::execute_query_with_options, Generation, HandleSource,
-    QueryParams, QueryResult, RepoIndex, RepoShard, ShardStatus,
+    build_evidence_pack, index::ExpandedHandleDetail, query::execute_query_with_options,
+    EvidencePack, Generation, Handle, HandleSource, MatchMode, NodeType, QueryKind, QueryParams,
+    QueryResult, RepoIndex, RepoShard, ShardStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
+
+const EVIDENCE_PLAN_MAX_STEPS: usize = 3;
+const EVIDENCE_PLAN_SYMBOLS_PER_STEP: usize = 2;
+const EVIDENCE_PLAN_MIN_NEW_HANDLES: usize = 2;
 
 fn timestamp() -> String {
     let now = std::time::SystemTime::now()
@@ -54,6 +59,125 @@ fn query_params_text(params: &QueryParams) -> String {
         parts.push(s.clone());
     }
     parts.join(" ")
+}
+
+fn split_terms(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for term in text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+    {
+        if seen.insert(term.to_string()) {
+            out.push(term.to_string());
+        }
+    }
+    out
+}
+
+fn pattern_fallback_params(params: &QueryParams) -> Option<QueryParams> {
+    if params.patterns.is_some()
+        || params.symbol.is_some()
+        || params.section.is_some()
+        || params.parent.is_some()
+    {
+        return None;
+    }
+
+    let pattern = params.pattern.as_ref()?;
+    let terms = split_terms(pattern);
+    if terms.len() <= 1 {
+        return None;
+    }
+
+    let mut fallback = params.clone();
+    fallback.pattern = None;
+    fallback.patterns = Some(terms);
+    fallback.match_mode = MatchMode::Any;
+    Some(fallback)
+}
+
+fn extract_symbol_candidates_from_handles(
+    handles: &[Handle],
+    query_text: &str,
+    limit: usize,
+) -> Vec<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the",
+        "and",
+        "for",
+        "with",
+        "from",
+        "this",
+        "that",
+        "auth",
+        "authentication",
+        "token",
+        "user",
+        "users",
+        "request",
+        "response",
+        "middleware",
+        "handler",
+        "function",
+        "class",
+        "method",
+        "const",
+        "let",
+        "return",
+        "true",
+        "false",
+        "null",
+        "undefined",
+    ];
+
+    let query_terms: HashSet<String> = split_terms(query_text).into_iter().collect();
+    let stop_words: HashSet<String> = STOP_WORDS.iter().map(|w| w.to_string()).collect();
+    let mut scores: HashMap<String, usize> = HashMap::new();
+
+    for handle in handles.iter().take(8) {
+        for token in handle
+            .preview
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|t| t.len() >= 4)
+        {
+            if token
+                .chars()
+                .next()
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let lower = token.to_lowercase();
+            if query_terms.contains(&lower) || stop_words.contains(&lower) {
+                continue;
+            }
+
+            // Prefer identifier-like tokens over plain words.
+            let mut weight = 1usize;
+            if token.chars().any(|c| c.is_uppercase()) {
+                weight += 2;
+            }
+            if token.contains('_') {
+                weight += 1;
+            }
+            *scores.entry(token.to_string()).or_insert(0) += weight;
+        }
+    }
+
+    let mut ranked: Vec<(String, usize)> = scores.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.0.len().cmp(&a.0.len())));
+    ranked.into_iter().take(limit).map(|(sym, _)| sym).collect()
+}
+
+fn symbol_followup_params(base: &QueryParams, symbol: String) -> QueryParams {
+    let mut params = QueryParams::symbol(symbol);
+    params.kind = QueryKind::Definition;
+    params.limit = Some(base.limit.unwrap_or(16).min(12));
+    params.glob = base.glob.clone();
+    params
 }
 
 fn try_record_feedback_query(
@@ -133,6 +257,70 @@ fn try_record_feedback_expand(
     }
 
     wrote_any
+}
+
+async fn query_with_cache(
+    state: &SharedState,
+    repo_id: &str,
+    repo_root: &str,
+    generation: u64,
+    commit_sha: &Option<String>,
+    params: &QueryParams,
+    node_type_priors: Option<HashMap<NodeType, f64>>,
+) -> Result<(QueryResult, bool), AppError> {
+    let cache_key = serde_json::to_string(params).map_err(AppError::internal)?;
+    if let Some(result) = state
+        .get_cached_query(repo_id, &cache_key, generation)
+        .await
+    {
+        state
+            .metrics
+            .query_cache_hits
+            .fetch_add(1, Ordering::Relaxed);
+        return Ok((result, true));
+    }
+
+    state
+        .metrics
+        .query_cache_misses
+        .fetch_add(1, Ordering::Relaxed);
+
+    let cached_index = state
+        .get_or_open_index(repo_id, repo_root, generation)
+        .await
+        .map_err(AppError::from)?;
+
+    let params = params.clone();
+    let commit_sha = commit_sha.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let index = cached_index.index.lock().map_err(|err| {
+            canopy_core::CanopyError::Io(std::io::Error::other(format!(
+                "Index mutex poisoned: {err}"
+            )))
+        })?;
+        let query = params.to_query()?;
+        let mut options = params.to_options();
+        if options.node_type_priors.is_none() {
+            options.node_type_priors = node_type_priors;
+        }
+        let mut result = execute_query_with_options(&query, &index, options)?;
+        for handle in &mut result.handles {
+            handle.source = HandleSource::Service;
+            handle.commit_sha = commit_sha.clone();
+            handle.generation = Some(generation);
+        }
+        Ok::<_, canopy_core::CanopyError>(result)
+    })
+    .await
+    .map_err(AppError::internal)??;
+
+    if !result.auto_expanded {
+        state
+            .insert_cached_query(repo_id, cache_key, result.clone(), generation)
+            .await;
+    }
+
+    Ok((result, false))
 }
 
 // POST /query
@@ -281,6 +469,189 @@ pub async fn query(
     );
 
     Ok(Json(result))
+}
+
+// POST /evidence_pack
+#[derive(Deserialize)]
+pub struct EvidencePackRequest {
+    pub repo: String,
+    #[serde(flatten)]
+    pub params: QueryParams,
+    #[serde(default)]
+    pub max_handles: Option<usize>,
+    #[serde(default)]
+    pub max_per_file: Option<usize>,
+}
+
+pub async fn evidence_pack(
+    State(state): State<SharedState>,
+    Json(req): Json<EvidencePackRequest>,
+) -> Result<Json<EvidencePack>, AppError> {
+    let start = Instant::now();
+    let repo_label = req.repo.clone();
+
+    let shards = state.shards.read().await;
+    let shard = shards.get(&req.repo).ok_or_else(AppError::repo_not_found)?;
+
+    if shard.status != ShardStatus::Ready {
+        return Err(AppError::internal(format!(
+            "Repo {} is not ready (status: {:?})",
+            req.repo, shard.status
+        )));
+    }
+
+    let repo_id = shard.repo_id.clone();
+    let repo_root = shard.repo_root.clone();
+    let commit_sha = shard.commit_sha.clone();
+    let generation = shard.generation.value();
+    drop(shards);
+
+    let params = req.params;
+    // Deprecated in higher-level workflows: evidence pack is pointer-first.
+    let mut seed_params = params.clone();
+    seed_params.expand_budget = Some(0);
+    let query_text = query_params_text(&seed_params);
+    let max_handles = req.max_handles.unwrap_or(8).clamp(1, 64);
+    let max_per_file = req.max_per_file.unwrap_or(2).clamp(1, 8);
+
+    let feedback_store = state.feedback_store_for_repo(&repo_id, &repo_root).await;
+    let node_type_priors = state.load_node_type_priors(&repo_id, &repo_root).await;
+
+    state.metrics.query_count.fetch_add(1, Ordering::Relaxed);
+    let mut pending: VecDeque<QueryParams> = VecDeque::from([seed_params.clone()]);
+    let mut seen_param_keys: HashSet<String> = HashSet::new();
+    let mut seen_handle_ids: HashSet<String> = HashSet::new();
+    let mut aggregate_handles: Vec<Handle> = Vec::new();
+    let mut aggregate_tokens = 0usize;
+    let mut aggregate_truncated = false;
+    let mut total_matches = 0usize;
+    let mut cache_hits = 0usize;
+    let mut cache_misses = 0usize;
+    let mut plan_steps = 0usize;
+
+    while let Some(current_params) = pending.pop_front() {
+        if plan_steps >= EVIDENCE_PLAN_MAX_STEPS {
+            break;
+        }
+        let key = serde_json::to_string(&current_params).map_err(AppError::internal)?;
+        if !seen_param_keys.insert(key) {
+            continue;
+        }
+        plan_steps += 1;
+
+        let (result, was_hit) = query_with_cache(
+            &state,
+            &repo_id,
+            &repo_root,
+            generation,
+            &commit_sha,
+            &current_params,
+            node_type_priors.clone(),
+        )
+        .await?;
+        if was_hit {
+            cache_hits += 1;
+        } else {
+            cache_misses += 1;
+        }
+
+        total_matches += result.total_matches;
+        aggregate_truncated |= result.truncated;
+
+        let mut new_handle_count = 0usize;
+        for handle in result.handles {
+            if seen_handle_ids.insert(handle.id.to_string()) {
+                aggregate_tokens += handle.token_count;
+                aggregate_handles.push(handle);
+                new_handle_count += 1;
+            }
+        }
+
+        if new_handle_count < EVIDENCE_PLAN_MIN_NEW_HANDLES {
+            continue;
+        }
+
+        if let Some(fallback) = pattern_fallback_params(&current_params) {
+            let fallback_key = serde_json::to_string(&fallback).map_err(AppError::internal)?;
+            if !seen_param_keys.contains(&fallback_key) {
+                pending.push_back(fallback);
+            }
+        }
+
+        let symbol_candidates = extract_symbol_candidates_from_handles(
+            &aggregate_handles,
+            &query_text,
+            EVIDENCE_PLAN_SYMBOLS_PER_STEP,
+        );
+        for symbol in symbol_candidates {
+            let followup = symbol_followup_params(&seed_params, symbol);
+            let followup_key = serde_json::to_string(&followup).map_err(AppError::internal)?;
+            if !seen_param_keys.contains(&followup_key) {
+                pending.push_back(followup);
+            }
+        }
+    }
+
+    let expanded_handle_ids: Vec<String> = aggregate_handles
+        .iter()
+        .filter(|h| h.content.is_some())
+        .map(|h| h.id.to_string())
+        .collect();
+    let expanded_count = expanded_handle_ids.len();
+    let expanded_tokens: usize = aggregate_handles
+        .iter()
+        .filter(|h| h.content.is_some())
+        .map(|h| h.token_count)
+        .sum();
+    let auto_expanded = !aggregate_handles.is_empty() && expanded_count == aggregate_handles.len();
+    let result = QueryResult {
+        handles: aggregate_handles,
+        ref_handles: None,
+        total_tokens: aggregate_tokens,
+        truncated: aggregate_truncated,
+        total_matches,
+        auto_expanded,
+        expand_note: None,
+        expanded_count,
+        expanded_tokens,
+        expanded_handle_ids,
+    };
+
+    if let Some(query_event_id) =
+        try_record_feedback_query(feedback_store.as_ref(), &seed_params, &result)
+    {
+        let handle_ids: Vec<String> = result.handles.iter().map(|h| h.id.to_string()).collect();
+        state
+            .remember_query_event_for_handles(&repo_id, &handle_ids, query_event_id)
+            .await;
+        state.invalidate_node_type_priors_cache(&repo_id).await;
+    }
+
+    let pack = build_evidence_pack(&result, &query_text, max_handles, max_per_file);
+
+    let duration_ms = start.elapsed().as_millis();
+    state
+        .metrics
+        .total_query_ms
+        .fetch_add(duration_ms as u64, Ordering::Relaxed);
+    let cache_state = if cache_hits > 0 && cache_misses > 0 {
+        "mixed"
+    } else if cache_hits > 0 {
+        "hit"
+    } else {
+        "miss"
+    };
+    eprintln!(
+        "[{}] POST /evidence_pack repo={} duration_ms={} cache={} steps={} selected={}",
+        timestamp(),
+        repo_label,
+        duration_ms,
+        cache_state,
+        plan_steps,
+        pack.selected_count
+    );
+
+    Ok(Json(pack))
 }
 
 // POST /expand

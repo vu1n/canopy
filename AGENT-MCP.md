@@ -7,6 +7,14 @@ Canopy provides token-efficient codebase indexing. You query, get lightweight ha
 
 **Core invariant: Handles are cheap (~25 tokens). Expansion costs tokens. Query first, expand selectively.**
 
+## Canopy-First Policy
+
+For codebase discovery, use canopy tools as the default retrieval interface.
+
+- Use `canopy_evidence_pack` / `canopy_query` instead of shell search (`find`, `grep`, `rg`) for locating files, symbols, and callsites.
+- Use `canopy_expand` for targeted content retrieval after ranking.
+- Only fall back to non-canopy search if canopy returns no relevant evidence after one refinement pass (`guidance.recommended_action="refine_query"` and still low signal).
+
 ## Mental Model
 
 ```
@@ -14,7 +22,7 @@ QUERY  →  handles with previews (~100 bytes each)  →  EXPAND selected handle
 ```
 
 - Indexing is automatic. On first query, canopy indexes relevant files. For repos >1000 files, it uses predictive lazy indexing — extracting keywords from your query to index only relevant directories.
-- `expand_budget` defaults to 5000 tokens. If total results fit within budget, handles come with `content` already populated (check `auto_expanded: true`). If exceeded, you get previews only plus an `expand_note`.
+- `expand_budget` is deprecated for primary workflows. Prefer `canopy_evidence_pack` + selective `canopy_expand`.
 - Handle IDs are stable hashes (`h` + 24 hex chars). They survive reindexing if content location is unchanged.
 
 ## Tools
@@ -34,8 +42,8 @@ Search indexed content. Returns handles with previews and token counts.
 | `kind` | `"definition"` \| `"reference"` \| `"any"` | no | `"any"` | Filter result type |
 | `glob` | string | no | — | File path filter (e.g., `"src/**/*.ts"`) |
 | `match` | `"any"` \| `"all"` | no | `"any"` | Multi-pattern mode: OR vs AND |
-| `limit` | integer | no | 100 | Max results |
-| `expand_budget` | integer | no | 5000 | Auto-expand if total tokens fit within budget |
+| `limit` | integer | no | 16 | Max results |
+| `expand_budget` | integer | no | 0 | Deprecated: auto-expand toggle |
 | `query` | string | no | — | S-expression DSL (fallback, see below) |
 
 **Validation**: Must provide at least one of: `pattern`, `patterns`, `symbol`, `section`, `parent`, or `query`.
@@ -72,15 +80,39 @@ Search indexed content. Returns handles with previews and token counts.
   "total_matches": 5,
   "truncated": false,
   "auto_expanded": true,
-  "expand_note": "Results exceed expand_budget (5000 tokens). Expand specific handles."
+  "expand_note": "Results exceed expand_budget. Expand specific handles."
 }
 ```
 
 Notes:
 - `ref_handles` only present when `kind="reference"`
-- `content` on handles only present when `auto_expanded=true`
+- `content` may be present whenever `expanded_count > 0` (including partial auto-expansion)
+- `expanded_handle_ids` lists which handles already include `content`; do not re-expand those IDs
 - `expand_note` only present when budget exceeded
 - `auto_expanded` omitted (false) when not auto-expanded
+
+### canopy_evidence_pack
+
+Build compact, ranked evidence without snippets or full content.
+
+| Parameter | Type | Required | Default | Description |
+|-----------|------|----------|---------|-------------|
+| `path` | string | yes | — | Absolute path to repo root |
+| Same search params as `canopy_query` | — | — | — | `pattern`, `patterns`, `symbol`, `section`, `parent`, `kind`, `glob`, `match`, `query` |
+| `max_handles` | integer | no | 8 | Max ranked handles in pack |
+| `max_per_file` | integer | no | 2 | Max selected handles per file |
+
+Response includes:
+- `handles` with id/path/line-range/token-count/score (no snippets)
+- `files` grouped by file path
+- `expand_suggestion` with best handles to expand first
+- `guidance` with explicit control signals:
+  - `stop_querying` (bool): whether to stop retrieval loops
+  - `recommended_action`: `refine_query` or `expand_then_answer`
+  - `suggested_expand_count`: how many handles to expand before synthesis
+  - `max_additional_queries`: retrieval budget before writing
+  - `confidence` and `confidence_band`: heuristic trust for current pack
+  - `next_step`: direct one-line instruction for the agent
 
 ### canopy_expand
 
@@ -197,7 +229,7 @@ Query a repo. Same QueryParams as MCP, flattened into request body with `repo` f
   "kind": "definition",
   "glob": "src/**/*.ts",
   "limit": 20,
-  "expand_budget": 5000
+  "expand_budget": 1200
 }
 ```
 
@@ -314,17 +346,21 @@ GOAL: Search markdown documentation headings
 canopy_status(path)  →  understand what's indexed, repo size
 ```
 
-**Phase 2 — Discover** (1-2 calls):
+**Phase 2 — Discover** (1 call):
 ```
-canopy_query(path, pattern="<domain concept>", limit=20)
+canopy_evidence_pack(path, pattern="<domain concept>", max_handles=8, max_per_file=2)
 ```
-Read the previews. Identify relevant handles by file path and preview content.
+Identify relevant handles by file path, line range, and score.
+
+Decision gate from response guidance:
+- If `guidance.stop_querying=true` and `guidance.recommended_action="expand_then_answer"`, proceed to Phase 3 immediately.
+- If `guidance.recommended_action="refine_query"`, run one narrower follow-up query (more specific symbol/glob/terms), then proceed to Phase 3.
 
 **Phase 3 — Expand** (1 call):
 ```
 canopy_expand(path, handle_ids=[...only the relevant ones...])
 ```
-If `auto_expanded` was true in Phase 2, skip this — content is already in the handles.
+Expand only the minimal handles needed for final synthesis.
 
 **Phase 4 — Trace** (as needed):
 ```
@@ -332,15 +368,26 @@ canopy_query(path, symbol="<name from Phase 3>", kind="reference")  →  find ca
 canopy_query(path, parent="<class name>")  →  explore class hierarchy
 ```
 
+## Stop Rule (Novelty + Guidance)
+
+Do not rely on fixed turn counts. Stop retrieval when marginal evidence gain is low.
+
+1. Start with `canopy_evidence_pack`.
+2. Follow `guidance`:
+   - `expand_then_answer` + `stop_querying=true`: expand suggested handles and write.
+   - `refine_query`: run one narrower evidence query.
+3. After each additional evidence query, compare with prior pack:
+   - If new handles are mostly repeats or from the same files, stop querying.
+   - If no meaningful new symbols/files appear, stop querying.
+4. Expand only `guidance.suggested_expand_count` handles first; expand more only if contradictions remain.
+
 ## Token Budget Management
 
 | Scenario | Strategy |
 |----------|----------|
-| Small result set (<5000 tokens) | Auto-expanded. `content` field populated. No expand call needed. |
-| Large result set (>5000 tokens) | `expand_note` present. Read previews, expand top 3-5 handles selectively. |
-| Exploratory broad search | Use default `expand_budget=5000`. Good balance. |
-| Known target, want full content | Set `expand_budget=20000` or higher. |
-| Preview-only scan | Set `expand_budget=0`. Forces handles-only response. |
+| Exploratory broad search | Use `canopy_evidence_pack` first, then expand selectively. |
+| Known target, want full content | Expand only top suggested handles first, then iterate. |
+| Preview-only scan | Stay on `canopy_evidence_pack` without expand calls. |
 | Result count too high | `truncated=true`. Narrow query with `glob`, more specific `pattern`, or lower `limit`. |
 
 ## S-Expression DSL
@@ -399,8 +446,8 @@ Example: `canopy_query(path, query='(in-file "src/**/*.rs" (intersect (grep "aut
 
 1. **Expanding all handles blindly.** Check `auto_expanded` first. If false, read previews and expand only relevant handles.
 2. **Manually indexing large repos.** Predictive indexing handles this automatically. Calling `canopy_index` on a 10k-file repo with `**/*` wastes time.
-3. **Using canopy for known file paths.** If you know the exact file, read it directly. Canopy adds overhead for single known files.
+3. **Using shell `find`/`grep`/`rg` as first-line discovery when canopy is available.** This bypasses ranking and drives context bloat. Start with canopy retrieval.
 4. **Ignoring `truncated`.** If true, you're missing results. Narrow your query or increase `limit`.
-5. **Re-querying when `auto_expanded=true`.** The `content` field is already populated. Calling expand is redundant.
+5. **Re-expanding handles that already include `content`.** Check `expanded_handle_ids` first; expanding those again is redundant.
 6. **Using DSL for simple queries.** The params API (`pattern`, `symbol`, etc.) is cleaner. Reserve DSL for `union`, `intersect`, and `in-file` compositions.
-7. **Setting `expand_budget` very high for broad queries.** Start with default 5000. Large budgets on broad queries waste context window.
+7. **Relying on broad auto-expand.** Use evidence packs and explicit expands to avoid context bloat.

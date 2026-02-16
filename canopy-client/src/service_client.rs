@@ -1,6 +1,6 @@
 //! HTTP client for canopy-service
 
-use canopy_core::{CanopyError, QueryParams, QueryResult, RepoShard, ShardStatus};
+use canopy_core::{CanopyError, EvidencePack, QueryParams, QueryResult, RepoShard, ShardStatus};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -17,6 +17,17 @@ struct QueryRequest {
     repo: String,
     #[serde(flatten)]
     params: QueryParams,
+}
+
+#[derive(Serialize)]
+struct EvidencePackRequest {
+    repo: String,
+    #[serde(flatten)]
+    params: QueryParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_handles: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_per_file: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -227,6 +238,44 @@ impl ServiceClient {
         }
 
         resp.json::<QueryResult>()
+            .map_err(|e| CanopyError::ServiceError {
+                code: "parse_error".to_string(),
+                message: e.to_string(),
+                hint: "Unexpected response from service".to_string(),
+            })
+    }
+
+    /// Build an evidence pack server-side.
+    pub fn evidence_pack(
+        &self,
+        repo_id: &str,
+        params: QueryParams,
+        max_handles: Option<usize>,
+        max_per_file: Option<usize>,
+    ) -> Result<EvidencePack, CanopyError> {
+        let url = format!("{}/evidence_pack", self.base_url);
+        let req = EvidencePackRequest {
+            repo: repo_id.to_string(),
+            params,
+            max_handles,
+            max_per_file,
+        };
+        let resp =
+            self.client
+                .post(&url)
+                .json(&req)
+                .send()
+                .map_err(|e| CanopyError::ServiceError {
+                    code: "connection_error".to_string(),
+                    message: e.to_string(),
+                    hint: "Is canopy-service running?".to_string(),
+                })?;
+
+        if !resp.status().is_success() {
+            return self.handle_error(resp);
+        }
+
+        resp.json::<EvidencePack>()
             .map_err(|e| CanopyError::ServiceError {
                 code: "parse_error".to_string(),
                 message: e.to_string(),

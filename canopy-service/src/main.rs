@@ -25,6 +25,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/query", post(routes::query))
+        .route("/evidence_pack", post(routes::evidence_pack))
         .route("/expand", post(routes::expand))
         .route("/repos/add", post(routes::add_repo))
         .route("/repos", get(routes::list_repos))
