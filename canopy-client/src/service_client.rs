@@ -8,6 +8,8 @@ use std::path::Path;
 pub struct ServiceClient {
     base_url: String,
     client: reqwest::blocking::Client,
+    /// API key for admin routes (sent as X-Api-Key header)
+    api_key: Option<String>,
     /// Cache: canonical path → repo_id
     repo_id_cache: HashMap<String, String>,
 }
@@ -84,12 +86,7 @@ pub struct ReindexResponse {
     pub commit_sha: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct ErrorEnvelope {
-    code: String,
-    message: String,
-    hint: String,
-}
+use canopy_core::ErrorEnvelope;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServiceStatus {
@@ -98,10 +95,11 @@ pub struct ServiceStatus {
 }
 
 impl ServiceClient {
-    pub fn new(base_url: &str) -> Self {
+    pub fn new(base_url: &str, api_key: Option<String>) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             client: reqwest::blocking::Client::new(),
+            api_key,
             repo_id_cache: HashMap::new(),
         }
     }
@@ -147,16 +145,13 @@ impl ServiceClient {
             path: canonical_path.to_string(),
             name: None,
         };
-        let resp =
-            self.client
-                .post(&url)
-                .json(&req)
-                .send()
-                .map_err(|e| CanopyError::ServiceError {
-                    code: "connection_error".to_string(),
-                    message: e.to_string(),
-                    hint: "Is canopy-service running?".to_string(),
-                })?;
+        let mut builder = self.client.post(&url).json(&req);
+        builder = self.apply_api_key(builder);
+        let resp = builder.send().map_err(|e| CanopyError::ServiceError {
+            code: "connection_error".to_string(),
+            message: e.to_string(),
+            hint: "Is canopy-service running?".to_string(),
+        })?;
 
         if !resp.status().is_success() {
             return self.handle_error(resp);
@@ -334,49 +329,11 @@ impl ServiceClient {
     }
 
     pub fn list_repos(&self) -> Result<Vec<RepoShard>, CanopyError> {
-        let url = format!("{}/repos", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| CanopyError::ServiceError {
-                code: "connection_error".to_string(),
-                message: e.to_string(),
-                hint: "Is canopy-service running?".to_string(),
-            })?;
-
-        if !resp.status().is_success() {
-            return self.handle_error(resp);
-        }
-
-        resp.json().map_err(|e| CanopyError::ServiceError {
-            code: "parse_error".to_string(),
-            message: e.to_string(),
-            hint: "Unexpected response from service".to_string(),
-        })
+        self.get_json("/repos")
     }
 
     pub fn status(&self) -> Result<ServiceStatus, CanopyError> {
-        let url = format!("{}/status", self.base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .map_err(|e| CanopyError::ServiceError {
-                code: "connection_error".to_string(),
-                message: e.to_string(),
-                hint: "Is canopy-service running?".to_string(),
-            })?;
-
-        if !resp.status().is_success() {
-            return self.handle_error(resp);
-        }
-
-        resp.json().map_err(|e| CanopyError::ServiceError {
-            code: "parse_error".to_string(),
-            message: e.to_string(),
-            hint: "Unexpected response from service".to_string(),
-        })
+        self.get_json("/status")
     }
 
     pub fn reindex(
@@ -389,16 +346,13 @@ impl ServiceClient {
             repo: repo_id.to_string(),
             glob,
         };
-        let resp =
-            self.client
-                .post(&url)
-                .json(&req)
-                .send()
-                .map_err(|e| CanopyError::ServiceError {
-                    code: "connection_error".to_string(),
-                    message: e.to_string(),
-                    hint: "Is canopy-service running?".to_string(),
-                })?;
+        let mut builder = self.client.post(&url).json(&req);
+        builder = self.apply_api_key(builder);
+        let resp = builder.send().map_err(|e| CanopyError::ServiceError {
+            code: "connection_error".to_string(),
+            message: e.to_string(),
+            hint: "Is canopy-service running?".to_string(),
+        })?;
 
         if !resp.status().is_success() {
             return self.handle_error(resp);
@@ -409,6 +363,42 @@ impl ServiceClient {
             message: e.to_string(),
             hint: "Unexpected response from service".to_string(),
         })
+    }
+
+    /// Generic GET + JSON deserialize for simple read endpoints.
+    fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T, CanopyError> {
+        let url = format!("{}{}", self.base_url, path);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .map_err(|e| CanopyError::ServiceError {
+                code: "connection_error".to_string(),
+                message: e.to_string(),
+                hint: "Is canopy-service running?".to_string(),
+            })?;
+
+        if !resp.status().is_success() {
+            return self.handle_error(resp);
+        }
+
+        resp.json().map_err(|e| CanopyError::ServiceError {
+            code: "parse_error".to_string(),
+            message: e.to_string(),
+            hint: "Unexpected response from service".to_string(),
+        })
+    }
+
+    /// Attach X-Api-Key header to a request if an API key is configured.
+    fn apply_api_key(
+        &self,
+        builder: reqwest::blocking::RequestBuilder,
+    ) -> reqwest::blocking::RequestBuilder {
+        if let Some(ref key) = self.api_key {
+            builder.header("x-api-key", key)
+        } else {
+            builder
+        }
     }
 
     fn handle_error<T>(&self, resp: reqwest::blocking::Response) -> Result<T, CanopyError> {

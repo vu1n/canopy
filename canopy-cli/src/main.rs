@@ -1,6 +1,6 @@
 //! Canopy CLI - Command-line interface for token-efficient codebase queries
 
-use canopy_client::{ClientRuntime, IndexResult, QueryInput, StandalonePolicy};
+use canopy_client::{ClientRuntime, IndexResult, QueryInput};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -19,6 +19,10 @@ struct Cli {
     #[arg(long, global = true, env = "CANOPY_SERVICE_URL")]
     service_url: Option<String>,
 
+    /// API key for service admin routes (also reads CANOPY_API_KEY env var)
+    #[arg(long, global = true, env = "CANOPY_API_KEY")]
+    api_key: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -36,36 +40,8 @@ enum Commands {
 
     /// Run query and show handles
     Query {
-        /// Query in s-expression format (e.g., "(grep 'error')")
-        query: Option<String>,
-
-        /// Text pattern to search (alternative to positional query arg)
-        #[arg(short, long)]
-        pattern: Option<String>,
-
-        /// Search for code symbol (function, class, struct)
-        #[arg(short, long)]
-        symbol: Option<String>,
-
-        /// Filter by parent symbol (e.g., class name for methods)
-        #[arg(long)]
-        parent: Option<String>,
-
-        /// Query kind: definition, reference, or any (default)
-        #[arg(short, long, value_parser = ["definition", "reference", "any"])]
-        kind: Option<String>,
-
-        /// Filter by file glob pattern
-        #[arg(short, long)]
-        glob: Option<String>,
-
-        /// Auto-expand if total tokens fit within budget (default: 5000 when specified without value)
-        #[arg(long, num_args = 0..=1, default_missing_value = "5000")]
-        expand_budget: Option<usize>,
-
-        /// Override default result limit
-        #[arg(long)]
-        limit: Option<usize>,
+        #[command(flatten)]
+        args: QueryArgs,
     },
 
     /// Expand handles to content
@@ -106,44 +82,88 @@ enum Commands {
     },
 }
 
+#[derive(clap::Args)]
+struct QueryArgs {
+    /// Query in s-expression format (e.g., "(grep 'error')")
+    query: Option<String>,
+
+    /// Text pattern to search (alternative to positional query arg)
+    #[arg(short, long)]
+    pattern: Option<String>,
+
+    /// Multiple text patterns (use with --match to control AND/OR)
+    #[arg(long, num_args = 1..)]
+    patterns: Option<Vec<String>>,
+
+    /// Search for code symbol (function, class, struct)
+    #[arg(short, long)]
+    symbol: Option<String>,
+
+    /// Search by markdown section heading
+    #[arg(long)]
+    section: Option<String>,
+
+    /// Filter by parent symbol (e.g., class name for methods)
+    #[arg(long)]
+    parent: Option<String>,
+
+    /// Query kind: definition, reference, or any (default)
+    #[arg(short, long, value_parser = ["definition", "reference", "any"])]
+    kind: Option<String>,
+
+    /// Filter by file glob pattern
+    #[arg(short, long)]
+    glob: Option<String>,
+
+    /// Multi-pattern match mode: any (default) or all
+    #[arg(long, value_name = "MODE", value_parser = ["any", "all"])]
+    r#match: Option<String>,
+
+    /// Auto-expand if total tokens fit within budget (default: 5000 when specified without value)
+    #[arg(long, num_args = 0..=1, default_missing_value = "5000")]
+    expand_budget: Option<usize>,
+
+    /// Override default result limit
+    #[arg(long)]
+    limit: Option<usize>,
+}
+
 fn main() {
     let cli = Cli::parse();
 
+    let api_key = cli.api_key;
     let result = match cli.command {
         Commands::Init => cmd_init(cli.root),
-        Commands::Index { glob } => cmd_index(cli.root, glob, cli.json, cli.service_url.as_deref()),
-        Commands::Query {
-            query,
-            pattern,
-            symbol,
-            parent,
-            kind,
-            glob,
-            expand_budget,
-            limit,
-        } => cmd_query(
+        Commands::Index { glob } => cmd_index(
             cli.root,
-            query,
-            pattern,
-            symbol,
-            parent,
-            kind,
             glob,
-            expand_budget,
-            limit,
             cli.json,
             cli.service_url.as_deref(),
+            api_key,
         ),
-        Commands::Expand { handle_ids } => {
-            cmd_expand(cli.root, &handle_ids, cli.json, cli.service_url.as_deref())
-        }
+        Commands::Query { args } => cmd_query(
+            cli.root,
+            args,
+            cli.json,
+            cli.service_url.as_deref(),
+            api_key,
+        ),
+        Commands::Expand { handle_ids } => cmd_expand(
+            cli.root,
+            &handle_ids,
+            cli.json,
+            cli.service_url.as_deref(),
+            api_key,
+        ),
         Commands::Status => cmd_status(cli.root, cli.json),
         Commands::Invalidate { glob } => cmd_invalidate(cli.root, glob, cli.json),
-        Commands::Repos => cmd_repos(cli.service_url.as_deref(), cli.json),
+        Commands::Repos => cmd_repos(cli.service_url.as_deref(), cli.json, api_key),
         Commands::Reindex { repo, glob } => {
-            cmd_reindex(cli.service_url.as_deref(), repo, glob, cli.json)
+            cmd_reindex(cli.service_url.as_deref(), repo, glob, cli.json, api_key)
         }
-        Commands::ServiceStatus => cmd_service_status(cli.service_url.as_deref(), cli.json),
+        Commands::ServiceStatus => {
+            cmd_service_status(cli.service_url.as_deref(), cli.json, api_key)
+        }
         Commands::FeedbackStats { lookback_days } => {
             cmd_feedback_stats(cli.root, cli.json, lookback_days)
         }
@@ -163,7 +183,11 @@ fn main() {
                     serde_json::json!({ "code": "error", "message": e.to_string(), "hint": "" })
                 }
             };
-            eprintln!("{}", serde_json::to_string_pretty(&error_json).unwrap());
+            if let Ok(s) = serde_json::to_string_pretty(&error_json) {
+                eprintln!("{}", s);
+            } else {
+                eprintln!("Error: {}", e);
+            }
         } else {
             eprintln!("Error: {}", e);
         }
@@ -171,8 +195,8 @@ fn main() {
     }
 }
 
-fn make_runtime(service_url: Option<&str>) -> ClientRuntime {
-    ClientRuntime::new(service_url, StandalonePolicy::QueryOnly)
+fn make_runtime(service_url: Option<&str>, api_key: Option<String>) -> ClientRuntime {
+    ClientRuntime::new(service_url, api_key)
 }
 
 fn cmd_init(root: Option<std::path::PathBuf>) -> canopy_core::Result<()> {
@@ -192,17 +216,18 @@ fn cmd_index(
     glob: Option<String>,
     json: bool,
     service_url: Option<&str>,
+    api_key: Option<String>,
 ) -> canopy_core::Result<()> {
     use colored::Colorize;
 
     let repo_root = detect_repo_root(root)?;
-    let mut runtime = make_runtime(service_url);
+    let mut runtime = make_runtime(service_url, api_key);
     let result = runtime.index(&repo_root, glob.as_deref())?;
 
     match result {
         IndexResult::Local(stats) => {
             if json {
-                println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+                println!("{}", serde_json::to_string_pretty(&stats)?);
             } else {
                 println!(
                     "{}: {} files ({} tokens)",
@@ -230,8 +255,7 @@ fn cmd_index(
                         "generation": resp.generation,
                         "status": resp.status,
                         "commit_sha": resp.commit_sha,
-                    }))
-                    .unwrap()
+                    }))?
                 );
             } else {
                 println!("{}: generation {}", "Reindex".green(), resp.generation);
@@ -245,109 +269,67 @@ fn cmd_index(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_query(
     root: Option<std::path::PathBuf>,
-    query_str: Option<String>,
-    pattern: Option<String>,
-    symbol: Option<String>,
-    parent: Option<String>,
-    kind: Option<String>,
-    glob: Option<String>,
-    expand_budget: Option<usize>,
-    limit: Option<usize>,
+    args: QueryArgs,
     json: bool,
     service_url: Option<&str>,
+    api_key: Option<String>,
 ) -> canopy_core::Result<()> {
     let repo_root = detect_repo_root(root)?;
-    let mut runtime = make_runtime(service_url);
+    let mut runtime = make_runtime(service_url, api_key);
 
-    // Build QueryInput
-    let input = if let Some(ref qs) = query_str {
-        if pattern.is_none() && symbol.is_none() && parent.is_none() {
-            // Pure DSL query
+    let input = if let Some(ref qs) = args.query {
+        if args.pattern.is_none() && args.symbol.is_none() && args.parent.is_none() {
             QueryInput::Dsl(
                 qs.clone(),
                 canopy_core::QueryOptions {
-                    limit,
-                    expand_budget,
+                    limit: args.limit,
+                    expand_budget: args.expand_budget,
                     node_type_priors: None,
                 },
             )
         } else {
-            // Mixed: build params from flags
-            QueryInput::Params(build_query_params(
-                pattern.as_deref(),
-                symbol.as_deref(),
-                parent.as_deref(),
-                kind.as_deref(),
-                glob.as_deref(),
-                expand_budget,
-                limit,
-            )?)
+            QueryInput::Params(build_query_params(&args)?)
         }
     } else {
-        QueryInput::Params(build_query_params(
-            pattern.as_deref(),
-            symbol.as_deref(),
-            parent.as_deref(),
-            kind.as_deref(),
-            glob.as_deref(),
-            expand_budget,
-            limit,
-        )?)
+        QueryInput::Params(build_query_params(&args)?)
     };
 
     let result = runtime.query(&repo_root, input)?;
     print_query_result(&result, json)
 }
 
-/// Build QueryParams from CLI arguments
-fn build_query_params(
-    pattern: Option<&str>,
-    symbol: Option<&str>,
-    parent: Option<&str>,
-    kind: Option<&str>,
-    glob: Option<&str>,
-    expand_budget: Option<usize>,
-    limit: Option<usize>,
-) -> canopy_core::Result<canopy_core::QueryParams> {
-    use canopy_core::{QueryKind, QueryParams};
+fn build_query_params(args: &QueryArgs) -> canopy_core::Result<canopy_core::QueryParams> {
+    use canopy_core::{MatchMode, QueryParams};
 
-    if pattern.is_none() && symbol.is_none() && parent.is_none() {
+    let mut params = QueryParams::new();
+    params.pattern = args.pattern.clone();
+    params.patterns = args.patterns.clone();
+    params.symbol = args.symbol.clone();
+    params.section = args.section.clone();
+    params.parent = args.parent.clone();
+    params.glob = args.glob.clone();
+    params.limit = args.limit;
+    params.expand_budget = args.expand_budget;
+
+    if let Some(ref k) = args.kind {
+        params.kind = QueryParams::parse_kind(k);
+    }
+
+    if let Some(ref m) = args.r#match {
+        params.match_mode = match m.as_str() {
+            "all" => MatchMode::All,
+            _ => MatchMode::Any,
+        };
+    }
+
+    if !params.has_search_target() {
         return Err(canopy_core::CanopyError::QueryParse {
             position: 0,
             message: "Must provide either a query s-expression or --pattern/--symbol/--parent flag"
                 .to_string(),
         });
-    }
-
-    let mut params = QueryParams::new();
-
-    if let Some(p) = pattern {
-        params.pattern = Some(p.to_string());
-    }
-    if let Some(s) = symbol {
-        params.symbol = Some(s.to_string());
-    }
-    if let Some(p) = parent {
-        params.parent = Some(p.to_string());
-    }
-    if let Some(k) = kind {
-        params.kind = match k {
-            "definition" => QueryKind::Definition,
-            "reference" => QueryKind::Reference,
-            _ => QueryKind::Any,
-        };
-    }
-    if let Some(g) = glob {
-        params.glob = Some(g.to_string());
-    }
-    if let Some(l) = limit {
-        params.limit = Some(l);
-    }
-    if let Some(eb) = expand_budget {
-        params.expand_budget = Some(eb);
     }
 
     Ok(params)
@@ -358,7 +340,7 @@ fn print_query_result(result: &canopy_core::QueryResult, json: bool) -> canopy_c
     use colored::Colorize;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+        println!("{}", serde_json::to_string_pretty(&result)?);
     } else if let Some(refs) = &result.ref_handles {
         for reference in refs {
             let qualifier = reference
@@ -455,11 +437,12 @@ fn cmd_expand(
     handle_ids: &[String],
     json: bool,
     service_url: Option<&str>,
+    api_key: Option<String>,
 ) -> canopy_core::Result<()> {
     use colored::Colorize;
 
     let repo_root = detect_repo_root(root)?;
-    let mut runtime = make_runtime(service_url);
+    let mut runtime = make_runtime(service_url, api_key);
     let outcome = runtime.expand(&repo_root, handle_ids)?;
 
     if json {
@@ -469,7 +452,7 @@ fn cmd_expand(
             }).collect::<Vec<_>>(),
             "failed_ids": outcome.failed_ids,
         });
-        println!("{}", serde_json::to_string_pretty(&json_val).unwrap());
+        println!("{}", serde_json::to_string_pretty(&json_val)?);
     } else {
         for (handle_id, content) in &outcome.contents {
             println!("{}", format!("// {}", handle_id).dimmed());
@@ -496,7 +479,7 @@ fn cmd_status(root: Option<std::path::PathBuf>, json: bool) -> canopy_core::Resu
     let status = index.status()?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&status).unwrap());
+        println!("{}", serde_json::to_string_pretty(&status)?);
     } else {
         println!(
             "{}: .canopy/index.db ({:.1} MB)",
@@ -533,8 +516,7 @@ fn cmd_feedback_stats(
                 "handle_expand_accept_rate": metrics.handle_expand_accept_rate,
                 "avg_tokens_per_expand": metrics.avg_tokens_per_expand,
                 "sample_count": metrics.sample_count,
-            }))
-            .unwrap()
+            }))?
         );
     } else {
         println!("{}:", "Feedback".blue());
@@ -583,14 +565,18 @@ fn cmd_invalidate(
     Ok(())
 }
 
-fn cmd_repos(service_url: Option<&str>, json: bool) -> canopy_core::Result<()> {
+fn cmd_repos(
+    service_url: Option<&str>,
+    json: bool,
+    api_key: Option<String>,
+) -> canopy_core::Result<()> {
     use colored::Colorize;
 
-    let runtime = make_runtime(service_url);
+    let runtime = make_runtime(service_url, api_key);
     let repos = runtime.list_repos()?;
 
     if json {
-        println!("{}", serde_json::to_string_pretty(&repos).unwrap());
+        println!("{}", serde_json::to_string_pretty(&repos)?);
     } else {
         if repos.is_empty() {
             println!("No repos registered with the service.");
@@ -628,10 +614,11 @@ fn cmd_reindex(
     repo: String,
     glob: Option<String>,
     json: bool,
+    api_key: Option<String>,
 ) -> canopy_core::Result<()> {
     use colored::Colorize;
 
-    let runtime = make_runtime(service_url);
+    let runtime = make_runtime(service_url, api_key);
     let response = runtime.reindex_by_id(&repo, glob.as_deref())?;
 
     if json {
@@ -641,8 +628,7 @@ fn cmd_reindex(
                 "generation": response.generation,
                 "status": response.status,
                 "commit_sha": response.commit_sha,
-            }))
-            .unwrap()
+            }))?
         );
     } else {
         println!("{}: generation {}", "Reindex".green(), response.generation);
@@ -654,10 +640,14 @@ fn cmd_reindex(
     Ok(())
 }
 
-fn cmd_service_status(service_url: Option<&str>, json: bool) -> canopy_core::Result<()> {
+fn cmd_service_status(
+    service_url: Option<&str>,
+    json: bool,
+    api_key: Option<String>,
+) -> canopy_core::Result<()> {
     use colored::Colorize;
 
-    let runtime = make_runtime(service_url);
+    let runtime = make_runtime(service_url, api_key);
     let status = runtime.service_status()?;
 
     if json {
@@ -666,8 +656,7 @@ fn cmd_service_status(service_url: Option<&str>, json: bool) -> canopy_core::Res
             serde_json::to_string_pretty(&serde_json::json!({
                 "service": status.service,
                 "repos": status.repos,
-            }))
-            .unwrap()
+            }))?
         );
     } else {
         println!("{}: {}", "Service".green(), status.service);

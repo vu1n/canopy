@@ -9,6 +9,22 @@ use crate::scoring::{select_for_expansion, HandleScorer};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
+/// Split text into unique lowercase terms, splitting on non-alphanumeric/underscore.
+pub fn split_terms(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for term in text
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|s| !s.is_empty())
+    {
+        if seen.insert(term.to_string()) {
+            out.push(term.to_string());
+        }
+    }
+    out
+}
+
 /// Query AST
 #[derive(Debug, Clone)]
 pub enum Query {
@@ -39,7 +55,7 @@ pub enum Query {
 }
 
 /// Match mode for multi-pattern queries
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MatchMode {
     /// Union: match any of the patterns (OR)
@@ -50,7 +66,7 @@ pub enum MatchMode {
 }
 
 /// Query kind for filtering results
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QueryKind {
     /// Match any (default behavior)
@@ -190,6 +206,76 @@ impl QueryParams {
         self
     }
 
+    /// Parse a kind string ("definition", "reference", "any") into a QueryKind.
+    pub fn parse_kind(s: &str) -> QueryKind {
+        match s {
+            "definition" => QueryKind::Definition,
+            "reference" => QueryKind::Reference,
+            _ => QueryKind::Any,
+        }
+    }
+
+    /// Returns true if at least one search target field is set.
+    pub fn has_search_target(&self) -> bool {
+        self.pattern.is_some()
+            || self.patterns.is_some()
+            || self.symbol.is_some()
+            || self.section.is_some()
+            || self.parent.is_some()
+    }
+
+    /// Concatenate all query parameter text fields into a single string.
+    ///
+    /// Useful for feedback recording and keyword extraction.
+    pub fn to_text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(s) = &self.pattern {
+            parts.push(s.clone());
+        }
+        if let Some(ss) = &self.patterns {
+            parts.extend(ss.clone());
+        }
+        if let Some(s) = &self.symbol {
+            parts.push(s.clone());
+        }
+        if let Some(s) = &self.section {
+            parts.push(s.clone());
+        }
+        if let Some(s) = &self.parent {
+            parts.push(s.clone());
+        }
+        if let Some(s) = &self.glob {
+            parts.push(s.clone());
+        }
+        parts.join(" ")
+    }
+
+    /// Build a multi-term fallback from a single-pattern query.
+    ///
+    /// Returns `None` if the query already uses multi-field search or the
+    /// pattern has only one term.
+    pub fn pattern_fallback(&self) -> Option<QueryParams> {
+        if self.patterns.is_some()
+            || self.symbol.is_some()
+            || self.section.is_some()
+            || self.parent.is_some()
+        {
+            return None;
+        }
+
+        let pattern = self.pattern.as_ref()?;
+        let terms = split_terms(pattern);
+        if terms.len() <= 1 {
+            return None;
+        }
+
+        let mut fallback = self.clone();
+        fallback.pattern = None;
+        fallback.patterns = Some(terms);
+        fallback.match_mode = MatchMode::Any;
+        Some(fallback)
+    }
+
     /// Convert params to Query AST
     pub fn to_query(&self) -> crate::Result<Query> {
         // Validate: kind requires symbol
@@ -321,6 +407,52 @@ pub struct EvidencePack {
     /// Action guidance so agents can stop exploring and start synthesis.
     #[serde(default)]
     pub guidance: EvidenceGuidance,
+}
+
+impl EvidencePack {
+    /// Reorder expand suggestions so recently-expanded handles come last.
+    ///
+    /// If all suggestions are recently expanded, backfill from pack handles.
+    /// The `is_recent` predicate determines whether a handle ID was recently expanded.
+    pub fn reorder_expand_suggestions(&mut self, is_recent: impl Fn(&str) -> bool) {
+        if self.expand_suggestion.is_empty() {
+            return;
+        }
+
+        let mut fresh = Vec::new();
+        let mut repeated = Vec::new();
+        for id in &self.expand_suggestion {
+            if is_recent(id) {
+                repeated.push(id.clone());
+            } else {
+                fresh.push(id.clone());
+            }
+        }
+
+        if repeated.is_empty() {
+            return;
+        }
+
+        if fresh.is_empty() {
+            for handle in &self.handles {
+                if fresh.len() >= self.expand_suggestion.len() {
+                    break;
+                }
+                if is_recent(&handle.id) {
+                    continue;
+                }
+                if !fresh.iter().any(|id| id == &handle.id) {
+                    fresh.push(handle.id.clone());
+                }
+            }
+        }
+
+        if !fresh.is_empty() {
+            fresh.extend(repeated);
+            fresh.truncate(self.expand_suggestion.len());
+            self.expand_suggestion = fresh;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

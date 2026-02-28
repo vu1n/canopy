@@ -1,9 +1,9 @@
 //! Canopy MCP Server - MCP interface for token-efficient codebase queries
 
 use canopy_client::predict::extract_query_text;
-use canopy_client::{ClientRuntime, IndexResult, QueryInput, StandalonePolicy};
+use canopy_client::{ClientRuntime, IndexResult, QueryInput};
 use canopy_core::feedback::FeedbackStore;
-use canopy_core::{MatchMode, QueryKind, QueryParams, RepoIndex};
+use canopy_core::{MatchMode, QueryParams, RepoIndex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -19,8 +19,9 @@ fn main() {
 
     // Parse --service-url from CLI args (falls back to CANOPY_SERVICE_URL env var)
     let service_url = parse_service_url();
+    let api_key = parse_api_key();
     let default_repo_root = parse_root_path();
-    let mut server = McpServer::with_service_url(service_url, default_repo_root);
+    let mut server = McpServer::with_service_url(service_url, api_key, default_repo_root);
 
     for line in reader.lines() {
         let line = match line {
@@ -100,10 +101,28 @@ fn parse_root_path() -> Option<PathBuf> {
     std::env::var("CANOPY_ROOT").ok().map(PathBuf::from)
 }
 
+/// Parse --api-key from CLI args, falling back to CANOPY_API_KEY env var
+fn parse_api_key() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--api-key" {
+            return args.get(i + 1).cloned();
+        }
+        if let Some(val) = args[i].strip_prefix("--api-key=") {
+            return Some(val.to_string());
+        }
+    }
+    std::env::var("CANOPY_API_KEY").ok()
+}
+
 impl McpServer {
-    fn with_service_url(service_url: Option<String>, default_repo_root: Option<PathBuf>) -> Self {
+    fn with_service_url(
+        service_url: Option<String>,
+        api_key: Option<String>,
+        default_repo_root: Option<PathBuf>,
+    ) -> Self {
         Self {
-            runtime: ClientRuntime::new(service_url.as_deref(), StandalonePolicy::Predictive),
+            runtime: ClientRuntime::new(service_url.as_deref(), api_key),
             default_repo_root,
         }
     }
@@ -148,7 +167,12 @@ impl McpServer {
             },
         };
 
-        Some(serde_json::to_string(&response).unwrap())
+        Some(serde_json::to_string(&response).unwrap_or_else(|e| {
+            format!(
+                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"Response serialization failed: {}"}}}}"#,
+                e
+            )
+        }))
     }
 
     fn handle_initialize(&self, _params: &Option<Value>) -> Result<Value, (i32, String)> {
@@ -412,7 +436,8 @@ impl McpServer {
 
         let result_json = match result {
             IndexResult::Local(stats) => {
-                let mut val = serde_json::to_value(&stats).unwrap();
+                let mut val = serde_json::to_value(&stats)
+                    .map_err(|e| (-32000, format!("Serialization error: {}", e)))?;
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert(
                         "repo_root".to_string(),
@@ -431,10 +456,12 @@ impl McpServer {
             }
         };
 
+        let text = serde_json::to_string(&result_json)
+            .map_err(|e| (-32000, format!("Serialization error: {}", e)))?;
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string(&result_json).unwrap()
+                "text": text
             }]
         }))
     }
@@ -459,10 +486,12 @@ impl McpServer {
             .query(&repo_root, input)
             .map_err(|e| (-32000, e.to_string()))?;
 
+        let text = serde_json::to_string(&result)
+            .map_err(|e| (-32000, format!("Serialization error: {}", e)))?;
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string(&result).unwrap()
+                "text": text
             }]
         }))
     }
@@ -497,10 +526,12 @@ impl McpServer {
             .evidence_pack(&repo_root, input, max_handles, max_per_file, plan)
             .map_err(|e| (-32000, e.to_string()))?;
 
+        let text = serde_json::to_string(&pack)
+            .map_err(|e| (-32000, format!("Serialization error: {}", e)))?;
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string(&pack).unwrap()
+                "text": text
             }]
         }))
     }
@@ -554,7 +585,8 @@ impl McpServer {
         let index = self.open_index_at(&repo_root)?;
         let status = index.status().map_err(|e| (-32000, e.to_string()))?;
 
-        let mut result = serde_json::to_value(&status).unwrap();
+        let mut result = serde_json::to_value(&status)
+            .map_err(|e| (-32000, format!("Serialization error: {}", e)))?;
         if let Some(obj) = result.as_object_mut() {
             obj.insert(
                 "repo_root".to_string(),
@@ -579,10 +611,12 @@ impl McpServer {
             }
         }
 
+        let text = serde_json::to_string(&result)
+            .map_err(|e| (-32000, format!("Serialization error: {}", e)))?;
         Ok(json!({
             "content": [{
                 "type": "text",
-                "text": serde_json::to_string(&result).unwrap()
+                "text": text
             }]
         }))
     }
@@ -684,11 +718,7 @@ fn build_query_input(args: &Value) -> Result<QueryInput, (i32, String)> {
     }
 
     if let Some(kind) = args.get("kind").and_then(|v| v.as_str()) {
-        params.kind = match kind {
-            "definition" => QueryKind::Definition,
-            "reference" => QueryKind::Reference,
-            _ => QueryKind::Any,
-        };
+        params.kind = QueryParams::parse_kind(kind);
     }
 
     if let Some(glob) = args.get("glob").and_then(|v| v.as_str()) {
@@ -717,13 +747,7 @@ fn build_query_input(args: &Value) -> Result<QueryInput, (i32, String)> {
             .unwrap_or(DEFAULT_MCP_EXPAND_BUDGET),
     );
 
-    // Validate that at least one search param is provided
-    if params.pattern.is_none()
-        && params.patterns.is_none()
-        && params.symbol.is_none()
-        && params.section.is_none()
-        && params.parent.is_none()
-    {
+    if !params.has_search_target() {
         return Err((
             -32602,
             "Must specify one of: pattern, patterns, symbol, section, parent, or query".to_string(),

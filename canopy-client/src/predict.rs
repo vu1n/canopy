@@ -1,6 +1,15 @@
 //! Query-driven path prediction for lazy indexing
+//!
+//! Prediction policy constants live here alongside the prediction logic.
+//! Service-side evidence constants live in `canopy-service/src/evidence.rs`.
 
 use canopy_core::feedback::FeedbackStore;
+
+/// Repos with more files than this use predictive (scoped) indexing instead of full index.
+pub const LARGE_REPO_THRESHOLD: usize = 1000;
+
+/// Maximum files to index in a single predictive pass.
+pub const MAX_PREDICTIVE_FILES: usize = 500;
 
 /// Keyword to directory pattern mappings
 /// Patterns use ** for recursive matching, will be combined with extensions

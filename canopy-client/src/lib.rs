@@ -6,10 +6,10 @@
 pub mod dirty;
 pub mod merge;
 pub mod predict;
+pub mod provenance;
 pub mod runtime;
 pub mod service_client;
 
-pub use runtime::{
-    ClientRuntime, ExpandOutcome, HandleProvenance, IndexResult, QueryInput, StandalonePolicy,
-};
+pub use provenance::HandleProvenance;
+pub use runtime::{ClientRuntime, ExpandOutcome, IndexResult, QueryInput};
 pub use service_client::{ReindexResponse, ServiceClient, ServiceStatus};

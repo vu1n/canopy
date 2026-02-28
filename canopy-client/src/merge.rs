@@ -52,14 +52,25 @@ pub fn merge_results(
         .map(|h| h.id.to_string())
         .collect();
 
+    // Truncated means the merged set may be incomplete — true if either source
+    // was truncated, since we cannot know if dropped results would survive merge.
+    let truncated = local.truncated || service.truncated;
+
+    // auto_expanded is meaningful only when all merged handles were expanded
+    // by upstream (not by the merge itself); preserve the upstream signal.
+    let auto_expanded = expanded_count > 0 && expanded_count == total_matches;
+
+    // expand_note: prefer service note (it has richer context), fallback to local.
+    let expand_note = service.expand_note.or(local.expand_note);
+
     QueryResult {
         handles: merged_handles,
         ref_handles: merge_ref_handles(local.ref_handles, service.ref_handles, dirty_paths),
         total_tokens,
-        truncated: local.truncated || service.truncated,
+        truncated,
         total_matches,
-        auto_expanded: expanded_count > 0 && expanded_count == total_matches,
-        expand_note: service.expand_note.or(local.expand_note),
+        auto_expanded,
+        expand_note,
         expanded_count,
         expanded_tokens,
         expanded_handle_ids,

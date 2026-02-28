@@ -286,7 +286,7 @@ for discovery, then expand selectively for synthesis.
 # Initialize canopy in a repository
 canopy init
 
-# Index files (automatic on first query)
+# Index files (MCP server auto-indexes on query; CLI requires explicit index)
 canopy index
 
 # Query the codebase
@@ -376,10 +376,11 @@ patterns = ["node_modules", ".git", "dist", "build", "__pycache__"]
 | canopy-client   |  Shared runtime (service client, dirty overlay, merge, predict)
 +-----------------+
 | canopy-core     |  Indexing and query engine
-|  - index.rs     |  SQLite FTS5 + symbol cache + mmap
+|  - index/       |  SQLite FTS5 + symbol cache + pipeline + file discovery
 |  - parse.rs     |  Tree-sitter parsing
-|  - query.rs     |  Query DSL and execution
+|  - query.rs     |  Query DSL, execution, evidence packs
 |  - handle.rs    |  HandleSource + generation metadata
+|  - error.rs     |  CanopyError + ErrorEnvelope (shared boundary contract)
 +-----------------+
 ```
 
@@ -409,6 +410,39 @@ Token metric interpretation:
 - Cache-read tokens can dominate long loops, so reported-only views may hide retrieval churn.
 
 Design principles, anti-drift guardrails, and divergence logging live in `docs/design-anchors.md`.
+
+---
+
+## Compatibility
+
+All crates in this workspace are versioned together and released as a unit.
+Cross-crate contracts (e.g., `ErrorEnvelope`, `QueryParams`, `Handle`) live in `canopy-core` and are re-exported by downstream crates.
+
+| Component pair | Contract | Breakage signal |
+|---|---|---|
+| canopy-service ↔ canopy-client | JSON over HTTP; `ErrorEnvelope`, `QueryResult`, `EvidencePack` schemas | Service integration tests (`canopy-client/tests/service_integration.rs`) |
+| canopy-mcp ↔ canopy-client | `ClientRuntime` public API | MCP build + unit tests |
+| canopy-cli ↔ canopy-client | `ClientRuntime` public API | CLI build + unit tests |
+| canopy-client ↔ canopy-core | `RepoIndex`, `QueryParams`, `Handle`, `EvidencePack` | Client unit tests |
+
+Service mode requires matching canopy-service and canopy-client versions.
+Running mismatched versions may produce `stale_generation` or schema errors.
+
+---
+
+## Quality Gates
+
+| Behavior | Gate | Location |
+|---|---|---|
+| Core indexing + query | 59 unit tests | `canopy-core` |
+| Client runtime, dirty overlay, merge | 32 unit tests | `canopy-client` |
+| Service routes, evidence, state | 20 unit tests | `canopy-service` |
+| End-to-end service lifecycle | 5 integration tests | `canopy-client/tests/`, `canopy-service/tests/` |
+| Symbol cache consistency | `test_symbol_cache_by_file_consistency` | `canopy-core` |
+| Pipeline vs sequential indexing | `test_pipeline_path_indexes_large_batch`, `test_sequential_path_indexes_small_batch` | `canopy-core` |
+| Dirty-file merge correctness | `test_dirty_merge_*` | `canopy-client` |
+
+Run `cargo test` to execute all gates. No benchmark quality gates are published yet; see `docs/benchmarking.md` for evaluation methodology.
 
 ---
 

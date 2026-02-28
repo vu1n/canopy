@@ -1,39 +1,6 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use serde::Serialize;
-
-#[derive(Debug, Serialize)]
-pub struct ErrorEnvelope {
-    pub code: String,
-    pub message: String,
-    pub hint: String,
-}
-
-impl ErrorEnvelope {
-    pub fn new(
-        code: impl Into<String>,
-        message: impl Into<String>,
-        hint: impl Into<String>,
-    ) -> Self {
-        Self {
-            code: code.into(),
-            message: message.into(),
-            hint: hint.into(),
-        }
-    }
-
-    pub fn stale_generation(expected: u64, found: u64) -> Self {
-        Self::new(
-            "stale_generation",
-            format!("Expected generation {}, found {}", expected, found),
-            "Call /reindex to get a fresh generation",
-        )
-    }
-
-    pub fn internal(msg: &str) -> Self {
-        Self::new("internal_error", msg, "Check service logs for details")
-    }
-}
+pub use canopy_core::ErrorEnvelope;
 
 pub struct AppError {
     pub status: StatusCode,

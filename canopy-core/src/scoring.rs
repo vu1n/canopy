@@ -2,6 +2,7 @@
 
 use crate::document::NodeType;
 use crate::handle::Handle;
+use crate::query::split_terms;
 use std::collections::HashMap;
 
 const NEARBY_LINE_GAP: usize = 2;
@@ -141,14 +142,6 @@ fn is_near_duplicate_selection(
             false
         }
     })
-}
-
-fn split_terms(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect()
 }
 
 #[cfg(test)]

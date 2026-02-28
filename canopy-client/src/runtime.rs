@@ -4,35 +4,25 @@
 
 use crate::dirty;
 use crate::merge;
-use crate::predict::{extract_extensions_from_glob, predict_globs, predict_globs_with_feedback};
+use crate::predict::{
+    extract_extensions_from_glob, predict_globs, predict_globs_with_feedback, LARGE_REPO_THRESHOLD,
+    MAX_PREDICTIVE_FILES,
+};
+use crate::provenance::{HandleProvenance, ProvenanceTracker};
 use crate::service_client::{is_error_code, ReindexResponse, ServiceClient, ServiceStatus};
 use canopy_core::index::ExpandedHandleDetail;
 use canopy_core::{
     build_evidence_pack,
     feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle},
-    EvidencePack, HandleSource, IndexStats, MatchMode, NodeType, QueryOptions, QueryParams,
-    QueryResult, RepoIndex, RepoShard,
+    EvidencePack, HandleSource, IndexStats, NodeType, QueryOptions, QueryParams, QueryResult,
+    RepoIndex, RepoShard,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Instant;
 
-const PROVENANCE_CAP: usize = 10_000;
-const RECENT_EXPANDED_CAP: usize = 10_000;
-const RECENT_QUERY_EVENT_CAP: usize = 10_000;
 const ENSURE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// Indexing policy for standalone mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StandalonePolicy {
-    /// CLI index command: index everything
-    FullIndex,
-    /// CLI query/expand: query existing index only, no auto-indexing
-    QueryOnly,
-    /// MCP: caller handles predictive indexing before query
-    Predictive,
-}
 
 /// Input for a query — either structured params or DSL string
 pub enum QueryInput {
@@ -46,17 +36,6 @@ pub enum QueryInput {
 pub enum IndexResult {
     Local(IndexStats),
     Service(ReindexResponse),
-}
-
-/// Tracks where a handle came from for expand routing
-#[derive(Debug, Clone)]
-pub struct HandleProvenance {
-    pub source: HandleSource,
-    pub generation: Option<u64>,
-    pub repo_id: Option<String>,
-    pub file_path: String,
-    pub node_type: NodeType,
-    pub token_count: usize,
 }
 
 /// Outcome of an expand operation — supports partial success
@@ -73,22 +52,12 @@ struct PendingPredictiveContext {
 
 pub struct ClientRuntime {
     service: Option<ServiceClient>,
-    /// (canonical_repo_path, handle_id) → provenance
-    handle_provenance: HashMap<(String, String), HandleProvenance>,
-    /// Insertion order for LRU eviction
-    provenance_order: VecDeque<(String, String)>,
+    /// Handle provenance + expand tracking (extracted module)
+    tracker: ProvenanceTracker,
     /// Track last-known generation per repo to detect changes
     repo_generations: HashMap<String, u64>,
     /// Repo-local feedback DB handles (lazy-opened)
     feedback_stores: HashMap<String, FeedbackStore>,
-    /// Best-effort mapping: (canonical_repo_path, handle_id) -> latest query_event_id
-    recent_handle_query_events: HashMap<(String, String), i64>,
-    /// Insertion order for recent_handle_query_events cap eviction
-    recent_handle_query_order: VecDeque<(String, String)>,
-    /// Session-local memory: handles already expanded in this runtime
-    recently_expanded: HashSet<(String, String)>,
-    /// Insertion order for recently_expanded cap eviction
-    recently_expanded_order: VecDeque<(String, String)>,
     /// Predictive context staged between predictive_index_for_query() and query()
     pending_predictive: HashMap<String, PendingPredictiveContext>,
     /// Cached node type priors per repo
@@ -98,22 +67,16 @@ pub struct ClientRuntime {
 impl ClientRuntime {
     /// Create a new runtime.
     ///
-    /// `_policy` is accepted for caller documentation but the runtime does not
-    /// auto-index.  Callers choose their own indexing strategy:
+    /// Callers choose their own indexing strategy:
     /// - CLI `index` command: calls `runtime.index()` explicitly
     /// - MCP: calls `runtime.predictive_index_for_query()` before query
     /// - CLI query/expand: queries whatever is already indexed
-    pub fn new(service_url: Option<&str>, _policy: StandalonePolicy) -> Self {
+    pub fn new(service_url: Option<&str>, api_key: Option<String>) -> Self {
         Self {
-            service: service_url.map(ServiceClient::new),
-            handle_provenance: HashMap::new(),
-            provenance_order: VecDeque::new(),
+            service: service_url.map(|url| ServiceClient::new(url, api_key)),
+            tracker: ProvenanceTracker::new(),
             repo_generations: HashMap::new(),
             feedback_stores: HashMap::new(),
-            recent_handle_query_events: HashMap::new(),
-            recent_handle_query_order: VecDeque::new(),
-            recently_expanded: HashSet::new(),
-            recently_expanded_order: VecDeque::new(),
             pending_predictive: HashMap::new(),
             node_type_priors_cache: HashMap::new(),
         }
@@ -227,7 +190,7 @@ impl ClientRuntime {
         }
 
         let fallback_params = match &input {
-            QueryInput::Params(params) => Self::pattern_fallback_params(params),
+            QueryInput::Params(params) => params.pattern_fallback(),
             QueryInput::Dsl(..) => None,
         };
         let query_text = Self::query_input_text(&input);
@@ -238,7 +201,7 @@ impl ClientRuntime {
 
         if pack.selected_count == 0 {
             if let Some(fallback) = fallback_params {
-                let fallback_text = Self::query_params_text(&fallback);
+                let fallback_text = fallback.to_text();
                 let fallback_result = self.query(repo_path, QueryInput::Params(fallback))?;
                 let fallback_pack = build_evidence_pack(
                     &fallback_result,
@@ -269,8 +232,8 @@ impl ClientRuntime {
         handle_ids: &[String],
     ) -> canopy_core::Result<ExpandOutcome> {
         let canonical = canonical_path(repo_path);
-        let mut contents: Vec<(String, String)> = Vec::new();
-        let mut failed_ids: Vec<String> = Vec::new();
+
+        // Deduplicate handle IDs
         let mut seen_ids = HashSet::new();
         let unique_handle_ids: Vec<String> = handle_ids
             .iter()
@@ -278,14 +241,13 @@ impl ClientRuntime {
             .cloned()
             .collect();
 
-        // Partition handles by provenance
+        // Partition by provenance
         let mut local_ids: Vec<String> = Vec::new();
-        let mut service_ids: Vec<(String, Option<u64>, Option<String>)> = Vec::new(); // (id, gen, repo_id)
+        let mut service_ids: Vec<(String, Option<u64>, Option<String>)> = Vec::new();
         let mut unknown_ids: Vec<String> = Vec::new();
 
         for id in &unique_handle_ids {
-            let key = (canonical.clone(), id.clone());
-            if let Some(prov) = self.handle_provenance.get(&key) {
+            if let Some(prov) = self.tracker.get(&canonical, id) {
                 match prov.source {
                     HandleSource::Local => local_ids.push(id.clone()),
                     HandleSource::Service => {
@@ -297,130 +259,24 @@ impl ClientRuntime {
             }
         }
 
-        // Expand local handles — try batch first, fall back to per-handle
-        if !local_ids.is_empty() {
-            match self.expand_local(repo_path, &local_ids) {
-                Ok(mut c) => contents.append(&mut c),
-                Err(_) => {
-                    // Batch failed — try each handle individually
-                    for id in local_ids {
-                        match self.expand_local(repo_path, std::slice::from_ref(&id)) {
-                            Ok(c) => contents.extend(c),
-                            Err(_) => failed_ids.push(id),
-                        }
-                    }
-                }
-            }
-        }
+        // Expand each partition
+        let mut contents: Vec<(String, String)> = Vec::new();
+        let mut failed_ids: Vec<String> = Vec::new();
 
-        // Expand service handles — try batch first, fall back to per-handle
-        if !service_ids.is_empty() {
-            if let Some(service) = &self.service {
-                let first_repo_id = service_ids.first().and_then(|(_, _, r)| r.clone());
+        self.expand_local_batch(repo_path, local_ids, &mut contents, &mut failed_ids);
+        self.expand_service_batch(repo_path, service_ids, &mut contents, &mut failed_ids);
+        self.expand_unknown(repo_path, unknown_ids, &mut contents, &mut failed_ids);
 
-                if let Some(repo_id) = first_repo_id {
-                    // ensure_ready; on repo_not_found, re-resolve and retry
-                    let active_repo_id = match service.ensure_ready(&repo_id, ENSURE_READY_TIMEOUT)
-                    {
-                        Ok(()) => Some(repo_id),
-                        Err(e) if is_error_code(&e, "repo_not_found") => {
-                            let service = self.service.as_mut().unwrap();
-                            match service.invalidate_and_resolve(repo_path) {
-                                Ok(new_id) => {
-                                    match service.ensure_ready(&new_id, ENSURE_READY_TIMEOUT) {
-                                        Ok(()) => Some(new_id),
-                                        Err(_) => None,
-                                    }
-                                }
-                                Err(_) => None,
-                            }
-                        }
-                        Err(_) => None,
-                    };
-
-                    if let Some(repo_id) = active_repo_id {
-                        let service = self.service.as_ref().unwrap();
-                        // Try batch expand; on failure, fall back to per-handle
-                        let all_ids: Vec<String> =
-                            service_ids.iter().map(|(id, _, _)| id.clone()).collect();
-                        let batch_gen = service_ids.first().and_then(|(_, g, _)| *g);
-
-                        match service.expand(&repo_id, &all_ids, batch_gen) {
-                            Ok(mut c) => contents.append(&mut c),
-                            Err(e) if is_error_code(&e, "repo_not_found") => {
-                                // Re-resolve, then per-handle
-                                let service = self.service.as_mut().unwrap();
-                                let resolved = service.invalidate_and_resolve(repo_path).ok();
-                                for (id, gen, _) in &service_ids {
-                                    if let Some(ref rid) = resolved {
-                                        if let Ok(c) =
-                                            service.expand(rid, std::slice::from_ref(id), *gen)
-                                        {
-                                            contents.extend(c);
-                                            continue;
-                                        }
-                                    }
-                                    failed_ids.push(id.clone());
-                                }
-                            }
-                            Err(_) => {
-                                // Batch failed (e.g., mixed generations) — per-handle fallback
-                                for (id, gen, rid) in &service_ids {
-                                    let target_id = rid.as_deref().unwrap_or(&repo_id);
-                                    match service.expand(target_id, std::slice::from_ref(id), *gen)
-                                    {
-                                        Ok(c) => contents.extend(c),
-                                        Err(_) => failed_ids.push(id.clone()),
-                                    }
-                                }
-                            }
-                        }
-                    } else {
-                        let ids: Vec<String> =
-                            service_ids.into_iter().map(|(id, _, _)| id).collect();
-                        failed_ids.extend(ids);
-                    }
-                } else {
-                    let ids: Vec<String> = service_ids.into_iter().map(|(id, _, _)| id).collect();
-                    failed_ids.extend(ids);
-                }
-            } else {
-                let ids: Vec<String> = service_ids.into_iter().map(|(id, _, _)| id).collect();
-                failed_ids.extend(ids);
-            }
-        }
-
-        // Expand unknown handles: try local first, then service
-        for id in unknown_ids {
-            // Try local
-            if let Ok(c) = self.expand_local(repo_path, std::slice::from_ref(&id)) {
-                contents.extend(c);
-                continue;
-            }
-            // Try service
-            if let Some(service) = &mut self.service {
-                if let Ok(repo_id) = service.resolve_repo_id(repo_path) {
-                    if service.ensure_ready(&repo_id, ENSURE_READY_TIMEOUT).is_ok() {
-                        if let Ok(c) = service.expand(&repo_id, std::slice::from_ref(&id), None) {
-                            contents.extend(c);
-                            continue;
-                        }
-                    }
-                }
-            }
-            failed_ids.push(id);
-        }
-
+        // Record feedback
         self.record_recently_expanded(repo_path, &contents);
         if self.service.is_some() {
-            // Service mode already records expand feedback server-side.
-            // Only record local-handle expansions here to avoid double counting.
+            // Service mode records expand feedback server-side;
+            // only record local-handle expansions here to avoid double counting.
             let local_contents: Vec<(String, String)> = contents
                 .iter()
                 .filter_map(|(id, content)| {
-                    let key = (canonical.clone(), id.clone());
-                    self.handle_provenance
-                        .get(&key)
+                    self.tracker
+                        .get(&canonical, id)
                         .filter(|prov| matches!(prov.source, HandleSource::Local))
                         .map(|_| (id.clone(), content.clone()))
                 })
@@ -440,6 +296,130 @@ impl ClientRuntime {
             contents,
             failed_ids,
         })
+    }
+
+    /// Expand local handles: try batch first, fall back to per-handle on failure.
+    fn expand_local_batch(
+        &self,
+        repo_path: &Path,
+        ids: Vec<String>,
+        contents: &mut Vec<(String, String)>,
+        failed_ids: &mut Vec<String>,
+    ) {
+        if ids.is_empty() {
+            return;
+        }
+        match self.expand_local(repo_path, &ids) {
+            Ok(mut c) => contents.append(&mut c),
+            Err(_) => {
+                for id in ids {
+                    match self.expand_local(repo_path, std::slice::from_ref(&id)) {
+                        Ok(c) => contents.extend(c),
+                        Err(_) => failed_ids.push(id),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expand service handles: resolve repo, ensure ready, batch expand with fallbacks.
+    fn expand_service_batch(
+        &mut self,
+        repo_path: &Path,
+        service_ids: Vec<(String, Option<u64>, Option<String>)>,
+        contents: &mut Vec<(String, String)>,
+        failed_ids: &mut Vec<String>,
+    ) {
+        if service_ids.is_empty() {
+            return;
+        }
+
+        let first_repo_id = service_ids.first().and_then(|(_, _, r)| r.clone());
+        let Some(repo_id) = first_repo_id else {
+            failed_ids.extend(service_ids.into_iter().map(|(id, _, _)| id));
+            return;
+        };
+
+        let Some(service) = &self.service else {
+            failed_ids.extend(service_ids.into_iter().map(|(id, _, _)| id));
+            return;
+        };
+
+        // Resolve an active repo_id (re-resolving on repo_not_found)
+        let active_repo_id = match service.ensure_ready(&repo_id, ENSURE_READY_TIMEOUT) {
+            Ok(()) => Some(repo_id),
+            Err(e) if is_error_code(&e, "repo_not_found") => {
+                let service = self.service.as_mut().unwrap();
+                service
+                    .invalidate_and_resolve(repo_path)
+                    .ok()
+                    .filter(|new_id| service.ensure_ready(new_id, ENSURE_READY_TIMEOUT).is_ok())
+            }
+            Err(_) => None,
+        };
+
+        let Some(repo_id) = active_repo_id else {
+            failed_ids.extend(service_ids.into_iter().map(|(id, _, _)| id));
+            return;
+        };
+
+        let all_ids: Vec<String> = service_ids.iter().map(|(id, _, _)| id.clone()).collect();
+        let batch_gen = service_ids.first().and_then(|(_, g, _)| *g);
+        let service = self.service.as_ref().unwrap();
+
+        match service.expand(&repo_id, &all_ids, batch_gen) {
+            Ok(mut c) => contents.append(&mut c),
+            Err(e) if is_error_code(&e, "repo_not_found") => {
+                let service = self.service.as_mut().unwrap();
+                let resolved = service.invalidate_and_resolve(repo_path).ok();
+                for (id, gen, _) in &service_ids {
+                    if let Some(ref rid) = resolved {
+                        if let Ok(c) = service.expand(rid, std::slice::from_ref(id), *gen) {
+                            contents.extend(c);
+                            continue;
+                        }
+                    }
+                    failed_ids.push(id.clone());
+                }
+            }
+            Err(_) => {
+                // Batch failed (e.g., mixed generations) — per-handle fallback
+                for (id, gen, rid) in &service_ids {
+                    let target_id = rid.as_deref().unwrap_or(&repo_id);
+                    match service.expand(target_id, std::slice::from_ref(id), *gen) {
+                        Ok(c) => contents.extend(c),
+                        Err(_) => failed_ids.push(id.clone()),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expand handles with unknown provenance: try local first, then service.
+    fn expand_unknown(
+        &mut self,
+        repo_path: &Path,
+        ids: Vec<String>,
+        contents: &mut Vec<(String, String)>,
+        failed_ids: &mut Vec<String>,
+    ) {
+        for id in ids {
+            if let Ok(c) = self.expand_local(repo_path, std::slice::from_ref(&id)) {
+                contents.extend(c);
+                continue;
+            }
+            if let Some(service) = &mut self.service {
+                if let Ok(repo_id) = service.resolve_repo_id(repo_path) {
+                    if service.ensure_ready(&repo_id, ENSURE_READY_TIMEOUT).is_ok() {
+                        if let Ok(c) = service.expand(&repo_id, std::slice::from_ref(&id), None) {
+                            contents.extend(c);
+                            continue;
+                        }
+                    }
+                }
+            }
+            failed_ids.push(id);
+        }
     }
 
     /// Index/reindex — ensure_ready NOT called here (would deadlock on first index)
@@ -498,68 +478,8 @@ impl ClientRuntime {
     fn query_input_text(input: &QueryInput) -> String {
         match input {
             QueryInput::Dsl(dsl, _) => dsl.clone(),
-            QueryInput::Params(params) => Self::query_params_text(params),
+            QueryInput::Params(params) => params.to_text(),
         }
-    }
-
-    fn query_params_text(params: &QueryParams) -> String {
-        let mut parts = Vec::new();
-        if let Some(s) = &params.pattern {
-            parts.push(s.clone());
-        }
-        if let Some(ss) = &params.patterns {
-            parts.extend(ss.clone());
-        }
-        if let Some(s) = &params.symbol {
-            parts.push(s.clone());
-        }
-        if let Some(s) = &params.section {
-            parts.push(s.clone());
-        }
-        if let Some(s) = &params.parent {
-            parts.push(s.clone());
-        }
-        if let Some(s) = &params.glob {
-            parts.push(s.clone());
-        }
-        parts.join(" ")
-    }
-
-    fn split_terms(text: &str) -> Vec<String> {
-        let mut out = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for term in text
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|s| !s.is_empty())
-        {
-            if seen.insert(term.to_string()) {
-                out.push(term.to_string());
-            }
-        }
-        out
-    }
-
-    fn pattern_fallback_params(params: &QueryParams) -> Option<QueryParams> {
-        if params.patterns.is_some()
-            || params.symbol.is_some()
-            || params.section.is_some()
-            || params.parent.is_some()
-        {
-            return None;
-        }
-
-        let pattern = params.pattern.as_ref()?;
-        let terms = Self::split_terms(pattern);
-        if terms.len() <= 1 {
-            return None;
-        }
-
-        let mut fallback = params.clone();
-        fallback.pattern = None;
-        fallback.patterns = Some(terms);
-        fallback.match_mode = MatchMode::Any;
-        Some(fallback)
     }
 
     fn feedback_store_for_repo(&mut self, repo_path: &Path) -> Option<&FeedbackStore> {
@@ -605,22 +525,8 @@ impl ClientRuntime {
     }
 
     fn remember_recent_query_event(&mut self, repo: &str, handle_id: &str, query_event_id: i64) {
-        let key = (repo.to_string(), handle_id.to_string());
-        if self.recent_handle_query_events.contains_key(&key) {
-            self.recent_handle_query_events.insert(key, query_event_id);
-        } else {
-            self.recent_handle_query_events
-                .insert(key.clone(), query_event_id);
-            self.recent_handle_query_order.push_back(key);
-        }
-
-        while self.recent_handle_query_events.len() > RECENT_QUERY_EVENT_CAP {
-            if let Some(oldest) = self.recent_handle_query_order.pop_front() {
-                self.recent_handle_query_events.remove(&oldest);
-            } else {
-                break;
-            }
-        }
+        self.tracker
+            .record_query_event(repo, handle_id, query_event_id);
     }
 
     fn record_feedback_for_query(
@@ -710,11 +616,7 @@ impl ClientRuntime {
         let missing_handle_ids: Vec<String> = contents
             .iter()
             .map(|(handle_id, _)| handle_id.clone())
-            .filter(|handle_id| {
-                !self
-                    .handle_provenance
-                    .contains_key(&(canonical.clone(), handle_id.clone()))
-            })
+            .filter(|handle_id| self.tracker.get(&canonical, handle_id).is_none())
             .collect();
 
         if !missing_handle_ids.is_empty() {
@@ -742,9 +644,8 @@ impl ClientRuntime {
 
         let mut events = Vec::new();
         for (handle_id, content) in contents {
-            let key = (canonical.clone(), handle_id.clone());
             let (file_path, node_type, token_count) = if let Some(prov) =
-                self.handle_provenance.get(&key)
+                self.tracker.get(&canonical, handle_id)
             {
                 (prov.file_path.clone(), prov.node_type, prov.token_count)
             } else if let Some((file_path, node_type, token_count)) = local_metadata.get(handle_id)
@@ -758,7 +659,7 @@ impl ClientRuntime {
                 )
             };
 
-            let query_event_id = self.recent_handle_query_events.get(&key).copied();
+            let query_event_id = self.tracker.query_event_id(&canonical, handle_id);
             events.push(ExpandEvent {
                 query_event_id,
                 handle_id: handle_id.clone(),
@@ -882,7 +783,7 @@ impl ClientRuntime {
         if let Some(gen) = gen {
             let old_gen = self.repo_generations.insert(repo_id.to_string(), gen);
             if old_gen.is_some() && old_gen != Some(gen) {
-                self.invalidate_provenance_for_repo(repo_id);
+                self.tracker.invalidate_repo(repo_id);
             }
         }
 
@@ -946,14 +847,11 @@ impl ClientRuntime {
         let canonical = canonical_path(repo_path);
         self.pending_predictive.remove(&canonical);
 
-        const LARGE_REPO_THRESHOLD: usize = 1000;
-        const MAX_PREDICTIVE_FILES: usize = 500;
-
         let is_large_repo = if status.files_indexed == 0 {
             let all_files = index.walk_files(&default_glob).unwrap_or_default();
             all_files.len() > LARGE_REPO_THRESHOLD
         } else {
-            status.files_indexed < LARGE_REPO_THRESHOLD
+            status.files_indexed > LARGE_REPO_THRESHOLD
         };
 
         if status.files_indexed == 0 && !is_large_repo {
@@ -1048,36 +946,19 @@ impl ClientRuntime {
         repo_id: Option<String>,
     ) {
         let canonical = canonical_path(repo_path);
-
         for handle in &result.handles {
-            let key = (canonical.clone(), handle.id.to_string());
-            let prov = HandleProvenance {
-                source: source.clone(),
-                generation: generation.or(handle.generation),
-                repo_id: repo_id.clone(),
-                file_path: handle.file_path.clone(),
-                node_type: handle.node_type,
-                token_count: handle.token_count,
-            };
-
-            // On update, skip re-enqueue — just update HashMap in-place
-            if self.handle_provenance.contains_key(&key) {
-                self.handle_provenance.insert(key, prov);
-            } else {
-                self.handle_provenance.insert(key.clone(), prov);
-                self.provenance_order.push_back(key);
-            }
-        }
-
-        // Evict if over cap
-        while self.handle_provenance.len() > PROVENANCE_CAP {
-            if let Some(oldest) = self.provenance_order.pop_front() {
-                // Lazy tombstone: skip if already gone (was updated in-place and
-                // has a newer entry in the deque)
-                self.handle_provenance.remove(&oldest);
-            } else {
-                break;
-            }
+            self.tracker.record(
+                &canonical,
+                &handle.id.to_string(),
+                HandleProvenance {
+                    source: source.clone(),
+                    generation: generation.or(handle.generation),
+                    repo_id: repo_id.clone(),
+                    file_path: handle.file_path.clone(),
+                    node_type: handle.node_type,
+                    token_count: handle.token_count,
+                },
+            );
         }
     }
 
@@ -1089,72 +970,28 @@ impl ClientRuntime {
     ) {
         let canonical = canonical_path(repo_path);
         for handle in &pack.handles {
-            let key = (canonical.clone(), handle.id.clone());
             let repo_id = match handle.source {
                 HandleSource::Service => service_repo_id.clone(),
                 HandleSource::Local => None,
             };
-            let prov = HandleProvenance {
-                source: handle.source.clone(),
-                generation: handle.generation,
-                repo_id,
-                file_path: handle.file_path.clone(),
-                node_type: handle.node_type,
-                token_count: handle.token_count,
-            };
-            if self.handle_provenance.contains_key(&key) {
-                self.handle_provenance.insert(key, prov);
-            } else {
-                self.handle_provenance.insert(key.clone(), prov);
-                self.provenance_order.push_back(key);
-            }
-        }
-        while self.handle_provenance.len() > PROVENANCE_CAP {
-            if let Some(oldest) = self.provenance_order.pop_front() {
-                self.handle_provenance.remove(&oldest);
-            } else {
-                break;
-            }
+            self.tracker.record(
+                &canonical,
+                &handle.id,
+                HandleProvenance {
+                    source: handle.source.clone(),
+                    generation: handle.generation,
+                    repo_id,
+                    file_path: handle.file_path.clone(),
+                    node_type: handle.node_type,
+                    token_count: handle.token_count,
+                },
+            );
         }
     }
 
     fn rewrite_expand_suggestions(&self, repo_path: &Path, pack: &mut EvidencePack) {
-        if pack.expand_suggestion.is_empty() {
-            return;
-        }
-
         let canonical = canonical_path(repo_path);
-        let mut fresh = Vec::new();
-        let mut repeated = Vec::new();
-        for id in &pack.expand_suggestion {
-            let key = (canonical.clone(), id.clone());
-            if self.recently_expanded.contains(&key) {
-                repeated.push(id.clone());
-            } else {
-                fresh.push(id.clone());
-            }
-        }
-
-        if fresh.is_empty() {
-            for handle in &pack.handles {
-                if fresh.len() >= pack.expand_suggestion.len() {
-                    break;
-                }
-                let key = (canonical.clone(), handle.id.clone());
-                if self.recently_expanded.contains(&key) {
-                    continue;
-                }
-                if !fresh.iter().any(|id| id == &handle.id) {
-                    fresh.push(handle.id.clone());
-                }
-            }
-        }
-
-        if !fresh.is_empty() {
-            fresh.extend(repeated);
-            fresh.truncate(pack.expand_suggestion.len());
-            pack.expand_suggestion = fresh;
-        }
+        pack.reorder_expand_suggestions(|id| self.tracker.was_recently_expanded(&canonical, id));
     }
 
     fn record_recently_expanded(&mut self, repo_path: &Path, contents: &[(String, String)]) {
@@ -1163,24 +1000,8 @@ impl ClientRuntime {
         }
         let canonical = canonical_path(repo_path);
         for (handle_id, _) in contents {
-            let key = (canonical.clone(), handle_id.clone());
-            if self.recently_expanded.insert(key.clone()) {
-                self.recently_expanded_order.push_back(key);
-            }
+            self.tracker.mark_expanded(&canonical, handle_id);
         }
-        while self.recently_expanded.len() > RECENT_EXPANDED_CAP {
-            if let Some(oldest) = self.recently_expanded_order.pop_front() {
-                self.recently_expanded.remove(&oldest);
-            } else {
-                break;
-            }
-        }
-    }
-
-    fn invalidate_provenance_for_repo(&mut self, repo_id: &str) {
-        // Remove all HashMap entries for this repo; stale VecDeque entries become tombstones
-        self.handle_provenance
-            .retain(|_, prov| prov.repo_id.as_deref() != Some(repo_id));
     }
 }
 
@@ -1210,19 +1031,19 @@ mod tests {
 
     #[test]
     fn test_standalone_no_service() {
-        let rt = ClientRuntime::new(None, StandalonePolicy::FullIndex);
+        let rt = ClientRuntime::new(None, None);
         assert!(!rt.is_service_mode());
     }
 
     #[test]
     fn test_service_mode() {
-        let rt = ClientRuntime::new(Some("http://localhost:3000"), StandalonePolicy::FullIndex);
+        let rt = ClientRuntime::new(Some("http://localhost:3000"), None);
         assert!(rt.is_service_mode());
     }
 
     #[test]
     fn test_list_repos_without_service() {
-        let rt = ClientRuntime::new(None, StandalonePolicy::FullIndex);
+        let rt = ClientRuntime::new(None, None);
         let err = rt.list_repos().unwrap_err();
         assert!(matches!(
             err,
@@ -1232,7 +1053,7 @@ mod tests {
 
     #[test]
     fn test_service_status_without_service() {
-        let rt = ClientRuntime::new(None, StandalonePolicy::FullIndex);
+        let rt = ClientRuntime::new(None, None);
         let err = rt.service_status().unwrap_err();
         assert!(matches!(
             err,
@@ -1242,7 +1063,7 @@ mod tests {
 
     #[test]
     fn test_reindex_by_id_without_service() {
-        let rt = ClientRuntime::new(None, StandalonePolicy::FullIndex);
+        let rt = ClientRuntime::new(None, None);
         let err = rt.reindex_by_id("some-id", None).unwrap_err();
         assert!(matches!(
             err,
@@ -1252,14 +1073,16 @@ mod tests {
 
     #[test]
     fn test_provenance_eviction() {
-        let mut rt = ClientRuntime::new(None, StandalonePolicy::FullIndex);
-        let path = Path::new("/tmp/test-repo");
+        use crate::provenance::PROVENANCE_CAP;
+
+        let mut rt = ClientRuntime::new(None, None);
 
         // Insert more than PROVENANCE_CAP entries
         for i in 0..PROVENANCE_CAP + 10 {
-            let key = ("/tmp/test-repo".to_string(), format!("h{:024x}", i));
-            rt.handle_provenance.insert(
-                key.clone(),
+            let handle_id = format!("h{:024x}", i);
+            rt.tracker.record(
+                "/tmp/test-repo",
+                &handle_id,
                 HandleProvenance {
                     source: HandleSource::Local,
                     generation: None,
@@ -1269,31 +1092,25 @@ mod tests {
                     token_count: 10,
                 },
             );
-            rt.provenance_order.push_back(key);
         }
 
-        // Trigger eviction
-        let result = QueryResult {
-            handles: vec![],
-            ref_handles: None,
-            total_tokens: 0,
-            truncated: false,
-            total_matches: 0,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
-        };
-        rt.record_provenance_for_result(path, &result, HandleSource::Local, None, None);
-
-        assert!(rt.handle_provenance.len() <= PROVENANCE_CAP);
+        // The tracker should have capped at PROVENANCE_CAP
+        // Verify that the earliest entry was evicted
+        assert!(rt
+            .tracker
+            .get("/tmp/test-repo", &format!("h{:024x}", 0))
+            .is_none());
+        // And a later entry still exists
+        assert!(rt
+            .tracker
+            .get("/tmp/test-repo", &format!("h{:024x}", PROVENANCE_CAP + 5))
+            .is_some());
     }
 
     #[test]
     fn test_expand_feedback_records_without_provenance() {
         let repo = temp_repo();
-        let mut rt = ClientRuntime::new(None, StandalonePolicy::QueryOnly);
+        let mut rt = ClientRuntime::new(None, None);
         let handle_id = "h000000000000000000000000".to_string();
         let contents = vec![(handle_id, "fn hello_world() {}".to_string())];
 

@@ -51,7 +51,7 @@ pub struct QueryAnalytics {
     pub top_symbols: HashMap<String, u64>,
     pub top_patterns: HashMap<String, u64>,
     pub top_expanded_files: HashMap<String, u64>,
-    pub queries_by_repo: HashMap<String, u64>,
+    pub requests_by_repo: HashMap<String, u64>,
 }
 
 impl QueryAnalytics {
@@ -60,7 +60,7 @@ impl QueryAnalytics {
             top_symbols: HashMap::new(),
             top_patterns: HashMap::new(),
             top_expanded_files: HashMap::new(),
-            queries_by_repo: HashMap::new(),
+            requests_by_repo: HashMap::new(),
         }
     }
 }
