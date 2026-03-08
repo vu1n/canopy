@@ -4,6 +4,7 @@ use canopy_core::feedback::{ExpandEvent, FeedbackStore, QueryEvent, QueryHandle}
 use canopy_core::index::ExpandedHandleDetail;
 use canopy_core::{QueryParams, QueryResult};
 use std::collections::HashMap;
+use tracing::warn;
 
 /// Record a query event to the feedback store, returning the event ID on success.
 ///
@@ -15,7 +16,7 @@ pub fn try_record_feedback_query(
 ) -> Option<i64> {
     let feedback_store = feedback_store?;
     let Ok(store) = feedback_store.lock() else {
-        eprintln!("[canopy-service] feedback lock poisoned while recording query");
+        warn!("[canopy-service] feedback lock poisoned while recording query");
         return None;
     };
 
@@ -30,7 +31,7 @@ pub fn try_record_feedback_query(
     let query_event_id = match store.record_query_event(&event) {
         Ok(id) => id,
         Err(e) => {
-            eprintln!("[canopy-service] feedback: failed to record query event: {e}");
+            warn!("[canopy-service] feedback: failed to record query event: {e}");
             return None;
         }
     };
@@ -38,16 +39,10 @@ pub fn try_record_feedback_query(
     let handles: Vec<QueryHandle> = result
         .handles
         .iter()
-        .map(|handle| QueryHandle {
-            handle_id: handle.id.to_string(),
-            file_path: handle.file_path.clone(),
-            node_type: handle.node_type,
-            token_count: handle.token_count,
-            first_match_glob: None,
-        })
+        .map(|handle| QueryHandle::from_handle(handle, None))
         .collect();
     if let Err(e) = store.record_query_handles(query_event_id, &handles) {
-        eprintln!("[canopy-service] feedback: failed to record query handles: {e}");
+        warn!("[canopy-service] feedback: failed to record query handles: {e}");
     }
 
     for handle in result.handles.iter().filter(|h| h.content.is_some()) {
@@ -59,7 +54,7 @@ pub fn try_record_feedback_query(
             token_count: handle.token_count,
             auto_expanded: true,
         }) {
-            eprintln!("[canopy-service] feedback: failed to record auto-expand event: {e}");
+            warn!("[canopy-service] feedback: failed to record auto-expand event: {e}");
         }
     }
 
@@ -78,24 +73,43 @@ pub fn try_record_feedback_expand(
         return false;
     };
     let Ok(store) = feedback_store.lock() else {
-        eprintln!("[canopy-service] feedback lock poisoned while recording expand");
+        warn!("[canopy-service] feedback lock poisoned while recording expand");
         return false;
     };
 
     let mut wrote_any = false;
-    for (handle_id, file_path, node_type, token_count, _content) in rows {
+    for row in rows {
         match store.record_expand_event(&ExpandEvent {
-            query_event_id: recent_query_event_ids.get(handle_id).copied(),
-            handle_id: handle_id.clone(),
-            file_path: file_path.clone(),
-            node_type: *node_type,
-            token_count: *token_count,
+            query_event_id: recent_query_event_ids.get(&row.handle_id).copied(),
+            handle_id: row.handle_id.clone(),
+            file_path: row.file_path.clone(),
+            node_type: row.node_type,
+            token_count: row.token_count,
             auto_expanded: false,
         }) {
             Ok(_) => wrote_any = true,
-            Err(e) => eprintln!("[canopy-service] feedback: failed to record expand event: {e}"),
+            Err(e) => warn!("[canopy-service] feedback: failed to record expand event: {e}"),
         }
     }
 
     wrote_any
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn try_record_feedback_query_returns_none_when_no_store() {
+        let params = QueryParams::default();
+        let result = QueryResult::default();
+        assert!(try_record_feedback_query(None, &params, &result).is_none());
+    }
+
+    #[test]
+    fn try_record_feedback_expand_returns_false_when_no_store() {
+        let rows: Vec<ExpandedHandleDetail> = vec![];
+        let ids = HashMap::new();
+        assert!(!try_record_feedback_expand(None, &rows, &ids));
+    }
 }

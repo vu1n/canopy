@@ -1,5 +1,7 @@
+use canopy_core::capped_map::{CappedMap, CappedSet};
 use canopy_core::{
-    feedback::FeedbackStore, CanopyError, NodeType, QueryResult, RepoIndex, RepoShard,
+    feedback::{FeedbackStore, NODE_TYPE_PRIOR_CACHE_TTL},
+    CanopyError, NodeType, QueryResult, RepoIndex, RepoShard,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
@@ -8,12 +10,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::RwLock;
+use tracing::warn;
 
 pub type SharedState = Arc<AppState>;
 pub const QUERY_CACHE_MAX_ENTRIES: usize = 128;
 pub const RECENT_QUERY_EVENT_CAP: usize = 20_000;
 pub const RECENT_EXPANDED_HANDLE_CAP: usize = 20_000;
-pub const NODE_TYPE_PRIOR_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 type NodeTypePriors = HashMap<NodeType, f64>;
 type NodeTypePriorsCacheEntry = (Instant, NodeTypePriors);
 
@@ -70,6 +72,19 @@ pub struct CachedIndex {
     pub generation: u64,
 }
 
+impl CachedIndex {
+    /// Lock the index mutex, mapping poison errors to `CanopyError`.
+    pub fn lock_index(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, RepoIndex>, CanopyError> {
+        self.index.lock().map_err(|err| {
+            CanopyError::Io(io::Error::other(format!(
+                "Index mutex poisoned: {err}"
+            )))
+        })
+    }
+}
+
 pub struct RepoQueryCache {
     entries: HashMap<String, QueryResult>,
     order: VecDeque<String>,
@@ -123,17 +138,27 @@ impl RepoQueryCache {
     }
 }
 
+/// Cached indexes and query result caches.
+///
+/// Lock ordering: acquire `index_state` before `feedback_state`.
+struct IndexState {
+    indexes: HashMap<String, Arc<CachedIndex>>,
+    query_caches: HashMap<String, RepoQueryCache>,
+}
+
+/// Feedback stores, priors cache, and recent handle tracking.
+struct FeedbackState {
+    stores: HashMap<String, Arc<Mutex<FeedbackStore>>>,
+    node_type_priors_cache: HashMap<String, NodeTypePriorsCacheEntry>,
+    handle_query_events: CappedMap<(String, String), i64>,
+    expanded_handles: CappedSet<(String, String)>,
+}
+
 pub struct AppState {
     pub shards: RwLock<HashMap<String, RepoShard>>,
     pub metrics: ServiceMetrics,
-    indexes: RwLock<HashMap<String, Arc<CachedIndex>>>,
-    query_caches: RwLock<HashMap<String, RepoQueryCache>>,
-    feedback_stores: RwLock<HashMap<String, Arc<Mutex<FeedbackStore>>>>,
-    node_type_priors_cache: RwLock<HashMap<String, NodeTypePriorsCacheEntry>>,
-    recent_handle_query_events: RwLock<HashMap<(String, String), i64>>,
-    recent_handle_query_order: RwLock<VecDeque<(String, String)>>,
-    recent_expanded_handles: RwLock<HashSet<(String, String)>>,
-    recent_expanded_order: RwLock<VecDeque<(String, String)>>,
+    index_state: RwLock<IndexState>,
+    feedback_state: RwLock<FeedbackState>,
 }
 
 impl AppState {
@@ -141,14 +166,16 @@ impl AppState {
         Self {
             shards: RwLock::new(HashMap::new()),
             metrics: ServiceMetrics::new(),
-            indexes: RwLock::new(HashMap::new()),
-            query_caches: RwLock::new(HashMap::new()),
-            feedback_stores: RwLock::new(HashMap::new()),
-            node_type_priors_cache: RwLock::new(HashMap::new()),
-            recent_handle_query_events: RwLock::new(HashMap::new()),
-            recent_handle_query_order: RwLock::new(VecDeque::new()),
-            recent_expanded_handles: RwLock::new(HashSet::new()),
-            recent_expanded_order: RwLock::new(VecDeque::new()),
+            index_state: RwLock::new(IndexState {
+                indexes: HashMap::new(),
+                query_caches: HashMap::new(),
+            }),
+            feedback_state: RwLock::new(FeedbackState {
+                stores: HashMap::new(),
+                node_type_priors_cache: HashMap::new(),
+                handle_query_events: CappedMap::new(RECENT_QUERY_EVENT_CAP),
+                expanded_handles: CappedSet::new(RECENT_EXPANDED_HANDLE_CAP),
+            }),
         }
     }
 
@@ -159,8 +186,8 @@ impl AppState {
         generation: u64,
     ) -> Result<Arc<CachedIndex>, CanopyError> {
         {
-            let indexes = self.indexes.read().await;
-            if let Some(cached) = indexes.get(repo_id) {
+            let state = self.index_state.read().await;
+            if let Some(cached) = state.indexes.get(repo_id) {
                 if cached.generation == generation {
                     self.metrics
                         .index_cache_hits
@@ -187,14 +214,16 @@ impl AppState {
             generation,
         });
 
-        let mut indexes = self.indexes.write().await;
-        if let Some(existing) = indexes.get(repo_id) {
+        let mut state = self.index_state.write().await;
+        if let Some(existing) = state.indexes.get(repo_id) {
             if existing.generation == generation {
                 return Ok(Arc::clone(existing));
             }
         }
 
-        indexes.insert(repo_id.to_string(), Arc::clone(&candidate));
+        state
+            .indexes
+            .insert(repo_id.to_string(), Arc::clone(&candidate));
         Ok(candidate)
     }
 
@@ -204,8 +233,9 @@ impl AppState {
         cache_key: &str,
         generation: u64,
     ) -> Option<QueryResult> {
-        let caches = self.query_caches.read().await;
-        caches
+        let state = self.index_state.read().await;
+        state
+            .query_caches
             .get(repo_id)
             .and_then(|repo_cache| repo_cache.get(cache_key, generation).cloned())
     }
@@ -221,34 +251,29 @@ impl AppState {
             return;
         }
 
-        let mut caches = self.query_caches.write().await;
-        let repo_cache = caches
+        let mut state = self.index_state.write().await;
+        let repo_cache = state
+            .query_caches
             .entry(repo_id.to_string())
             .or_insert_with(|| RepoQueryCache::new(generation, QUERY_CACHE_MAX_ENTRIES));
         repo_cache.insert(cache_key, result, generation);
     }
 
     pub async fn invalidate_repo(&self, repo_id: &str) {
-        self.indexes.write().await.remove(repo_id);
-        self.query_caches.write().await.remove(repo_id);
-        self.feedback_stores.write().await.remove(repo_id);
-        self.node_type_priors_cache.write().await.remove(repo_id);
-        self.recent_handle_query_events
-            .write()
-            .await
-            .retain(|(r, _), _| r != repo_id);
-        self.recent_handle_query_order
-            .write()
-            .await
-            .retain(|(r, _)| r != repo_id);
-        self.recent_expanded_handles
-            .write()
-            .await
-            .retain(|(r, _)| r != repo_id);
-        self.recent_expanded_order
-            .write()
-            .await
-            .retain(|(r, _)| r != repo_id);
+        {
+            let mut state = self.index_state.write().await;
+            state.indexes.remove(repo_id);
+            state.query_caches.remove(repo_id);
+        }
+        {
+            let mut state = self.feedback_state.write().await;
+            state.stores.remove(repo_id);
+            state.node_type_priors_cache.remove(repo_id);
+            state
+                .handle_query_events
+                .retain(|(r, _), _| r != repo_id);
+            state.expanded_handles.retain(|(r, _)| r != repo_id);
+        }
     }
 
     pub async fn feedback_store_for_repo(
@@ -257,8 +282,8 @@ impl AppState {
         repo_root: &str,
     ) -> Option<Arc<Mutex<FeedbackStore>>> {
         {
-            let stores = self.feedback_stores.read().await;
-            if let Some(store) = stores.get(repo_id) {
+            let state = self.feedback_state.read().await;
+            if let Some(store) = state.stores.get(repo_id) {
                 return Some(Arc::clone(store));
             }
         }
@@ -266,7 +291,7 @@ impl AppState {
         let opened = match FeedbackStore::open(Path::new(repo_root)) {
             Ok(store) => Arc::new(Mutex::new(store)),
             Err(err) => {
-                eprintln!(
+                warn!(
                     "[canopy-service] feedback disabled for repo {}: {}",
                     repo_id, err
                 );
@@ -274,11 +299,13 @@ impl AppState {
             }
         };
 
-        let mut stores = self.feedback_stores.write().await;
-        if let Some(existing) = stores.get(repo_id) {
+        let mut state = self.feedback_state.write().await;
+        if let Some(existing) = state.stores.get(repo_id) {
             return Some(Arc::clone(existing));
         }
-        stores.insert(repo_id.to_string(), Arc::clone(&opened));
+        state
+            .stores
+            .insert(repo_id.to_string(), Arc::clone(&opened));
         Some(opened)
     }
 
@@ -288,8 +315,8 @@ impl AppState {
         repo_root: &str,
     ) -> Option<NodeTypePriors> {
         {
-            let cache = self.node_type_priors_cache.read().await;
-            if let Some((loaded_at, priors)) = cache.get(repo_id) {
+            let state = self.feedback_state.read().await;
+            if let Some((loaded_at, priors)) = state.node_type_priors_cache.get(repo_id) {
                 if loaded_at.elapsed() < NODE_TYPE_PRIOR_CACHE_TTL {
                     return Some(priors.clone());
                 }
@@ -299,7 +326,7 @@ impl AppState {
         let store = self.feedback_store_for_repo(repo_id, repo_root).await?;
         let priors = {
             let Ok(store_guard) = store.lock() else {
-                eprintln!(
+                warn!(
                     "[canopy-service] feedback lock poisoned while loading priors for {}",
                     repo_id
                 );
@@ -308,7 +335,7 @@ impl AppState {
             match store_guard.get_node_type_priors() {
                 Ok(priors) => priors,
                 Err(err) => {
-                    eprintln!(
+                    warn!(
                         "[canopy-service] failed to load node type priors for {}: {}",
                         repo_id, err
                     );
@@ -321,15 +348,20 @@ impl AppState {
             return None;
         }
 
-        self.node_type_priors_cache
+        self.feedback_state
             .write()
             .await
+            .node_type_priors_cache
             .insert(repo_id.to_string(), (Instant::now(), priors.clone()));
         Some(priors)
     }
 
     pub async fn invalidate_node_type_priors_cache(&self, repo_id: &str) {
-        self.node_type_priors_cache.write().await.remove(repo_id);
+        self.feedback_state
+            .write()
+            .await
+            .node_type_priors_cache
+            .remove(repo_id);
     }
 
     pub async fn remember_query_event_for_handles(
@@ -338,25 +370,10 @@ impl AppState {
         handle_ids: &[String],
         query_event_id: i64,
     ) {
-        let mut map = self.recent_handle_query_events.write().await;
-        let mut order = self.recent_handle_query_order.write().await;
-
+        let mut state = self.feedback_state.write().await;
         for handle_id in handle_ids {
             let key = (repo_id.to_string(), handle_id.clone());
-            if map.contains_key(&key) {
-                map.insert(key, query_event_id);
-            } else {
-                map.insert(key.clone(), query_event_id);
-                order.push_back(key);
-            }
-        }
-
-        while map.len() > RECENT_QUERY_EVENT_CAP {
-            if let Some(oldest) = order.pop_front() {
-                map.remove(&oldest);
-            } else {
-                break;
-            }
+            state.handle_query_events.insert(key, query_event_id);
         }
     }
 
@@ -365,11 +382,11 @@ impl AppState {
         repo_id: &str,
         handle_ids: &[String],
     ) -> HashMap<String, i64> {
-        let map = self.recent_handle_query_events.read().await;
+        let state = self.feedback_state.read().await;
         let mut out = HashMap::new();
         for handle_id in handle_ids {
             let key = (repo_id.to_string(), handle_id.clone());
-            if let Some(query_event_id) = map.get(&key).copied() {
+            if let Some(query_event_id) = state.handle_query_events.get(&key).copied() {
                 out.insert(handle_id.clone(), query_event_id);
             }
         }
@@ -380,23 +397,10 @@ impl AppState {
         if handle_ids.is_empty() {
             return;
         }
-
-        let mut handles = self.recent_expanded_handles.write().await;
-        let mut order = self.recent_expanded_order.write().await;
-
+        let mut state = self.feedback_state.write().await;
         for handle_id in handle_ids {
             let key = (repo_id.to_string(), handle_id.clone());
-            if handles.insert(key.clone()) {
-                order.push_back(key);
-            }
-        }
-
-        while handles.len() > RECENT_EXPANDED_HANDLE_CAP {
-            if let Some(oldest) = order.pop_front() {
-                handles.remove(&oldest);
-            } else {
-                break;
-            }
+            state.expanded_handles.insert(key);
         }
     }
 
@@ -409,11 +413,11 @@ impl AppState {
             return HashSet::new();
         }
 
-        let handles = self.recent_expanded_handles.read().await;
+        let state = self.feedback_state.read().await;
         let mut out = HashSet::new();
         for handle_id in handle_ids {
             let key = (repo_id.to_string(), handle_id.clone());
-            if handles.contains(&key) {
+            if state.expanded_handles.contains(&key) {
                 out.insert(handle_id.clone());
             }
         }
@@ -427,16 +431,8 @@ mod tests {
 
     fn result(total_matches: usize) -> QueryResult {
         QueryResult {
-            handles: Vec::new(),
-            ref_handles: None,
-            total_tokens: 0,
-            truncated: false,
             total_matches,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: Vec::new(),
+            ..QueryResult::default()
         }
     }
 
