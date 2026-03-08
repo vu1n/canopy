@@ -43,6 +43,10 @@ colored = "3.0"
 # MCP/Async
 tokio = { version = "1", features = ["full"] }
 
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 # HTTP Service
 axum = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
