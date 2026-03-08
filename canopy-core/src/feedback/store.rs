@@ -1,55 +1,15 @@
-//! Feedback storage for query/expand signals used by ranking heuristics.
-
-use crate::{CanopyError, NodeType};
+use super::{
+    now_ts, ExpandEvent, FeedbackMetrics, QueryEvent, QueryHandle, EXPAND_EVENTS_CAP,
+    QUERY_EVENTS_CAP, RETENTION_DAYS, TOP_K_GLOBS,
+};
+use crate::NodeType;
 use rusqlite::{params, Connection};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-const RETENTION_DAYS: i64 = 30;
-const QUERY_EVENTS_CAP: i64 = 10_000;
-const EXPAND_EVENTS_CAP: i64 = 50_000;
-const TOP_K_GLOBS: usize = 5;
-
-#[derive(Debug, Clone)]
-pub struct QueryEvent {
-    pub query_text: String,
-    pub predicted_globs: Option<Vec<String>>,
-    pub files_indexed: usize,
-    pub handles_returned: usize,
-    pub total_tokens: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct QueryHandle {
-    pub handle_id: String,
-    pub file_path: String,
-    pub node_type: NodeType,
-    pub token_count: usize,
-    pub first_match_glob: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ExpandEvent {
-    pub query_event_id: Option<i64>,
-    pub handle_id: String,
-    pub file_path: String,
-    pub node_type: NodeType,
-    pub token_count: usize,
-    pub auto_expanded: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct FeedbackMetrics {
-    pub glob_hit_rate_at_k: f64,
-    pub handle_expand_accept_rate: f64,
-    pub avg_tokens_per_expand: f64,
-    pub sample_count: usize,
-}
 
 pub struct FeedbackStore {
-    conn: Connection,
+    pub(super) conn: Connection,
 }
 
 impl FeedbackStore {
@@ -114,10 +74,7 @@ impl FeedbackStore {
 
     pub fn record_query_event(&self, event: &QueryEvent) -> crate::Result<i64> {
         let predicted_globs = match &event.predicted_globs {
-            Some(globs) if !globs.is_empty() => Some(
-                serde_json::to_string(globs)
-                    .map_err(|e| CanopyError::ConfigParse(e.to_string()))?,
-            ),
+            Some(globs) if !globs.is_empty() => Some(serde_json::to_string(globs)?),
             _ => None,
         };
 
@@ -375,11 +332,11 @@ impl FeedbackStore {
             glob_hit_rate_at_k,
             handle_expand_accept_rate,
             avg_tokens_per_expand: avg_tokens_per_expand.unwrap_or(0.0),
-            sample_count: sample_count as usize,
+            sample_count: sample_count.max(0) as usize,
         })
     }
 
-    fn prune(&self) -> crate::Result<()> {
+    pub(super) fn prune(&self) -> crate::Result<()> {
         let cutoff = now_ts() - RETENTION_DAYS * 86_400;
         self.conn.execute(
             "DELETE FROM query_events WHERE timestamp < ?",
@@ -419,160 +376,5 @@ impl FeedbackStore {
         )?;
 
         Ok(())
-    }
-}
-
-fn now_ts() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::NodeType;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_repo() -> std::path::PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("canopy-feedback-test-{ts}"));
-        fs::create_dir_all(&root).unwrap();
-        root
-    }
-
-    #[test]
-    fn record_and_score_roundtrip() {
-        let repo_root = temp_repo();
-        let store = FeedbackStore::open(&repo_root).unwrap();
-
-        let event_id = store
-            .record_query_event(&QueryEvent {
-                query_text: "auth".to_string(),
-                predicted_globs: Some(vec!["**/auth/**/*.rs".to_string()]),
-                files_indexed: 10,
-                handles_returned: 1,
-                total_tokens: 120,
-            })
-            .unwrap();
-
-        store
-            .record_query_handles(
-                event_id,
-                &[QueryHandle {
-                    handle_id: "h123".to_string(),
-                    file_path: "src/auth/mod.rs".to_string(),
-                    node_type: NodeType::Function,
-                    token_count: 120,
-                    first_match_glob: Some("**/auth/**/*.rs".to_string()),
-                }],
-            )
-            .unwrap();
-
-        store
-            .record_expand_event(&ExpandEvent {
-                query_event_id: Some(event_id),
-                handle_id: "h123".to_string(),
-                file_path: "src/auth/mod.rs".to_string(),
-                node_type: NodeType::Function,
-                token_count: 120,
-                auto_expanded: false,
-            })
-            .unwrap();
-
-        let scores = store
-            .get_glob_scores(&["**/auth/**/*.rs".to_string()], 7.0)
-            .unwrap();
-        assert!(scores.get("**/auth/**/*.rs").copied().unwrap_or(0.0) > 0.0);
-
-        let priors = store.get_node_type_priors().unwrap();
-        assert!(priors.get(&NodeType::Function).copied().unwrap_or(0.0) > 0.0);
-    }
-
-    #[test]
-    fn prune_removes_expired_rows_and_cascades_handles() {
-        let repo_root = temp_repo();
-        let store = FeedbackStore::open(&repo_root).unwrap();
-        let old_ts = now_ts() - (RETENTION_DAYS + 1) * 86_400;
-
-        store
-            .conn
-            .execute(
-                "INSERT INTO query_events (timestamp, query_text, files_indexed, handles_returned, total_tokens)
-                 VALUES (?, ?, 0, 1, 10)",
-                params![old_ts, "legacy query"],
-            )
-            .unwrap();
-        let old_query_event_id = store.conn.last_insert_rowid();
-
-        store
-            .conn
-            .execute(
-                "INSERT INTO query_handles
-                 (query_event_id, handle_id, file_path, node_type, token_count, first_match_glob, returned_at)
-                 VALUES (?, ?, ?, ?, ?, NULL, ?)",
-                params![
-                    old_query_event_id,
-                    "hold",
-                    "src/old.rs",
-                    NodeType::Function.as_int() as i64,
-                    10i64,
-                    old_ts,
-                ],
-            )
-            .unwrap();
-
-        store
-            .conn
-            .execute(
-                "INSERT INTO expand_events
-                 (query_event_id, handle_id, file_path, node_type, token_count, auto_expanded, expanded_at)
-                 VALUES (?, ?, ?, ?, ?, 0, ?)",
-                params![
-                    old_query_event_id,
-                    "hold",
-                    "src/old.rs",
-                    NodeType::Function.as_int() as i64,
-                    10i64,
-                    old_ts,
-                ],
-            )
-            .unwrap();
-
-        store.prune().unwrap();
-
-        let query_count: i64 = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM query_events WHERE id = ?",
-                params![old_query_event_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(query_count, 0);
-
-        let handle_count: i64 = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM query_handles WHERE query_event_id = ?",
-                params![old_query_event_id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(handle_count, 0);
-
-        let expand_count: i64 = store
-            .conn
-            .query_row(
-                "SELECT COUNT(*) FROM expand_events WHERE handle_id = ?",
-                params!["hold"],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(expand_count, 0);
     }
 }
