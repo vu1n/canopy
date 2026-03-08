@@ -64,11 +64,79 @@ pub struct FeedbackSummary {
     pub sample_count: usize,
 }
 
-fn top_n_sorted(map: &HashMap<String, u64>, n: usize) -> Vec<(String, u64)> {
+pub(crate) fn top_n_sorted(map: &HashMap<String, u64>, n: usize) -> Vec<(String, u64)> {
     let mut entries: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
     entries.sort_by(|a, b| b.1.cmp(&a.1));
     entries.truncate(n);
     entries
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_n_sorted_returns_sorted_by_count_descending() {
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), 10);
+        map.insert("b".to_string(), 30);
+        map.insert("c".to_string(), 20);
+        let result = top_n_sorted(&map, 3);
+        assert_eq!(result[0], ("b".to_string(), 30));
+        assert_eq!(result[1], ("c".to_string(), 20));
+        assert_eq!(result[2], ("a".to_string(), 10));
+    }
+
+    #[test]
+    fn top_n_sorted_truncates_to_n() {
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), 10);
+        map.insert("b".to_string(), 30);
+        map.insert("c".to_string(), 20);
+        let result = top_n_sorted(&map, 2);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].1, 30);
+        assert_eq!(result[1].1, 20);
+    }
+
+    #[test]
+    fn top_n_sorted_handles_empty_map() {
+        let map: HashMap<String, u64> = HashMap::new();
+        let result = top_n_sorted(&map, 5);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn metrics_response_serializes_to_json() {
+        let resp = MetricsResponse {
+            performance: PerformanceMetrics {
+                queries: 100,
+                query_cache_hit_rate: 0.75,
+                query_cache_hits: 75,
+                query_cache_misses: 25,
+                expands: 50,
+                index_cache_hits: 40,
+                index_cache_misses: 10,
+                reindexes: 3,
+                avg_query_ms: 15,
+                avg_expand_ms: 5,
+            },
+            analytics: AnalyticsMetrics {
+                top_symbols: vec![NamedCount {
+                    name: "Config".to_string(),
+                    count: 42,
+                }],
+                top_patterns: vec![],
+                top_expanded_files: vec![],
+                requests_by_repo: HashMap::new(),
+                feedback_by_repo: HashMap::new(),
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["performance"]["queries"], 100);
+        assert_eq!(json["performance"]["query_cache_hit_rate"], 0.75);
+        assert_eq!(json["analytics"]["top_symbols"][0]["name"], "Config");
+    }
 }
 
 pub async fn metrics(State(state): State<SharedState>) -> Json<MetricsResponse> {
