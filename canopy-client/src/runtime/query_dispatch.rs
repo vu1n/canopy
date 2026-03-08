@@ -131,8 +131,7 @@ impl ClientRuntime {
         let query = params.to_query()?;
         let mut options = params.to_options();
         options.node_type_priors = self.load_node_type_priors(repo_path);
-        let result =
-            canopy_core::query::execute_query_with_options(&query, &index, options)?;
+        let result = canopy_core::query::execute_query_with_options(&query, &index, options)?;
 
         self.record_provenance_for_result(repo_path, &result, HandleSource::Local, None, None);
         Ok(result)

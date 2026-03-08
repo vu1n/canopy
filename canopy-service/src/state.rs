@@ -74,13 +74,9 @@ pub struct CachedIndex {
 
 impl CachedIndex {
     /// Lock the index mutex, mapping poison errors to `CanopyError`.
-    pub fn lock_index(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, RepoIndex>, CanopyError> {
+    pub fn lock_index(&self) -> Result<std::sync::MutexGuard<'_, RepoIndex>, CanopyError> {
         self.index.lock().map_err(|err| {
-            CanopyError::Io(io::Error::other(format!(
-                "Index mutex poisoned: {err}"
-            )))
+            CanopyError::Io(io::Error::other(format!("Index mutex poisoned: {err}")))
         })
     }
 }
@@ -269,9 +265,7 @@ impl AppState {
             let mut state = self.feedback_state.write().await;
             state.stores.remove(repo_id);
             state.node_type_priors_cache.remove(repo_id);
-            state
-                .handle_query_events
-                .retain(|(r, _), _| r != repo_id);
+            state.handle_query_events.retain(|(r, _), _| r != repo_id);
             state.expanded_handles.retain(|(r, _)| r != repo_id);
         }
     }

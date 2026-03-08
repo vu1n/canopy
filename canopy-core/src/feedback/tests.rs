@@ -201,10 +201,7 @@ fn glob_scores_decay_with_age() {
     // The score = expanded_weight / returned_weight, so both are 1.0 (since both
     // expanded and returned weights decay equally).
     let scores = store
-        .get_glob_scores(
-            &["old_glob".to_string(), "new_glob".to_string()],
-            7.0,
-        )
+        .get_glob_scores(&["old_glob".to_string(), "new_glob".to_string()], 7.0)
         .unwrap();
     assert!(scores.contains_key("old_glob"));
     assert!(scores.contains_key("new_glob"));
@@ -324,7 +321,11 @@ fn node_type_priors_distinguish_types() {
     let qid = store.conn.last_insert_rowid();
 
     // 2 Function handles, 1 expanded; 1 Struct handle, not expanded
-    for (id, nt) in [("hf1", NodeType::Function), ("hf2", NodeType::Function), ("hs1", NodeType::Struct)] {
+    for (id, nt) in [
+        ("hf1", NodeType::Function),
+        ("hf2", NodeType::Function),
+        ("hs1", NodeType::Struct),
+    ] {
         store
             .conn
             .execute(
@@ -346,10 +347,6 @@ fn node_type_priors_distinguish_types() {
     let priors = store.get_node_type_priors().unwrap();
     let fn_prior = priors.get(&NodeType::Function).copied().unwrap_or(0.0);
     let st_prior = priors.get(&NodeType::Struct).copied().unwrap_or(0.0);
-    assert!(
-        fn_prior > 0.0,
-        "Function prior should be > 0: {}",
-        fn_prior
-    );
+    assert!(fn_prior > 0.0, "Function prior should be > 0: {}", fn_prior);
     assert_eq!(st_prior, 0.0, "Struct prior should be 0 (never expanded)");
 }

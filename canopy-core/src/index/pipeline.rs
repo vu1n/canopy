@@ -557,8 +557,8 @@ impl RepoIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::test_helpers::setup_repo;
+    use super::*;
     use std::io::Write;
 
     #[test]
@@ -585,7 +585,11 @@ mod tests {
 
         // Each entry should have valid data
         for (path, cache) in &meta {
-            assert!(path.starts_with("src/"), "path should be relative: {}", path);
+            assert!(
+                path.starts_with("src/"),
+                "path should be relative: {}",
+                path
+            );
             assert!(cache.mtime > 0, "mtime should be positive");
             assert!(cache.tokens > 0, "tokens should be positive");
         }

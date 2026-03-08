@@ -362,8 +362,21 @@ mod tests {
     use super::*;
     use crate::{Handle, NodeType, Span};
 
-    fn make_handle(file: &str, node_type: NodeType, span: Span, tokens: usize, preview: &str) -> Handle {
-        Handle::new(file.to_string(), node_type, span, (1, 10), tokens, preview.to_string())
+    fn make_handle(
+        file: &str,
+        node_type: NodeType,
+        span: Span,
+        tokens: usize,
+        preview: &str,
+    ) -> Handle {
+        Handle::new(
+            file.to_string(),
+            node_type,
+            span,
+            (1, 10),
+            tokens,
+            preview.to_string(),
+        )
     }
 
     fn make_query_result(handles: Vec<Handle>) -> QueryResult {
@@ -387,7 +400,10 @@ mod tests {
         assert!(pack.handles.is_empty());
         assert!(pack.files.is_empty());
         assert!(pack.expand_suggestion.is_empty());
-        assert_eq!(pack.guidance.recommended_action, EvidenceAction::RefineQuery);
+        assert_eq!(
+            pack.guidance.recommended_action,
+            EvidenceAction::RefineQuery
+        );
         assert!(!pack.guidance.stop_querying);
     }
 
@@ -398,7 +414,13 @@ mod tests {
             .map(|i| {
                 let start = i * 100;
                 let end = start + 50;
-                make_handle("src/auth.rs", NodeType::Function, start..end, 40, "auth function code")
+                make_handle(
+                    "src/auth.rs",
+                    NodeType::Function,
+                    start..end,
+                    40,
+                    "auth function code",
+                )
             })
             .collect();
         let result = make_query_result(handles);
@@ -422,7 +444,11 @@ mod tests {
         assert_eq!(pack.selected_count, 3);
         assert_eq!(pack.files.len(), 2);
 
-        let file_a = pack.files.iter().find(|f| f.file_path == "src/a.rs").unwrap();
+        let file_a = pack
+            .files
+            .iter()
+            .find(|f| f.file_path == "src/a.rs")
+            .unwrap();
         assert_eq!(file_a.handle_ids.len(), 2);
         assert_eq!(file_a.total_tokens, 100); // 30 + 70
     }
@@ -438,7 +464,11 @@ mod tests {
         // High scores, multiple files, good fill -> High confidence
         let selected: Vec<(usize, f64)> = vec![(0, 0.95), (1, 0.90), (2, 0.85), (3, 0.80)];
         let g_high = build_evidence_guidance(&selected, 4, 3, 10, false, 4);
-        assert!(g_high.confidence >= 0.70, "expected High band, got {:.2}", g_high.confidence);
+        assert!(
+            g_high.confidence >= 0.70,
+            "expected High band, got {:.2}",
+            g_high.confidence
+        );
         assert_eq!(g_high.confidence_band, EvidenceConfidence::High);
         assert!(g_high.stop_querying);
         assert_eq!(g_high.recommended_action, EvidenceAction::ExpandThenAnswer);
@@ -447,7 +477,11 @@ mod tests {
         // Low scores, single file, sparse matches -> Low/Medium
         let selected_low: Vec<(usize, f64)> = vec![(0, 0.15)];
         let g_low = build_evidence_guidance(&selected_low, 1, 1, 1, true, 10);
-        assert!(g_low.confidence < 0.35, "expected Low band, got {:.2}", g_low.confidence);
+        assert!(
+            g_low.confidence < 0.35,
+            "expected Low band, got {:.2}",
+            g_low.confidence
+        );
         assert_eq!(g_low.confidence_band, EvidenceConfidence::Low);
     }
 

@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::{ExpandedHandleDetail, ExpandedHandleDbRow, IndexStatus, RepoIndex, SCHEMA_VERSION};
+use super::{ExpandedHandleDbRow, ExpandedHandleDetail, IndexStatus, RepoIndex, SCHEMA_VERSION};
 
 impl RepoIndex {
     /// Expand handles to full content
@@ -259,7 +259,10 @@ mod tests {
         // A valid HandleId format but one that does not exist in the DB
         let fake_id = "src/fake.rs::Function::0:100";
         let result = index.expand(&[fake_id.to_string()]);
-        assert!(result.is_err(), "expanding a nonexistent handle should fail");
+        assert!(
+            result.is_err(),
+            "expanding a nonexistent handle should fail"
+        );
     }
 
     #[test]

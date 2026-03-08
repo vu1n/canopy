@@ -9,7 +9,8 @@ use super::symbol_cache::SymbolCacheEntry;
 use super::RepoIndex;
 
 /// Shared column list for handle queries — matches the `handle_from_row` column order.
-pub(super) const HANDLE_SELECT: &str = "n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte, \
+pub(super) const HANDLE_SELECT: &str =
+    "n.handle_id, f.path, n.node_type, n.start_byte, n.end_byte, \
      n.line_start, n.line_end, n.token_count, n.preview";
 
 impl RepoIndex {
@@ -158,13 +159,11 @@ impl RepoIndex {
             .conn
             .prepare("SELECT f.path, f.token_count FROM files f")?;
 
-        let all_rows: Vec<(String, usize)> = collect_row_results(
-            stmt.query_map([], |row| {
-                let path: String = row.get(0)?;
-                let tokens: i64 = row.get(1)?;
-                Ok((path, tokens.max(0) as usize))
-            })?,
-        )?;
+        let all_rows: Vec<(String, usize)> = collect_row_results(stmt.query_map([], |row| {
+            let path: String = row.get(0)?;
+            let tokens: i64 = row.get(1)?;
+            Ok((path, tokens.max(0) as usize))
+        })?)?;
         let matches: Vec<(String, usize)> = all_rows
             .into_iter()
             .filter(|(path, _)| glob_matcher.is_match(path))
@@ -309,8 +308,8 @@ impl RepoIndex {
              LIMIT ?",
         )?;
 
-        let raw_rows = collect_row_results(
-            stmt.query_map(params![symbol_lower, limit as i64], |row| {
+        let raw_rows =
+            collect_row_results(stmt.query_map(params![symbol_lower, limit as i64], |row| {
                 let file_path: String = row.get(0)?;
                 let span_start: i64 = row.get(1)?;
                 let span_end: i64 = row.get(2)?;
@@ -334,8 +333,7 @@ impl RepoIndex {
                     source_handle_id,
                     preview.unwrap_or_else(|| "...".to_string()),
                 ))
-            })?,
-        )?;
+            })?)?;
         let refs: Vec<RefHandle> = raw_rows
             .into_iter()
             .map(
@@ -488,9 +486,9 @@ mod tests {
         let params = code_type_params();
         assert_eq!(params.len(), 4);
         assert_eq!(params[0], NodeType::Function.as_int() as i32); // 3
-        assert_eq!(params[1], NodeType::Class.as_int() as i32);    // 4
-        assert_eq!(params[2], NodeType::Struct.as_int() as i32);   // 5
-        assert_eq!(params[3], NodeType::Method.as_int() as i32);   // 6
+        assert_eq!(params[1], NodeType::Class.as_int() as i32); // 4
+        assert_eq!(params[2], NodeType::Struct.as_int() as i32); // 5
+        assert_eq!(params[3], NodeType::Method.as_int() as i32); // 6
     }
 
     #[test]

@@ -212,9 +212,7 @@ fn test_service_query_returns_service_handles() {
     assert!(rt.is_service_mode());
 
     let params = QueryParams::symbol("hello_world".to_string());
-    let result = rt
-        .query(&svc.repo_path, params)
-        .expect("query failed");
+    let result = rt.query(&svc.repo_path, params).expect("query failed");
 
     assert!(!result.handles.is_empty(), "Expected at least one handle");
     for handle in &result.handles {
@@ -256,9 +254,7 @@ struct Config {
 
     // Query for a symbol in the modified file
     let params = QueryParams::pattern("hello_world".to_string());
-    let result = rt
-        .query(&svc.repo_path, params)
-        .expect("query failed");
+    let result = rt.query(&svc.repo_path, params).expect("query failed");
 
     // Handles for the dirty file (src/main.rs) should be Local
     let main_handles: Vec<_> = result
@@ -296,9 +292,7 @@ fn hello_world() {
 
     // Query for a symbol in the clean file (lib.rs)
     let params = QueryParams::symbol("multiply".to_string());
-    let result = rt
-        .query(&svc.repo_path, params)
-        .expect("query failed");
+    let result = rt.query(&svc.repo_path, params).expect("query failed");
 
     // Handles for the clean file (src/lib.rs) should be Service
     let lib_handles: Vec<_> = result
@@ -326,9 +320,7 @@ fn test_expand_service_handles() {
 
     // Query to get handles
     let params = QueryParams::symbol("Config".to_string());
-    let result = rt
-        .query(&svc.repo_path, params)
-        .expect("query failed");
+    let result = rt.query(&svc.repo_path, params).expect("query failed");
     assert!(!result.handles.is_empty());
 
     // Expand the first handle

@@ -216,7 +216,10 @@ mod tests {
     fn file_discovery_detect_is_cached() {
         let first = FileDiscovery::detect();
         let second = FileDiscovery::detect();
-        assert_eq!(first, second, "repeated detect() calls should return same value");
+        assert_eq!(
+            first, second,
+            "repeated detect() calls should return same value"
+        );
     }
 
     #[test]
@@ -250,7 +253,11 @@ mod tests {
 
         let all_files = index.walk_files("**/*").unwrap();
         // Should find at least the 3 files we created (plus config.toml in .canopy)
-        assert!(all_files.len() >= 3, "should find at least 3 files, got {}", all_files.len());
+        assert!(
+            all_files.len() >= 3,
+            "should find at least 3 files, got {}",
+            all_files.len()
+        );
     }
 
     #[test]

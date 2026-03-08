@@ -15,10 +15,8 @@ use crate::predict::{
 use crate::provenance::ProvenanceTracker;
 use crate::service_client::{is_error_code, ReindexResponse, ServiceClient, ServiceStatus};
 use canopy_core::{
-    build_evidence_pack,
-    feedback::FeedbackStore,
-    EvidencePack, ExpandOutcome, HandleSource, IndexStats, NodeType, QueryParams,
-    QueryResult, RepoIndex, RepoShard,
+    build_evidence_pack, feedback::FeedbackStore, EvidencePack, ExpandOutcome, HandleSource,
+    IndexStats, NodeType, QueryParams, QueryResult, RepoIndex, RepoShard,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -139,20 +137,17 @@ impl ClientRuntime {
 
                 let active_repo_id = service.resolve_ready(repo_path, ENSURE_READY_TIMEOUT)?;
 
-                let (mut pack, used_repo_id) = match service.evidence_pack(
-                    &active_repo_id,
-                    params.clone(),
-                    config.clone(),
-                ) {
-                    Ok(pack) => (pack, active_repo_id.clone()),
-                    Err(e) if is_error_code(&e, "repo_not_found") => {
-                        let new_id = service.invalidate_and_resolve(repo_path)?;
-                        service.ensure_ready(&new_id, ENSURE_READY_TIMEOUT)?;
-                        let pack = service.evidence_pack(&new_id, params, config)?;
-                        (pack, new_id)
-                    }
-                    Err(e) => return Err(e),
-                };
+                let (mut pack, used_repo_id) =
+                    match service.evidence_pack(&active_repo_id, params.clone(), config.clone()) {
+                        Ok(pack) => (pack, active_repo_id.clone()),
+                        Err(e) if is_error_code(&e, "repo_not_found") => {
+                            let new_id = service.invalidate_and_resolve(repo_path)?;
+                            service.ensure_ready(&new_id, ENSURE_READY_TIMEOUT)?;
+                            let pack = service.evidence_pack(&new_id, params, config)?;
+                            (pack, new_id)
+                        }
+                        Err(e) => return Err(e),
+                    };
 
                 self.rewrite_expand_suggestions(repo_path, &mut pack);
                 self.record_provenance_for_evidence_pack(repo_path, &pack, Some(used_repo_id));
@@ -306,7 +301,6 @@ impl ClientRuntime {
         service.reindex(repo_id, glob.map(String::from))
     }
 
-
     /// Predictive index with specific query text (used by MCP tool_query)
     pub fn predictive_index_for_query(
         &mut self,
@@ -422,30 +416,21 @@ mod tests {
     fn test_list_repos_without_service() {
         let rt = ClientRuntime::new(None, None);
         let err = rt.list_repos().unwrap_err();
-        assert!(matches!(
-            err,
-            canopy_core::CanopyError::NoServiceConfigured
-        ));
+        assert!(matches!(err, canopy_core::CanopyError::NoServiceConfigured));
     }
 
     #[test]
     fn test_service_status_without_service() {
         let rt = ClientRuntime::new(None, None);
         let err = rt.service_status().unwrap_err();
-        assert!(matches!(
-            err,
-            canopy_core::CanopyError::NoServiceConfigured
-        ));
+        assert!(matches!(err, canopy_core::CanopyError::NoServiceConfigured));
     }
 
     #[test]
     fn test_reindex_by_id_without_service() {
         let rt = ClientRuntime::new(None, None);
         let err = rt.reindex_by_id("some-id", None).unwrap_err();
-        assert!(matches!(
-            err,
-            canopy_core::CanopyError::NoServiceConfigured
-        ));
+        assert!(matches!(err, canopy_core::CanopyError::NoServiceConfigured));
     }
 
     #[test]

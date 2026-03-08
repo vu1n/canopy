@@ -33,7 +33,10 @@ pub(crate) async fn resolve_ready_shard(
     let shards = state.shards.read().await;
     let shard = shards.get(repo).ok_or_else(AppError::repo_not_found)?;
     if shard.status != ShardStatus::Ready {
-        return Err(AppError::repo_not_ready(repo, &format!("{:?}", shard.status)));
+        return Err(AppError::repo_not_ready(
+            repo,
+            &format!("{:?}", shard.status),
+        ));
     }
     Ok(ReadyShard {
         repo_id: shard.repo_id.clone(),

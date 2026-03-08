@@ -290,10 +290,7 @@ mod tests {
         let result = server.handle_tools_list().unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert!(!tools.is_empty());
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(tool_names.contains(&"canopy_query"));
         assert!(tool_names.contains(&"canopy_expand"));
     }

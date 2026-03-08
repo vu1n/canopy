@@ -265,10 +265,14 @@ mod tests {
     #[test]
     fn parse_empty_input_returns_error() {
         let err = parse_query("").unwrap_err();
-        assert!(matches!(err, CanopyError::QueryParse { position: 0, ref message } if message.contains("Empty")));
+        assert!(
+            matches!(err, CanopyError::QueryParse { position: 0, ref message } if message.contains("Empty"))
+        );
 
         let err = parse_query("   ").unwrap_err();
-        assert!(matches!(err, CanopyError::QueryParse { position: 0, ref message } if message.contains("Empty")));
+        assert!(
+            matches!(err, CanopyError::QueryParse { position: 0, ref message } if message.contains("Empty"))
+        );
     }
 
     #[test]

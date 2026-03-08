@@ -181,11 +181,7 @@ mod tests {
             "h2",
             make_provenance(HandleSource::Service, Some("repo2")),
         );
-        tracker.record(
-            "repo1",
-            "h3",
-            make_provenance(HandleSource::Local, None),
-        );
+        tracker.record("repo1", "h3", make_provenance(HandleSource::Local, None));
 
         tracker.invalidate_repo("repo1");
 

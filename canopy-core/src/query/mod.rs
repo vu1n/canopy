@@ -13,8 +13,8 @@ pub mod params;
 
 pub use dsl::{parse_query, Query};
 pub use evidence::{
-    build_evidence_pack, EvidenceAction, EvidenceConfidence, EvidenceFileSummary,
-    EvidenceGuidance, EvidenceHandle, EvidencePack,
+    build_evidence_pack, EvidenceAction, EvidenceConfidence, EvidenceFileSummary, EvidenceGuidance,
+    EvidenceHandle, EvidencePack,
 };
 pub use executor::{execute_query, execute_query_with_options, DEFAULT_EXPAND_BUDGET};
 pub use params::{split_terms, MatchMode, QueryKind, QueryParams};
@@ -428,11 +428,13 @@ fn target_large() {
         fs::write(
             root.join("src/main.rs"),
             "fn main() {\n    println!(\"hello\");\n}\n",
-        ).unwrap();
+        )
+        .unwrap();
         fs::write(
             root.join("README.md"),
             "# Project\nThis project has authentication.\n",
-        ).unwrap();
+        )
+        .unwrap();
         RepoIndex::init(&root).unwrap();
         let mut index = RepoIndex::open(&root).unwrap();
         index.index("**/*").unwrap();

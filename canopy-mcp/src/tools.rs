@@ -87,9 +87,9 @@ impl McpServer {
             .unwrap_or(2);
         let plan = args.get("plan").and_then(|v| v.as_bool());
 
-        let pack = self
-            .runtime
-            .evidence_pack(&repo_root, params, max_handles, max_per_file, plan)?;
+        let pack =
+            self.runtime
+                .evidence_pack(&repo_root, params, max_handles, max_per_file, plan)?;
 
         mcp_json(&pack)
     }

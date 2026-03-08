@@ -14,7 +14,9 @@ use crate::config::{default_config_toml, Config};
 use crate::document::NodeType;
 use crate::error::CanopyError;
 use crate::handle::generate_preview;
-use crate::query::{execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult};
+use crate::query::{
+    execute_query_with_options, parse_query, QueryOptions, QueryParams, QueryResult,
+};
 use rusqlite::Connection;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -336,8 +338,8 @@ fn update_gitignore(repo_root: &Path) -> crate::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::test_helpers::setup_repo;
+    use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]

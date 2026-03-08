@@ -65,7 +65,9 @@ pub(crate) async fn query(
         state
             .remember_query_event_for_handles(&shard.repo_id, &handle_ids, query_event_id)
             .await;
-        state.invalidate_node_type_priors_cache(&shard.repo_id).await;
+        state
+            .invalidate_node_type_priors_cache(&shard.repo_id)
+            .await;
     }
 
     let duration_ms = start.elapsed().as_millis();
@@ -140,7 +142,9 @@ pub(crate) async fn evidence_pack(
         state
             .remember_query_event_for_handles(&shard.repo_id, &handle_ids, query_event_id)
             .await;
-        state.invalidate_node_type_priors_cache(&shard.repo_id).await;
+        state
+            .invalidate_node_type_priors_cache(&shard.repo_id)
+            .await;
     }
 
     let mut pack = build_evidence_pack(

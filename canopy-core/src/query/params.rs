@@ -287,7 +287,7 @@ impl QueryParams {
         let base_query = match &self.kind {
             QueryKind::Definition => {
                 let symbol = self.symbol.as_ref().unwrap(); // validated above
-                // If parent is specified, use ChildrenNamed, otherwise Definition
+                                                            // If parent is specified, use ChildrenNamed, otherwise Definition
                 if let Some(parent) = &self.parent {
                     Query::ChildrenNamed(parent.clone(), symbol.clone())
                 } else {
@@ -393,7 +393,9 @@ mod tests {
             ..Default::default()
         };
         let err = params.to_query().unwrap_err();
-        assert!(matches!(err, CanopyError::QueryParse { ref message, .. } if message.contains("both")));
+        assert!(
+            matches!(err, CanopyError::QueryParse { ref message, .. } if message.contains("both"))
+        );
     }
 
     #[test]
@@ -404,7 +406,9 @@ mod tests {
             ..Default::default()
         };
         let err = params.to_query().unwrap_err();
-        assert!(matches!(err, CanopyError::QueryParse { ref message, .. } if message.contains("kind parameter requires symbol")));
+        assert!(
+            matches!(err, CanopyError::QueryParse { ref message, .. } if message.contains("kind parameter requires symbol"))
+        );
     }
 
     #[test]
@@ -464,7 +468,14 @@ mod tests {
         let params = QueryParams::pattern("auth middleware handler");
         let fb = params.pattern_fallback().unwrap();
         assert!(fb.pattern.is_none());
-        assert_eq!(fb.patterns, Some(vec!["auth".to_string(), "middleware".to_string(), "handler".to_string()]));
+        assert_eq!(
+            fb.patterns,
+            Some(vec![
+                "auth".to_string(),
+                "middleware".to_string(),
+                "handler".to_string()
+            ])
+        );
         assert_eq!(fb.match_mode, MatchMode::Any);
     }
 
@@ -493,7 +504,10 @@ mod tests {
         assert!(QueryParams::parent("x").has_search_target());
         assert!(QueryParams::patterns(vec!["x".to_string()]).has_search_target());
 
-        let dsl = QueryParams { dsl: Some("(grep \"x\")".to_string()), ..Default::default() };
+        let dsl = QueryParams {
+            dsl: Some("(grep \"x\")".to_string()),
+            ..Default::default()
+        };
         assert!(dsl.has_search_target());
     }
 

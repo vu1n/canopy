@@ -12,10 +12,7 @@ use std::time::Instant;
 use super::{canonical_path, ClientRuntime};
 
 impl ClientRuntime {
-    pub(super) fn feedback_store_for_repo(
-        &mut self,
-        repo_path: &Path,
-    ) -> Option<&FeedbackStore> {
+    pub(super) fn feedback_store_for_repo(&mut self, repo_path: &Path) -> Option<&FeedbackStore> {
         let canonical = canonical_path(repo_path);
         if !self.feedback.stores.contains_key(&canonical) {
             match FeedbackStore::open(repo_path) {
@@ -171,10 +168,8 @@ impl ClientRuntime {
                             self.expand_local_details(repo_path, std::slice::from_ref(handle_id))
                         {
                             if let Some(d) = details.pop() {
-                                local_metadata.insert(
-                                    d.handle_id,
-                                    (d.file_path, d.node_type, d.token_count),
-                                );
+                                local_metadata
+                                    .insert(d.handle_id, (d.file_path, d.node_type, d.token_count));
                             }
                         }
                     }

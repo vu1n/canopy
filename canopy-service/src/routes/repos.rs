@@ -263,15 +263,9 @@ mod tests {
         .await
         .unwrap();
 
-        let second = add_repo(
-            State(state),
-            Json(AddRepoRequest {
-                path,
-                name: None,
-            }),
-        )
-        .await
-        .unwrap();
+        let second = add_repo(State(state), Json(AddRepoRequest { path, name: None }))
+            .await
+            .unwrap();
 
         assert_eq!(first.repo_id, second.repo_id);
     }

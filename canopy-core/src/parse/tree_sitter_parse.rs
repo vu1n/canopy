@@ -194,8 +194,10 @@ fn determine_parent_context(
         }
         FileType::JavaScript | FileType::TypeScript => {
             if kind == "class_declaration" || kind == "class" {
-                let name = find_child_text(node, "identifier", source)
-                    .or_else(|| node.child_by_field_name("name").map(|n| node_text(&n, source)))?;
+                let name = find_child_text(node, "identifier", source).or_else(|| {
+                    node.child_by_field_name("name")
+                        .map(|n| node_text(&n, source))
+                })?;
                 Some(ParentContext {
                     name,
                     node_type: Some(NodeType::Class),
@@ -236,10 +238,7 @@ fn extract_go_receiver_type(node: &tree_sitter::Node, source: &str) -> Option<St
 // Per-language node classifiers
 // ---------------------------------------------------------------------------
 
-fn classify_rust_node(
-    node: &tree_sitter::Node,
-    source: &str,
-) -> Option<(NodeType, NodeMetadata)> {
+fn classify_rust_node(node: &tree_sitter::Node, source: &str) -> Option<(NodeType, NodeMetadata)> {
     match node.kind() {
         "function_item" => {
             let name = find_child_text(node, "identifier", source)
@@ -340,7 +339,10 @@ fn classify_js_ts_node(
     match node.kind() {
         "function_declaration" | "arrow_function" | "function" => {
             let name = find_child_text(node, "identifier", source)
-                .or_else(|| node.child_by_field_name("name").map(|n| node_text(&n, source)))
+                .or_else(|| {
+                    node.child_by_field_name("name")
+                        .map(|n| node_text(&n, source))
+                })
                 .unwrap_or_else(|| "<anonymous>".to_string());
             let sig = extract_signature(node, source, "formal_parameters");
             Some((
@@ -353,7 +355,10 @@ fn classify_js_ts_node(
         }
         "class_declaration" | "class" => {
             let name = find_child_text(node, "identifier", source)
-                .or_else(|| node.child_by_field_name("name").map(|n| node_text(&n, source)))
+                .or_else(|| {
+                    node.child_by_field_name("name")
+                        .map(|n| node_text(&n, source))
+                })
                 .unwrap_or_default();
             Some((NodeType::Class, NodeMetadata::Class { name }))
         }
@@ -372,7 +377,10 @@ fn classify_js_ts_node(
         }
         "interface_declaration" | "type_alias_declaration" => {
             let name = find_child_text(node, "type_identifier", source)
-                .or_else(|| node.child_by_field_name("name").map(|n| node_text(&n, source)))
+                .or_else(|| {
+                    node.child_by_field_name("name")
+                        .map(|n| node_text(&n, source))
+                })
                 .unwrap_or_default();
             Some((NodeType::Struct, NodeMetadata::Struct { name }))
         }
@@ -380,10 +388,7 @@ fn classify_js_ts_node(
     }
 }
 
-fn classify_go_node(
-    node: &tree_sitter::Node,
-    source: &str,
-) -> Option<(NodeType, NodeMetadata)> {
+fn classify_go_node(node: &tree_sitter::Node, source: &str) -> Option<(NodeType, NodeMetadata)> {
     match node.kind() {
         "function_declaration" => {
             let name = find_child_text(node, "identifier", source).unwrap_or_default();
@@ -411,8 +416,7 @@ fn classify_go_node(
             ))
         }
         "type_declaration" => find_child_by_kind(node, "type_spec").map(|type_spec| {
-            let name =
-                find_child_text(&type_spec, "type_identifier", source).unwrap_or_default();
+            let name = find_child_text(&type_spec, "type_identifier", source).unwrap_or_default();
             (NodeType::Struct, NodeMetadata::Struct { name })
         }),
         _ => None,
@@ -445,10 +449,6 @@ pub(crate) fn node_text(node: &tree_sitter::Node, source: &str) -> String {
     source[node.start_byte()..node.end_byte()].to_string()
 }
 
-fn extract_signature(
-    node: &tree_sitter::Node,
-    source: &str,
-    params_kind: &str,
-) -> Option<String> {
+fn extract_signature(node: &tree_sitter::Node, source: &str, params_kind: &str) -> Option<String> {
     find_child_by_kind(node, params_kind).map(|n| node_text(&n, source))
 }

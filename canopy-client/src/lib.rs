@@ -10,7 +10,7 @@ pub mod provenance;
 pub mod runtime;
 pub mod service_client;
 
-pub use provenance::HandleProvenance;
 pub use canopy_core::ExpandOutcome;
+pub use provenance::HandleProvenance;
 pub use runtime::{ClientRuntime, IndexResult};
 pub use service_client::{ReindexResponse, ServiceClient, ServiceStatus};

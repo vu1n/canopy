@@ -1,8 +1,8 @@
 //! HTTP client for canopy-service
 
 use canopy_core::protocol::{
-    AddRepoRequest, AddRepoResponse, EvidencePackConfig, ExpandHandle, ExpandRequest,
-    ExpandResponse, EvidencePackRequest, QueryRequest, ReindexRequest,
+    AddRepoRequest, AddRepoResponse, EvidencePackConfig, EvidencePackRequest, ExpandHandle,
+    ExpandRequest, ExpandResponse, QueryRequest, ReindexRequest,
 };
 use canopy_core::{
     CanopyError, ErrorEnvelope, EvidencePack, QueryParams, QueryResult, RepoShard, ShardStatus,

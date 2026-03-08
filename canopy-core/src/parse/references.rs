@@ -303,7 +303,11 @@ mod tests {
     use crate::document::RefType;
 
     /// Walk the tree depth-first, calling extract_references on every node.
-    fn collect_refs(source: &str, language: tree_sitter::Language, file_type: FileType) -> Vec<Reference> {
+    fn collect_refs(
+        source: &str,
+        language: tree_sitter::Language,
+        file_type: FileType,
+    ) -> Vec<Reference> {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&language).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -338,7 +342,10 @@ mod tests {
         let refs = collect_refs(source, tree_sitter_rust::LANGUAGE.into(), FileType::Rust);
 
         // Should find use imports
-        let imports: Vec<_> = refs.iter().filter(|r| r.ref_type == RefType::Import).collect();
+        let imports: Vec<_> = refs
+            .iter()
+            .filter(|r| r.ref_type == RefType::Import)
+            .collect();
         assert!(!imports.is_empty(), "should extract at least one import");
         assert!(
             imports.iter().any(|r| r.name == "HashMap"),
@@ -347,14 +354,19 @@ mod tests {
         );
 
         // Should find function calls
-        let calls: Vec<_> = refs.iter().filter(|r| r.ref_type == RefType::Call).collect();
+        let calls: Vec<_> = refs
+            .iter()
+            .filter(|r| r.ref_type == RefType::Call)
+            .collect();
         assert!(
             calls.iter().any(|r| r.name == "foo"),
             "should find foo() call, got: {:?}",
             calls.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
         assert!(
-            calls.iter().any(|r| r.name == "baz" && r.qualifier.as_deref() == Some("bar")),
+            calls
+                .iter()
+                .any(|r| r.name == "baz" && r.qualifier.as_deref() == Some("bar")),
             "should find bar::baz() call with qualifier"
         );
     }
@@ -362,9 +374,16 @@ mod tests {
     #[test]
     fn javascript_import_and_call_references() {
         let source = "import { useState, useEffect } from 'react';\n\nfunction App() {\n  const [x, setX] = useState(0);\n  console.log(x);\n}\n";
-        let refs = collect_refs(source, tree_sitter_javascript::LANGUAGE.into(), FileType::JavaScript);
+        let refs = collect_refs(
+            source,
+            tree_sitter_javascript::LANGUAGE.into(),
+            FileType::JavaScript,
+        );
 
-        let imports: Vec<_> = refs.iter().filter(|r| r.ref_type == RefType::Import).collect();
+        let imports: Vec<_> = refs
+            .iter()
+            .filter(|r| r.ref_type == RefType::Import)
+            .collect();
         assert!(
             imports.iter().any(|r| r.name == "useState"),
             "should find useState import, got: {:?}",
@@ -375,7 +394,10 @@ mod tests {
             "should find useEffect import"
         );
 
-        let calls: Vec<_> = refs.iter().filter(|r| r.ref_type == RefType::Call).collect();
+        let calls: Vec<_> = refs
+            .iter()
+            .filter(|r| r.ref_type == RefType::Call)
+            .collect();
         assert!(
             calls.iter().any(|r| r.name == "useState"),
             "should find useState() call, got: {:?}",
@@ -383,7 +405,9 @@ mod tests {
         );
         // console.log is a member_expression call
         assert!(
-            calls.iter().any(|r| r.name == "log" && r.qualifier.as_deref() == Some("console")),
+            calls
+                .iter()
+                .any(|r| r.name == "log" && r.qualifier.as_deref() == Some("console")),
             "should find console.log() call with qualifier"
         );
     }
@@ -391,23 +415,35 @@ mod tests {
     #[test]
     fn python_import_and_call_references() {
         let source = "from os.path import join\nimport sys\n\ndef main():\n    result = join('a', 'b')\n    sys.exit(0)\n";
-        let refs = collect_refs(source, tree_sitter_python::LANGUAGE.into(), FileType::Python);
+        let refs = collect_refs(
+            source,
+            tree_sitter_python::LANGUAGE.into(),
+            FileType::Python,
+        );
 
-        let imports: Vec<_> = refs.iter().filter(|r| r.ref_type == RefType::Import).collect();
+        let imports: Vec<_> = refs
+            .iter()
+            .filter(|r| r.ref_type == RefType::Import)
+            .collect();
         assert!(
             imports.iter().any(|r| r.name == "join"),
             "should find 'join' import, got: {:?}",
             imports.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
 
-        let calls: Vec<_> = refs.iter().filter(|r| r.ref_type == RefType::Call).collect();
+        let calls: Vec<_> = refs
+            .iter()
+            .filter(|r| r.ref_type == RefType::Call)
+            .collect();
         assert!(
             calls.iter().any(|r| r.name == "join"),
             "should find join() call, got: {:?}",
             calls.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
         assert!(
-            calls.iter().any(|r| r.name == "exit" && r.qualifier.as_deref() == Some("sys")),
+            calls
+                .iter()
+                .any(|r| r.name == "exit" && r.qualifier.as_deref() == Some("sys")),
             "should find sys.exit() call with qualifier"
         );
     }
@@ -417,7 +453,11 @@ mod tests {
         let refs = collect_refs("", tree_sitter_rust::LANGUAGE.into(), FileType::Rust);
         assert!(refs.is_empty());
 
-        let refs = collect_refs("", tree_sitter_javascript::LANGUAGE.into(), FileType::JavaScript);
+        let refs = collect_refs(
+            "",
+            tree_sitter_javascript::LANGUAGE.into(),
+            FileType::JavaScript,
+        );
         assert!(refs.is_empty());
 
         let refs = collect_refs("", tree_sitter_python::LANGUAGE.into(), FileType::Python);
