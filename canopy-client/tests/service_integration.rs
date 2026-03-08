@@ -4,7 +4,8 @@
 //! that ClientRuntime correctly queries the service, detects dirty files, and
 //! merges results.
 
-use canopy_client::runtime::{ClientRuntime, ExpandOutcome, QueryInput};
+use canopy_client::runtime::ClientRuntime;
+use canopy_client::ExpandOutcome;
 use canopy_core::{HandleSource, QueryParams};
 use std::process::Command;
 use std::time::Duration;
@@ -212,7 +213,7 @@ fn test_service_query_returns_service_handles() {
 
     let params = QueryParams::symbol("hello_world".to_string());
     let result = rt
-        .query(&svc.repo_path, QueryInput::Params(params))
+        .query(&svc.repo_path, params)
         .expect("query failed");
 
     assert!(!result.handles.is_empty(), "Expected at least one handle");
@@ -256,7 +257,7 @@ struct Config {
     // Query for a symbol in the modified file
     let params = QueryParams::pattern("hello_world".to_string());
     let result = rt
-        .query(&svc.repo_path, QueryInput::Params(params))
+        .query(&svc.repo_path, params)
         .expect("query failed");
 
     // Handles for the dirty file (src/main.rs) should be Local
@@ -296,7 +297,7 @@ fn hello_world() {
     // Query for a symbol in the clean file (lib.rs)
     let params = QueryParams::symbol("multiply".to_string());
     let result = rt
-        .query(&svc.repo_path, QueryInput::Params(params))
+        .query(&svc.repo_path, params)
         .expect("query failed");
 
     // Handles for the clean file (src/lib.rs) should be Service
@@ -326,7 +327,7 @@ fn test_expand_service_handles() {
     // Query to get handles
     let params = QueryParams::symbol("Config".to_string());
     let result = rt
-        .query(&svc.repo_path, QueryInput::Params(params))
+        .query(&svc.repo_path, params)
         .expect("query failed");
     assert!(!result.handles.is_empty());
 
