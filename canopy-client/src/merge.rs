@@ -156,36 +156,33 @@ mod tests {
     }
 
     #[test]
-    fn test_ranges_overlap() {
-        // Old test preserved for reference — merge now drops all dirty file handles
+    fn test_dirty_file_drops_all_service_handles() {
+        let dirty: HashSet<String> = ["src/a.rs".to_string()].into();
+        let local = QueryResult {
+            handles: vec![make_handle("src/a.rs", 1, 5)],
+            total_tokens: 100,
+            total_matches: 1,
+            ..QueryResult::default()
+        };
+        let service = QueryResult {
+            handles: vec![
+                make_handle("src/a.rs", 1, 5),
+                make_handle("src/a.rs", 10, 20),
+            ],
+            total_tokens: 200,
+            total_matches: 2,
+            ..QueryResult::default()
+        };
+        let merged = merge_results(local, service, &dirty);
+        // Only the local handle survives; both service handles for dirty file are dropped
+        assert_eq!(merged.handles.len(), 1);
+        assert_eq!(merged.handles[0].file_path, "src/a.rs");
     }
 
     #[test]
     fn test_merge_empty() {
-        let local = QueryResult {
-            handles: vec![],
-            ref_handles: None,
-            total_tokens: 0,
-            truncated: false,
-            total_matches: 0,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
-        };
-        let service = QueryResult {
-            handles: vec![],
-            ref_handles: None,
-            total_tokens: 0,
-            truncated: false,
-            total_matches: 0,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
-        };
+        let local = QueryResult::default();
+        let service = QueryResult::default();
         let dirty = HashSet::new();
         let result = merge_results(local, service, &dirty);
         assert!(result.handles.is_empty());
@@ -195,30 +192,18 @@ mod tests {
     fn test_merge_drops_all_service_handles_for_dirty_files() {
         let local = QueryResult {
             handles: vec![make_handle("src/dirty.rs", 1, 10)],
-            ref_handles: None,
             total_tokens: 100,
-            truncated: false,
             total_matches: 1,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
+            ..QueryResult::default()
         };
         let service = QueryResult {
             handles: vec![
                 make_handle("src/dirty.rs", 20, 30), // non-overlapping but dirty
                 make_handle("src/clean.rs", 1, 10),  // clean file, kept
             ],
-            ref_handles: None,
             total_tokens: 200,
-            truncated: false,
             total_matches: 2,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
+            ..QueryResult::default()
         };
         let mut dirty = HashSet::new();
         dirty.insert("src/dirty.rs".to_string());
@@ -233,30 +218,16 @@ mod tests {
     fn test_merge_keeps_all_handles_for_clean_files() {
         let local = QueryResult {
             handles: vec![make_handle("src/a.rs", 1, 10)], // ignored for clean path
-            ref_handles: None,
-            total_tokens: 0,
-            truncated: false,
-            total_matches: 0,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
+            ..QueryResult::default()
         };
         let service = QueryResult {
             handles: vec![
                 make_handle("src/a.rs", 1, 10),
                 make_handle("src/b.rs", 1, 10),
             ],
-            ref_handles: None,
             total_tokens: 200,
-            truncated: false,
             total_matches: 2,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
+            ..QueryResult::default()
         };
         let dirty = HashSet::new();
         let result = merge_results(local, service, &dirty);
@@ -269,30 +240,18 @@ mod tests {
     fn test_merge_dedupes_duplicate_handles() {
         let local = QueryResult {
             handles: vec![make_handle("src/dirty.rs", 1, 10)],
-            ref_handles: None,
             total_tokens: 100,
-            truncated: false,
             total_matches: 1,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
+            ..QueryResult::default()
         };
         let service = QueryResult {
             handles: vec![
                 make_handle("src/clean.rs", 1, 10),
                 make_handle("src/clean.rs", 1, 10), // duplicate id/span
             ],
-            ref_handles: None,
             total_tokens: 200,
-            truncated: false,
             total_matches: 2,
-            auto_expanded: false,
-            expand_note: None,
-            expanded_count: 0,
-            expanded_tokens: 0,
-            expanded_handle_ids: vec![],
+            ..QueryResult::default()
         };
         let mut dirty = HashSet::new();
         dirty.insert("src/dirty.rs".to_string());

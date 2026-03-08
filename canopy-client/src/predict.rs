@@ -252,17 +252,9 @@ mod tests {
     use super::*;
     use canopy_core::feedback::{ExpandEvent, QueryEvent, QueryHandle};
     use canopy_core::NodeType;
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_repo() -> std::path::PathBuf {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("canopy-predict-test-{ts}"));
-        fs::create_dir_all(&root).unwrap();
-        root
+        canopy_core::temp_test_dir("predict-test")
     }
 
     #[test]
