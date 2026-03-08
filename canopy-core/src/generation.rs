@@ -70,6 +70,9 @@ pub struct RepoShard {
     pub generation: Generation,
     /// Current status
     pub status: ShardStatus,
+    /// Error message from last failed operation (if status is Error)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 #[cfg(test)]
@@ -128,6 +131,7 @@ mod tests {
             commit_sha: Some("deadbeef".to_string()),
             generation: Generation::from_value(3),
             status: ShardStatus::Ready,
+            error_message: None,
         };
         let json = serde_json::to_string(&shard).unwrap();
         let back: RepoShard = serde_json::from_str(&json).unwrap();

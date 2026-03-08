@@ -191,3 +191,82 @@ impl RepoIndex {
         Ok(files)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    #[test]
+    fn file_discovery_detect_returns_valid_backend() {
+        let backend = FileDiscovery::detect();
+        // On CI or dev machines, at least one of these should be available
+        assert!(
+            matches!(
+                backend,
+                FileDiscovery::Fd | FileDiscovery::Ripgrep | FileDiscovery::Ignore
+            ),
+            "detect() should return a valid backend"
+        );
+    }
+
+    #[test]
+    fn file_discovery_detect_is_cached() {
+        let first = FileDiscovery::detect();
+        let second = FileDiscovery::detect();
+        assert_eq!(first, second, "repeated detect() calls should return same value");
+    }
+
+    #[test]
+    fn file_discovery_name_values() {
+        assert_eq!(FileDiscovery::Fd.name(), "fd");
+        assert_eq!(FileDiscovery::Ripgrep.name(), "ripgrep");
+        assert_eq!(FileDiscovery::Ignore.name(), "ignore-crate");
+    }
+
+    #[test]
+    fn walk_files_finds_matching_files() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        // Create some test files
+        for name in &["a.rs", "b.rs", "c.txt"] {
+            let path = src.join(name);
+            let mut f = fs::File::create(&path).unwrap();
+            writeln!(f, "// content").unwrap();
+        }
+
+        RepoIndex::init(dir.path()).unwrap();
+        let index = RepoIndex::open(dir.path()).unwrap();
+
+        let rs_files = index.walk_files("**/*.rs").unwrap();
+        assert_eq!(rs_files.len(), 2, "should find 2 .rs files");
+
+        let txt_files = index.walk_files("**/*.txt").unwrap();
+        assert_eq!(txt_files.len(), 1, "should find 1 .txt file");
+
+        let all_files = index.walk_files("**/*").unwrap();
+        // Should find at least the 3 files we created (plus config.toml in .canopy)
+        assert!(all_files.len() >= 3, "should find at least 3 files, got {}", all_files.len());
+    }
+
+    #[test]
+    fn walk_files_no_matches_returns_empty() {
+        let dir = TempDir::new().unwrap();
+        let src = dir.path().join("src");
+        fs::create_dir_all(&src).unwrap();
+
+        let path = src.join("a.rs");
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "// content").unwrap();
+
+        RepoIndex::init(dir.path()).unwrap();
+        let index = RepoIndex::open(dir.path()).unwrap();
+
+        let files = index.walk_files("**/*.py").unwrap();
+        assert!(files.is_empty(), "should find no .py files");
+    }
+}

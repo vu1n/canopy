@@ -122,3 +122,76 @@ impl RepoIndex {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_entry(name: &str, file: &str) -> (String, SymbolCacheEntry) {
+        (
+            name.to_lowercase(),
+            SymbolCacheEntry {
+                handle_id: format!("h_{name}"),
+                file_path: file.to_string(),
+                node_type: NodeType::Function.as_int() as i32,
+                start_byte: 0,
+                end_byte: 100,
+                line_start: 1,
+                line_end: 10,
+                token_count: 50,
+                preview: format!("fn {name}()"),
+            },
+        )
+    }
+
+    #[test]
+    fn add_and_lookup_symbol_cache() {
+        let mut cache = HashMap::new();
+        let mut by_file = HashMap::new();
+        let entries = vec![make_entry("foo", "src/lib.rs")];
+        RepoIndex::add_to_symbol_cache(&mut cache, &mut by_file, entries);
+        assert_eq!(cache["foo"].len(), 1);
+        assert_eq!(cache["foo"][0].handle_id, "h_foo");
+        assert!(by_file["src/lib.rs"].contains("foo"));
+    }
+
+    #[test]
+    fn remove_file_clears_entries_and_reverse_index() {
+        let mut cache = HashMap::new();
+        let mut by_file = HashMap::new();
+        let entries = vec![
+            make_entry("foo", "src/a.rs"),
+            make_entry("bar", "src/a.rs"),
+            make_entry("baz", "src/b.rs"),
+        ];
+        RepoIndex::add_to_symbol_cache(&mut cache, &mut by_file, entries);
+        assert_eq!(cache.len(), 3);
+
+        RepoIndex::remove_file_from_symbol_cache(&mut cache, &mut by_file, "src/a.rs");
+        assert!(!cache.contains_key("foo"));
+        assert!(!cache.contains_key("bar"));
+        assert!(cache.contains_key("baz"));
+        assert!(!by_file.contains_key("src/a.rs"));
+        assert!(by_file.contains_key("src/b.rs"));
+    }
+
+    #[test]
+    fn remove_nonexistent_file_is_noop() {
+        let mut cache = HashMap::new();
+        let mut by_file = HashMap::new();
+        RepoIndex::remove_file_from_symbol_cache(&mut cache, &mut by_file, "no/such/file.rs");
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn add_multiple_entries_same_symbol_name() {
+        let mut cache = HashMap::new();
+        let mut by_file = HashMap::new();
+        let entries = vec![
+            make_entry("config", "src/a.rs"),
+            make_entry("config", "src/b.rs"),
+        ];
+        RepoIndex::add_to_symbol_cache(&mut cache, &mut by_file, entries);
+        assert_eq!(cache["config"].len(), 2);
+    }
+}

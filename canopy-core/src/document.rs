@@ -256,3 +256,236 @@ pub struct ParsedFile {
     /// Used to avoid TOCTOU race between parse and DB write.
     pub mtime: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_type_as_int_roundtrip() {
+        let variants = [
+            NodeType::Section,
+            NodeType::CodeBlock,
+            NodeType::Paragraph,
+            NodeType::Function,
+            NodeType::Class,
+            NodeType::Struct,
+            NodeType::Method,
+            NodeType::Chunk,
+        ];
+        for variant in variants {
+            let int_val = variant.as_int();
+            let recovered = NodeType::from_int(int_val)
+                .unwrap_or_else(|| panic!("from_int failed for {}", int_val));
+            assert_eq!(recovered, variant);
+        }
+    }
+
+    #[test]
+    fn node_type_from_int_invalid_returns_none() {
+        assert!(NodeType::from_int(8).is_none());
+        assert!(NodeType::from_int(255).is_none());
+    }
+
+    #[test]
+    fn node_type_as_str_values() {
+        assert_eq!(NodeType::Section.as_str(), "section");
+        assert_eq!(NodeType::Function.as_str(), "function");
+        assert_eq!(NodeType::Class.as_str(), "class");
+        assert_eq!(NodeType::Struct.as_str(), "struct");
+        assert_eq!(NodeType::Method.as_str(), "method");
+        assert_eq!(NodeType::Chunk.as_str(), "chunk");
+        assert_eq!(NodeType::CodeBlock.as_str(), "code_block");
+        assert_eq!(NodeType::Paragraph.as_str(), "paragraph");
+    }
+
+    #[test]
+    fn node_metadata_json_roundtrip_function() {
+        let meta = NodeMetadata::Function {
+            name: "my_func".to_string(),
+            signature: Some("fn my_func(x: i32) -> bool".to_string()),
+        };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::Function).unwrap();
+        match recovered {
+            NodeMetadata::Function { name, signature } => {
+                assert_eq!(name, "my_func");
+                assert_eq!(signature.as_deref(), Some("fn my_func(x: i32) -> bool"));
+            }
+            _ => panic!("Expected Function metadata"),
+        }
+    }
+
+    #[test]
+    fn node_metadata_json_roundtrip_section() {
+        let meta = NodeMetadata::Section {
+            heading: "Introduction".to_string(),
+            level: 2,
+        };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::Section).unwrap();
+        match recovered {
+            NodeMetadata::Section { heading, level } => {
+                assert_eq!(heading, "Introduction");
+                assert_eq!(level, 2);
+            }
+            _ => panic!("Expected Section metadata"),
+        }
+    }
+
+    #[test]
+    fn node_metadata_json_roundtrip_all_variants() {
+        // CodeBlock with language
+        let meta = NodeMetadata::CodeBlock {
+            language: Some("rust".to_string()),
+        };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::CodeBlock).unwrap();
+        match recovered {
+            NodeMetadata::CodeBlock { language } => {
+                assert_eq!(language.as_deref(), Some("rust"));
+            }
+            _ => panic!("Expected CodeBlock"),
+        }
+
+        // CodeBlock without language
+        let meta = NodeMetadata::CodeBlock { language: None };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::CodeBlock).unwrap();
+        match recovered {
+            NodeMetadata::CodeBlock { language } => assert!(language.is_none()),
+            _ => panic!("Expected CodeBlock"),
+        }
+
+        // Paragraph
+        let meta = NodeMetadata::Paragraph;
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::Paragraph).unwrap();
+        assert!(matches!(recovered, NodeMetadata::Paragraph));
+
+        // Class
+        let meta = NodeMetadata::Class {
+            name: "MyClass".to_string(),
+        };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::Class).unwrap();
+        match recovered {
+            NodeMetadata::Class { name } => assert_eq!(name, "MyClass"),
+            _ => panic!("Expected Class"),
+        }
+
+        // Struct
+        let meta = NodeMetadata::Struct {
+            name: "Config".to_string(),
+        };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::Struct).unwrap();
+        match recovered {
+            NodeMetadata::Struct { name } => assert_eq!(name, "Config"),
+            _ => panic!("Expected Struct"),
+        }
+
+        // Method
+        let meta = NodeMetadata::Method {
+            name: "run".to_string(),
+            class_name: Some("Server".to_string()),
+        };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::Method).unwrap();
+        match recovered {
+            NodeMetadata::Method { name, class_name } => {
+                assert_eq!(name, "run");
+                assert_eq!(class_name.as_deref(), Some("Server"));
+            }
+            _ => panic!("Expected Method"),
+        }
+
+        // Chunk
+        let meta = NodeMetadata::Chunk { index: 42 };
+        let json = meta.to_json();
+        let recovered = NodeMetadata::from_json(&json, NodeType::Chunk).unwrap();
+        match recovered {
+            NodeMetadata::Chunk { index } => assert_eq!(index, 42),
+            _ => panic!("Expected Chunk"),
+        }
+    }
+
+    #[test]
+    fn node_metadata_from_json_invalid_returns_none() {
+        // Mismatched type: Section JSON parsed as Function
+        let meta = NodeMetadata::Section {
+            heading: "Intro".to_string(),
+            level: 1,
+        };
+        let json = meta.to_json();
+        // Parsing as Function should fail because "name" field is missing
+        assert!(NodeMetadata::from_json(&json, NodeType::Function).is_none());
+
+        // Invalid JSON
+        assert!(NodeMetadata::from_json("not valid json", NodeType::Function).is_none());
+    }
+
+    #[test]
+    fn searchable_name_returns_correct_values() {
+        assert_eq!(
+            NodeMetadata::Function {
+                name: "foo".to_string(),
+                signature: None,
+            }
+            .searchable_name(),
+            Some("foo")
+        );
+        assert_eq!(
+            NodeMetadata::Class {
+                name: "Bar".to_string(),
+            }
+            .searchable_name(),
+            Some("Bar")
+        );
+        assert_eq!(
+            NodeMetadata::Struct {
+                name: "Baz".to_string(),
+            }
+            .searchable_name(),
+            Some("Baz")
+        );
+        assert_eq!(
+            NodeMetadata::Method {
+                name: "run".to_string(),
+                class_name: None,
+            }
+            .searchable_name(),
+            Some("run")
+        );
+        assert_eq!(
+            NodeMetadata::Section {
+                heading: "Intro".to_string(),
+                level: 1,
+            }
+            .searchable_name(),
+            Some("Intro")
+        );
+        // These should return None
+        assert!(NodeMetadata::Paragraph.searchable_name().is_none());
+        assert!(NodeMetadata::CodeBlock { language: None }
+            .searchable_name()
+            .is_none());
+        assert!(NodeMetadata::Chunk { index: 0 }.searchable_name().is_none());
+    }
+
+    #[test]
+    fn ref_type_as_str_and_parse_roundtrip() {
+        let variants = [RefType::Call, RefType::Import, RefType::TypeRef];
+        for variant in variants {
+            let s = variant.as_str();
+            let recovered = RefType::parse(s).unwrap();
+            assert_eq!(recovered, variant);
+        }
+    }
+
+    #[test]
+    fn ref_type_parse_unknown_returns_none() {
+        assert!(RefType::parse("unknown").is_none());
+        assert!(RefType::parse("").is_none());
+    }
+}

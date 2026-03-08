@@ -30,9 +30,11 @@ impl RepoIndex {
     /// Number of parsed files per DB transaction in pipeline mode
     const BATCH_SIZE: usize = 500;
 
-    /// Index files matching glob pattern
+    /// Index files matching glob pattern.
+    ///
+    /// Dispatches to `index_sequential` for small batches or `index_pipeline`
+    /// for large ones. The threshold is [`SEQUENTIAL_THRESHOLD`](Self::SEQUENTIAL_THRESHOLD).
     pub fn index(&mut self, glob: &str) -> crate::Result<IndexStats> {
-        // Walk files respecting .gitignore
         let files = self.walk_files(glob)?;
 
         let now_secs = SystemTime::now()
@@ -41,8 +43,6 @@ impl RepoIndex {
             .as_secs() as i64;
         let ttl_secs = self.config.ttl_duration().as_secs() as i64;
 
-        // ── Decide path before loading metadata ──
-        // Build candidate list with relative paths
         let candidates: Vec<(PathBuf, String)> = files
             .iter()
             .map(|file_path| {
@@ -55,30 +55,36 @@ impl RepoIndex {
             })
             .collect();
 
-        // For small batches, use per-file queries instead of full table scan
         if candidates.len() <= Self::SEQUENTIAL_THRESHOLD {
-            return self.index_sequential(&candidates, now_secs, ttl_secs);
+            self.index_sequential(&candidates, now_secs, ttl_secs)
+        } else {
+            self.index_pipeline(&candidates, now_secs, ttl_secs)
         }
+    }
 
-        // ── Pipeline path: batch-load metadata (amortized over large set) ──
+    /// Pipeline index path for large batches (> SEQUENTIAL_THRESHOLD files).
+    ///
+    /// Batch-loads metadata (single SELECT), partitions by mtime/TTL, then spawns
+    /// rayon workers for parallel parse+hash with a bounded channel feeding a
+    /// single-threaded DB writer.
+    fn index_pipeline(
+        &mut self,
+        candidates: &[(PathBuf, String)],
+        now_secs: i64,
+        ttl_secs: i64,
+    ) -> crate::Result<IndexStats> {
+        // Amortize metadata lookup: single SELECT into HashMap vs N per-file queries
         let existing = self.batch_load_metadata()?;
 
-        // Eagerly init BPE encoder before parallel work
         warm_bpe();
 
-        // Partition: mtime+TTL fast-skip vs needs-reindex
         let mut files_skipped = 0usize;
         let mut skipped_tokens = 0usize;
         let mut to_index: Vec<(PathBuf, String)> = Vec::new();
 
-        for (file_path, relative_path) in &candidates {
-            if let Some(meta) = existing.get(relative_path) {
-                let current_mtime = fs::metadata(file_path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
+        for (file_path, relative_path) in candidates {
+            if let Some(meta) = existing.get(relative_path.as_str()) {
+                let current_mtime = file_mtime(file_path);
 
                 if current_mtime == meta.mtime && (now_secs - meta.indexed_at) < ttl_secs {
                     files_skipped += 1;
@@ -90,10 +96,10 @@ impl RepoIndex {
             to_index.push((file_path.clone(), relative_path.clone()));
         }
 
-        // ── Pipeline path (large batch) ──
+        // Bounded channel (cap 64) provides backpressure so rayon workers don't
+        // outpace the single-threaded DB writer.
         let (tx_ch, rx_ch) = crossbeam_channel::bounded::<(String, ParsedFile)>(64);
 
-        // Clone immutable data for rayon workers
         let config = self.config.clone();
         let existing_ref = &existing;
 
@@ -109,20 +115,19 @@ impl RepoIndex {
         let mut files_indexed = 0usize;
         let mut indexed_tokens = 0usize;
 
-        // Use std::thread::scope so we can share references to `existing` and atomics
+        // thread::scope lets rayon workers borrow `existing` and atomic counters
         let pipeline_result: crate::Result<()> = std::thread::scope(|s| {
-            // Producer thread: runs rayon par_iter internally
             let producer_sender = tx_ch.clone();
             s.spawn(move || {
                 to_index.par_iter().for_each_with(
                     producer_sender,
                     |sender, (file_path, relative_path)| {
-                        // Check cancellation before doing expensive work
                         if cancelled_ref.load(Ordering::Relaxed) {
                             return;
                         }
 
-                        // Capture mtime before read to avoid TOCTOU race
+                        // mtime captured before read: prevents TOCTOU where hash
+                        // reflects old content but mtime reflects new write
                         let mtime = file_mtime(file_path);
 
                         let source = match fs::read_to_string(file_path) {
@@ -130,7 +135,6 @@ impl RepoIndex {
                             Err(_) => return,
                         };
 
-                        // Hash-based skip
                         let mut hasher = Sha256::new();
                         hasher.update(source.as_bytes());
                         let hash: [u8; 32] = hasher.finalize().into();
@@ -143,25 +147,20 @@ impl RepoIndex {
                             }
                         }
 
-                        // Check cancellation again before parsing
                         if cancelled_ref.load(Ordering::Relaxed) {
                             return;
                         }
 
                         let parsed = parse_file_with_hash(file_path, &source, &config, hash, mtime);
                         if sender.send((relative_path.clone(), parsed)).is_err() {
-                            // Writer disconnected — signal other workers to stop
                             cancelled_ref.store(true, Ordering::Relaxed);
                         }
                     },
                 );
-                // producer_sender dropped here → receiver sees disconnect
             });
 
-            // Drop our copy so only the producer thread's sender keeps the channel alive
             drop(tx_ch);
 
-            // Writer: calling thread (owns &mut self)
             let preview_bytes = self.config.indexing.preview_bytes;
             let mut batch: Vec<(String, ParsedFile)> = Vec::with_capacity(Self::BATCH_SIZE);
 
@@ -178,7 +177,6 @@ impl RepoIndex {
                         &mut indexed_tokens,
                     );
                     if let Err(e) = result {
-                        // Signal producers to stop, drain channel to unblock them
                         cancelled.store(true, Ordering::Relaxed);
                         drop(rx_ch);
                         return Err(e);
@@ -202,7 +200,7 @@ impl RepoIndex {
 
         pipeline_result?;
 
-        // Incorporate hash-skipped counts
+        // Fold in hash-skip counters from rayon workers
         files_skipped += hash_skipped_count.load(Ordering::Relaxed);
         skipped_tokens += hash_skipped_tokens.load(Ordering::Relaxed);
 
@@ -233,7 +231,6 @@ impl RepoIndex {
         let mut skipped_tokens = 0usize;
 
         for (file_path, relative_path) in candidates {
-            // Per-file metadata lookup (cheap for small batches)
             let row: Option<(i64, Vec<u8>, i64, i64)> = self
                 .conn
                 .query_row(
@@ -244,13 +241,7 @@ impl RepoIndex {
                 .optional()?;
 
             if let Some((db_mtime, _db_hash, indexed_at, db_tokens)) = &row {
-                // Fast path: mtime unchanged + TTL valid
-                let current_mtime = fs::metadata(file_path)
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
+                let current_mtime = file_mtime(file_path);
 
                 if current_mtime == *db_mtime && (now_secs - indexed_at) < ttl_secs {
                     files_skipped += 1;
@@ -259,7 +250,6 @@ impl RepoIndex {
                 }
             }
 
-            // Capture mtime before read to avoid TOCTOU race
             let mtime = file_mtime(file_path);
 
             let source = match fs::read_to_string(file_path) {
@@ -267,7 +257,6 @@ impl RepoIndex {
                 Err(_) => continue,
             };
 
-            // Hash-based skip
             let mut hasher = Sha256::new();
             hasher.update(source.as_bytes());
             let hash: [u8; 32] = hasher.finalize().into();
@@ -398,10 +387,7 @@ impl RepoIndex {
         parsed: &ParsedFile,
         preview_bytes: usize,
     ) -> crate::Result<Vec<(String, SymbolCacheEntry)>> {
-        // Delete existing entry
         tx.execute("DELETE FROM files WHERE path = ?", params![relative_path])?;
-
-        // Use mtime captured at read time (avoids TOCTOU race)
         let mtime = parsed.mtime;
 
         let now = SystemTime::now()
@@ -409,7 +395,6 @@ impl RepoIndex {
             .unwrap()
             .as_secs() as i64;
 
-        // Insert file
         tx.execute(
             "INSERT INTO files (path, content_hash, mtime, indexed_at, token_count)
              VALUES (?, ?, ?, ?, ?)",
@@ -424,22 +409,16 @@ impl RepoIndex {
 
         let file_id = tx.last_insert_rowid();
 
-        // Collect symbols for cache update
         let mut new_cache_entries: Vec<(String, SymbolCacheEntry)> = Vec::new();
 
-        // Insert nodes
         for node in &parsed.nodes {
             let handle_id = HandleId::new(relative_path, node.node_type, &node.span);
             let node_tokens = estimate_tokens(&parsed.source[node.span.clone()]);
 
-            // Extract name from metadata for fast lookup
             let name = node.metadata.searchable_name().map(String::from);
             let name_lower = name.as_ref().map(|n| n.to_lowercase());
-
-            // Generate preview at index time
             let preview = generate_preview(&parsed.source, &node.span, preview_bytes);
 
-            // Parent fields
             let parent_name: Option<&str> = node.parent_name.as_deref();
             let parent_name_lower = parent_name.map(|p| p.to_lowercase());
             let parent_handle_id = match (node.parent_node_type, node.parent_span.as_ref()) {
@@ -478,7 +457,6 @@ impl RepoIndex {
 
             let node_id = tx.last_insert_rowid();
 
-            // Index content in FTS5
             let content = &parsed.source[node.span.clone()];
             tx.execute(
                 "INSERT INTO content_fts (content) VALUES (?)",
@@ -491,7 +469,6 @@ impl RepoIndex {
                 params![fts_rowid, node_id],
             )?;
 
-            // Index symbol name in symbol_fts for fuzzy search
             if let Some(ref sym_name) = name {
                 tx.execute(
                     "INSERT INTO symbol_fts (name) VALUES (?)",
@@ -503,7 +480,7 @@ impl RepoIndex {
                     params![symbol_fts_rowid, node_id],
                 )?;
 
-                // Collect code symbols for cache
+                // Only definition-like types go in the symbol cache (O(1) lookup path)
                 if matches!(
                     node.node_type,
                     NodeType::Function | NodeType::Class | NodeType::Struct | NodeType::Method
@@ -528,7 +505,7 @@ impl RepoIndex {
             }
         }
 
-        // Build a map of spans to node IDs for reference source mapping
+        // Span→node_id map lets us attribute each reference to its enclosing node
         let node_spans: Vec<(std::ops::Range<usize>, i64)> = parsed
             .nodes
             .iter()
@@ -545,7 +522,6 @@ impl RepoIndex {
             })
             .collect();
 
-        // Insert references
         for reference in &parsed.refs {
             let name_lower = reference.name.to_lowercase();
 
@@ -576,5 +552,90 @@ impl RepoIndex {
         }
 
         Ok(new_cache_entries)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::test_helpers::setup_repo;
+    use std::io::Write;
+
+    #[test]
+    fn sequential_threshold_is_64() {
+        assert_eq!(RepoIndex::SEQUENTIAL_THRESHOLD, 64);
+    }
+
+    #[test]
+    fn batch_load_metadata_empty_db() {
+        let dir = setup_repo(0);
+        let index = RepoIndex::open(dir.path()).unwrap();
+        let meta = index.batch_load_metadata().unwrap();
+        assert!(meta.is_empty(), "empty index should have no metadata");
+    }
+
+    #[test]
+    fn batch_load_metadata_after_indexing() {
+        let dir = setup_repo(3);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        index.index("**/*.rs").unwrap();
+
+        let meta = index.batch_load_metadata().unwrap();
+        assert_eq!(meta.len(), 3, "should have metadata for 3 files");
+
+        // Each entry should have valid data
+        for (path, cache) in &meta {
+            assert!(path.starts_with("src/"), "path should be relative: {}", path);
+            assert!(cache.mtime > 0, "mtime should be positive");
+            assert!(cache.tokens > 0, "tokens should be positive");
+        }
+    }
+
+    #[test]
+    fn index_stats_fields_correct() {
+        let dir = setup_repo(5);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        let stats = index.index("**/*.rs").unwrap();
+
+        assert_eq!(stats.files_indexed, 5);
+        assert_eq!(stats.files_skipped, 0);
+        assert!(stats.total_tokens > 0);
+        assert!(stats.index_size_bytes > 0);
+    }
+
+    #[test]
+    fn reindex_skips_unchanged_files() {
+        let dir = setup_repo(3);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+
+        let stats1 = index.index("**/*.rs").unwrap();
+        assert_eq!(stats1.files_indexed, 3);
+
+        let stats2 = index.index("**/*.rs").unwrap();
+        assert_eq!(stats2.files_indexed, 0);
+        assert_eq!(stats2.files_skipped, 3);
+        // Token count should be preserved from skipped files
+        assert_eq!(stats2.total_tokens, stats1.total_tokens);
+    }
+
+    #[test]
+    fn index_detects_modified_files() {
+        let dir = setup_repo(2);
+        let mut index = RepoIndex::open(dir.path()).unwrap();
+        index.index("**/*.rs").unwrap();
+
+        // Modify one file (change content AND mtime by sleeping briefly)
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let path = dir.path().join("src/file_0.rs");
+        let mut f = fs::File::create(&path).unwrap();
+        writeln!(f, "fn new_func() {{ /* changed */ }}").unwrap();
+
+        let stats = index.index("**/*.rs").unwrap();
+        // At least the modified file should be reindexed
+        assert!(
+            stats.files_indexed >= 1,
+            "should reindex at least modified file, got {}",
+            stats.files_indexed
+        );
     }
 }

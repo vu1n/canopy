@@ -5,52 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
 
-/// Default configuration as TOML
-pub const DEFAULT_CONFIG: &str = r#"# Canopy Configuration
-
-[core]
-# Time-to-live for cache entries (e.g., "1h", "30m", "1d")
-ttl = "1h"
-# Token encoding (cl100k_base is GPT-4/Claude compatible)
-encoding = "cl100k_base"
-# Default maximum results returned by queries
-default_result_limit = 100
-
-[indexing]
-# Default glob pattern for indexing
-# Add more extensions as needed for your project
-default_glob = "**/*.{rs,py,js,ts,tsx,jsx,go,md,txt,json,yaml,yml,toml}"
-# Files above this size (bytes) are chunked instead of parsed as single node
-chunk_threshold = 1000000
-# Number of lines per chunk
-chunk_lines = 50
-# Overlap between chunks
-chunk_overlap = 10
-# Maximum bytes for preview text
-preview_bytes = 100
-
-[fts]
-# FTS5 tokenizer (unicode61 without stemming is better for code)
-tokenizer = "unicode61"
-
-[ignore]
-# Additional patterns to ignore (beyond .gitignore)
-patterns = [
-    ".git",
-    ".canopy",
-    "node_modules",
-    "target",
-    "__pycache__",
-    ".venv",
-    "venv",
-    "*.min.js",
-    "*.min.css",
-    ".DS_Store",
-    "*.lock",
-    "package-lock.json",
-    "Cargo.lock",
-]
-"#;
+/// Generate default configuration as a TOML string.
+///
+/// Single source of truth: values come from the `Default` impls on each config
+/// section.  The TOML is serialised at runtime so it can never silently diverge
+/// from the defaults used when a field is missing from a user-provided file.
+pub fn default_config_toml() -> String {
+    toml::to_string_pretty(&Config::default()).expect("Config serialization cannot fail")
+}
 
 /// Canopy configuration
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -136,6 +98,14 @@ fn default_ignore_patterns() -> Vec<String> {
         "node_modules".to_string(),
         "target".to_string(),
         "__pycache__".to_string(),
+        ".venv".to_string(),
+        "venv".to_string(),
+        "*.min.js".to_string(),
+        "*.min.css".to_string(),
+        ".DS_Store".to_string(),
+        "*.lock".to_string(),
+        "package-lock.json".to_string(),
+        "Cargo.lock".to_string(),
     ]
 }
 
@@ -224,8 +194,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_default_config_parses() {
-        let config = Config::from_toml(DEFAULT_CONFIG).unwrap();
+    fn test_default_config_roundtrips() {
+        let toml = default_config_toml();
+        let config = Config::from_toml(&toml).unwrap();
         assert_eq!(config.core.ttl, "1h");
         assert_eq!(config.core.default_result_limit, 100);
         assert_eq!(config.indexing.chunk_threshold, 1_000_000);
@@ -242,7 +213,7 @@ mod tests {
 
     #[test]
     fn test_ttl_duration() {
-        let config = Config::from_toml(DEFAULT_CONFIG).unwrap();
+        let config = Config::default();
         assert_eq!(config.ttl_duration(), Duration::from_secs(3600));
     }
 }
